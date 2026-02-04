@@ -1,0 +1,67 @@
+# IntentContinuum Configuration
+
+# Intent thresholds
+intent:
+  upper_threshold: 3.0    # seconds - trigger scale UP if response time exceeds this
+  lower_threshold: 1.0    # seconds - trigger scale DOWN if response time below this
+  ema_alpha: 0.02         # smoothing factor for Exponential Moving Average
+  check_interval: 5       # seconds between checks
+  wait_after_action: 60   # seconds to wait after taking an action
+
+# Endpoints
+endpoints:
+  ollama: "http://localhost:11434"
+  onos: "http://localhost:8181"
+  onos_user: "onos"
+  onos_password: "rocks"
+  sflow_rt: "http://localhost:8008"
+  kubernetes_master: "10.132.0.14"
+  locust: "http://10.132.0.14:8089"
+
+# Application
+application:
+  entry_point: "http://192.168.100.100:5001/resize"
+  test_image: "/home/antonios-icontinuum/test_converted.jpg"
+  webhooks: "http://microservice2-service:5002/bw,http://microservice3-service:8081/,http://microservice4-service:5004/notify"
+  db_url: "http://db-service:5006/track_time"
+  logs_url: "http://db-service:5006/log"
+
+# LLM
+llm:
+  model: "tinyllama"
+  temperature: 0.1
+
+# Actions enabled (start with horizontal scaling only)
+actions:
+  horizontal_scaling: true
+  vertical_scaling: false
+  service_placement: false
+  flow_scheduling: false
+
+# Kubernetes
+kubernetes:
+  namespace: "default"
+  deployments:
+    - name: "microservice1-deployment"
+      min_replicas: 1
+      max_replicas: 5
+    - name: "microservice2-deployment"
+      min_replicas: 1
+      max_replicas: 5
+    - name: "microservice3-deployment"
+      min_replicas: 1
+      max_replicas: 5
+    - name: "microservice4-deployment"
+      min_replicas: 1
+      max_replicas: 3
+```
+
+---
+
+## Step 2.4: Create requirements.txt
+
+Open `requirements.txt` and add:
+```
+pyyaml>=6.0
+requests>=2.28.0
+urllib3>=1.26.0
