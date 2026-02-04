@@ -54,14 +54,3 @@ kubernetes:
     - name: "microservice4-deployment"
       min_replicas: 1
       max_replicas: 3
-```
-
----
-
-## Step 2.4: Create requirements.txt
-
-Open `requirements.txt` and add:
-```
-pyyaml>=6.0
-requests>=2.28.0
-urllib3>=1.26.0
