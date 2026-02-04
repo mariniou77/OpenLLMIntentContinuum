@@ -120,7 +120,8 @@ class SFlowRTClient:
     def is_healthy(self) -> bool:
         """Check if sFlow-RT is responding."""
         try:
-            version = self._get("version")
-            return bool(version)
+            url = f"{self.base_url}/version"
+            response = requests.get(url, timeout=5)
+            return response.status_code == 200
         except Exception:
             return False
