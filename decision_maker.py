@@ -13,6 +13,7 @@ It follows the IntentContinuum paper's approach:
 
 import json
 import logging
+import re
 import requests
 from typing import Optional
 from pathlib import Path
@@ -139,24 +140,70 @@ JSON Response:"""
         if not response_text:
             return self._get_fallback_response("No response from LLM")
         
+        logger.debug(f"Raw LLM response: {response_text[:500]}")
+        
+        # Clean up the response
+        cleaned = response_text.strip()
+        
         # Try to extract JSON from the response
         try:
             # First, try to parse the entire response as JSON
-            return json.loads(response_text.strip())
+            return json.loads(cleaned)
         except json.JSONDecodeError:
             pass
         
         # Try to find JSON object in the response
         try:
             # Look for JSON between curly braces
-            start = response_text.find('{')
-            end = response_text.rfind('}') + 1
+            start = cleaned.find('{')
+            end = cleaned.rfind('}') + 1
             
             if start != -1 and end > start:
-                json_str = response_text[start:end]
-                return json.loads(json_str)
-        except json.JSONDecodeError:
-            pass
+                json_str = cleaned[start:end]
+                parsed = json.loads(json_str)
+                
+                # Convert flat format to nested format if needed
+                if "deployment_name" in parsed and "parameters" not in parsed:
+                    parsed["parameters"] = {
+                        "deployment_name": parsed.pop("deployment_name"),
+                        "replicas": parsed.pop("replicas", 2)
+                    }
+                if "source" not in parsed:
+                    parsed["source"] = "compute"
+                    
+                return parsed
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON parse error: {e}")
+        
+        # Try to extract key information using simple parsing
+        try:
+            response_lower = response_text.lower()
+            
+            # Look for deployment names
+            deployment = None
+            for dep in ["microservice1", "microservice2", "microservice3", "microservice4", "db"]:
+                if dep in response_lower:
+                    deployment = f"{dep}-deployment"
+                    break
+            
+            # Look for replica counts
+            replicas = 2  # default
+            replica_match = re.search(r'replica[s]?["\s:]+(\d+)', response_lower)
+            if replica_match:
+                replicas = int(replica_match.group(1))
+            
+            if deployment:
+                return {
+                    "analysis": "Extracted from unstructured response",
+                    "source": "compute",
+                    "action": "horizontal_scaling",
+                    "parameters": {
+                        "deployment_name": deployment,
+                        "replicas": min(max(replicas, 1), 5)
+                    }
+                }
+        except Exception as e:
+            logger.warning(f"Fallback parsing failed: {e}")
         
         logger.warning(f"Could not parse LLM response as JSON: {response_text[:200]}")
         return self._get_fallback_response("Could not parse LLM response")

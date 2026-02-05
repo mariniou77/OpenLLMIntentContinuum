@@ -1,48 +1,24 @@
-You are an expert Kubernetes and SDN network administrator. Your task is to analyze system performance issues and recommend actions.
+You are a Kubernetes scaling assistant. Analyze the system and respond with ONLY a JSON object.
 
-CURRENT SITUATION:
-- A response time SLO violation has been detected
-- Violation type: {violation_type}
-- Upper threshold: {upper_threshold}s
-- Lower threshold: {lower_threshold}s
+VIOLATION: {violation_type}
+THRESHOLD: Upper={upper_threshold}s, Lower={lower_threshold}s
 
+SYSTEM STATE:
 {system_state}
 
-AVAILABLE ACTIONS:
-1. horizontal_scaling - Increase or decrease the number of pod replicas
-   - Use when: CPU/memory is high, or response times are slow due to overload
-   - Parameters: deployment_name, replicas (new count)
+TASK: The response time is too high. Decide which deployment needs more replicas.
 
-2. vertical_scaling - Adjust CPU/memory limits for pods (NOT ENABLED)
+RULES:
+- You MUST respond with ONLY a JSON object
+- No explanations, no text before or after the JSON
+- Pick the deployment that is most likely causing the slowdown
 
-3. service_placement - Move pods to different nodes (NOT ENABLED)
-
-4. flow_scheduling - Reroute network traffic (NOT ENABLED)
-
-INSTRUCTIONS:
-1. Analyze the system state to identify the root cause
-2. Consider: Is this a compute problem (CPU/memory) or network problem (congestion)?
-3. Recommend ONE action to resolve the issue
-4. For UPPER violations (response time too high): typically need MORE resources
-5. For LOWER violations (response time too low): may have OVER-provisioned resources
-
-Respond ONLY with a valid JSON object in this exact format:
+RESPOND WITH THIS EXACT FORMAT:
 {{
-  "analysis": "Brief explanation of the root cause",
-  "source": "compute|network|unknown",
+  "analysis": "one sentence explanation",
   "action": "horizontal_scaling",
-  "parameters": {{
-    "deployment_name": "name of deployment to scale",
-    "replicas": number_of_replicas
-  }}
+  "deployment_name": "microservice3-deployment",
+  "replicas": 2
 }}
 
-If no action is needed, respond with:
-{{
-  "analysis": "System is healthy",
-  "source": "none",
-  "action": "none",
-  "parameters": {{}}
-}}
-
-JSON Response:
+JSON:
