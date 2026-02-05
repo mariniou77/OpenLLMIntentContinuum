@@ -20,8 +20,8 @@ endpoints:
 
 # Application
 application:
-  entry_point: "http://192.168.100.100:5001/resize"
-  test_image: "/home/antonios-icontinuum/test_converted.jpg"
+  entry_point: "http://10.132.0.14:5001/resize"
+  test_image: "/home/antonios-icontinuum/OpenLLMIntentContinuum/images/family.jpg"
   webhooks: "http://microservice2-service:5002/bw,http://microservice3-service:8081/,http://microservice4-service:5004/notify"
   db_url: "http://db-service:5006/track_time"
   logs_url: "http://db-service:5006/log"

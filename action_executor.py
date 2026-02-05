@@ -167,13 +167,20 @@ class ActionExecutor:
         if target_replicas != original_target:
             logger.info(f"Adjusted replicas from {original_target} to {target_replicas} (constraints: {min_replicas}-{max_replicas})")
         
-        # Get current replica count
+        # Get current replica count (case-insensitive match)
         deployments = self.k8s_client.get_deployments()
         current_replicas = None
+        actual_deployment_name = None
+        
         for dep in deployments:
-            if dep["name"] == deployment_name:
+            if dep["name"].lower() == deployment_name.lower():
                 current_replicas = dep["replicas_desired"]
+                actual_deployment_name = dep["name"]  # Use actual name from cluster
                 break
+        
+        # Use the actual deployment name from the cluster
+        if actual_deployment_name:
+            deployment_name = actual_deployment_name
         
         if current_replicas is None:
             return {
