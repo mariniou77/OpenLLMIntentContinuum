@@ -3,7 +3,7 @@ Action Executor Module for IntentContinuum
 
 This module executes the corrective actions recommended by the LLM Decision Maker.
 It interfaces with:
-- Kubernetes API for compute actions (scaling, placement)
+- Kubernetes via SSH + kubectl on master node
 - ONOS API for network actions (flow scheduling)
 
 Actions supported:
@@ -13,10 +13,10 @@ Actions supported:
 - flow_scheduling: Reroute network traffic
 """
 
+import subprocess
+import json
 import logging
 import time
-from kubernetes import client, config
-from kubernetes.client.rest import ApiException
 import requests
 from typing import Dict, Any, Optional
 
@@ -29,40 +29,62 @@ class ActionExecutor:
     """
     Executes corrective actions on the Kubernetes cluster and SDN network.
     
-    This is called after the Decision Maker recommends an action.
+    Uses SSH + kubectl to communicate with Kubernetes (same pattern as KubernetesClient).
     """
     
-    def __init__(self, namespace: str = "default", onos_url: str = "http://localhost:8181"):
+    def __init__(self, master_ip: str, username: str = "antonios-icontinuum",
+                 namespace: str = "default", onos_url: str = "http://localhost:8181"):
         """
         Initialize the Action Executor.
         
         Args:
+            master_ip: IP address of the Kubernetes master node
+            username: SSH username for the master node
             namespace: Kubernetes namespace where app is deployed
             onos_url: ONOS controller REST API URL
         """
+        self.master_ip = master_ip
+        self.username = username
         self.namespace = namespace
         self.onos_url = onos_url
         self.onos_auth = ("onos", "rocks")  # Default ONOS credentials
         
-        # Load Kubernetes configuration
+        logger.info(f"ActionExecutor initialized - Master: {master_ip}, Namespace: {namespace}")
+    
+    def _run_kubectl(self, command: str, timeout: int = 30) -> tuple[bool, str]:
+        """
+        Run kubectl command on master node via SSH.
+        
+        Args:
+            command: kubectl command to run (without 'kubectl' prefix)
+            timeout: Command timeout in seconds
+            
+        Returns:
+            Tuple of (success: bool, output: str)
+        """
+        ssh_command = f"ssh -o StrictHostKeyChecking=no {self.username}@{self.master_ip} 'sudo kubectl {command}'"
+        
         try:
-            # Try in-cluster config first (when running inside K8s)
-            config.load_incluster_config()
-            logger.info("Loaded in-cluster Kubernetes config")
-        except config.ConfigException:
-            # Fall back to kubeconfig file
-            try:
-                config.load_kube_config()
-                logger.info("Loaded kubeconfig from file")
-            except config.ConfigException as e:
-                logger.error(f"Could not load Kubernetes config: {e}")
-                raise
-        
-        # Initialize Kubernetes API clients
-        self.apps_v1 = client.AppsV1Api()
-        self.core_v1 = client.CoreV1Api()
-        
-        logger.info(f"ActionExecutor initialized for namespace: {namespace}")
+            result = subprocess.run(
+                ssh_command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"kubectl error: {result.stderr}")
+                return False, result.stderr
+            
+            return True, result.stdout
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"kubectl command timed out: {command}")
+            return False, "Command timed out"
+        except Exception as e:
+            logger.error(f"SSH/kubectl error: {e}")
+            return False, str(e)
     
     def execute(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -129,36 +151,25 @@ class ActionExecutor:
         # Clamp replicas to reasonable range
         replicas = max(1, min(10, replicas))
         
+        # Get current replica count
+        current_replicas = self._get_deployment_replicas(deployment_name)
+        
+        if current_replicas is not None and current_replicas == replicas:
+            return {
+                "success": True,
+                "message": f"Already at {replicas} replicas",
+                "action": "horizontal_scaling",
+                "changed": False
+            }
+        
         logger.info(f"Scaling {deployment_name} to {replicas} replicas")
         
-        try:
-            # Get current deployment
-            deployment = self.apps_v1.read_namespaced_deployment(
-                name=deployment_name,
-                namespace=self.namespace
-            )
-            
-            current_replicas = deployment.spec.replicas
-            logger.info(f"Current replicas: {current_replicas}")
-            
-            if current_replicas == replicas:
-                return {
-                    "success": True,
-                    "message": f"Already at {replicas} replicas",
-                    "action": "horizontal_scaling",
-                    "changed": False
-                }
-            
-            # Patch the deployment
-            patch = {"spec": {"replicas": replicas}}
-            self.apps_v1.patch_namespaced_deployment(
-                name=deployment_name,
-                namespace=self.namespace,
-                body=patch
-            )
-            
+        # Execute scale command
+        command = f"scale deployment {deployment_name} --replicas={replicas} -n {self.namespace}"
+        success, output = self._run_kubectl(command)
+        
+        if success:
             logger.info(f"Successfully scaled {deployment_name}: {current_replicas} -> {replicas}")
-            
             return {
                 "success": True,
                 "message": f"Scaled {deployment_name} from {current_replicas} to {replicas} replicas",
@@ -167,15 +178,8 @@ class ActionExecutor:
                 "previous_replicas": current_replicas,
                 "new_replicas": replicas
             }
-            
-        except ApiException as e:
-            error_msg = f"Kubernetes API error: {e.status} - {e.reason}"
-            logger.error(error_msg)
-            return {"success": False, "error": error_msg}
-        except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
-            logger.error(error_msg)
-            return {"success": False, "error": error_msg}
+        else:
+            return {"success": False, "error": output}
     
     def _execute_vertical_scaling(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -202,64 +206,33 @@ class ActionExecutor:
         
         logger.info(f"Vertical scaling {deployment_name}: CPU={cpu_limit}, Mem={memory_limit}")
         
-        try:
-            # Get current deployment
-            deployment = self.apps_v1.read_namespaced_deployment(
-                name=deployment_name,
-                namespace=self.namespace
-            )
-            
-            # Build the resource limits patch
-            resources = {}
-            if cpu_limit:
-                resources["cpu"] = cpu_limit
-            if memory_limit:
-                resources["memory"] = memory_limit
-            
-            # Patch the first container's resources
-            patch = {
-                "spec": {
-                    "template": {
-                        "spec": {
-                            "containers": [{
-                                "name": deployment.spec.template.spec.containers[0].name,
-                                "resources": {
-                                    "limits": resources,
-                                    "requests": resources
-                                }
-                            }]
-                        }
-                    }
-                }
-            }
-            
-            self.apps_v1.patch_namespaced_deployment(
-                name=deployment_name,
-                namespace=self.namespace,
-                body=patch
-            )
-            
+        # Build resource string
+        resources = []
+        if cpu_limit:
+            resources.append(f"cpu={cpu_limit}")
+        if memory_limit:
+            resources.append(f"memory={memory_limit}")
+        
+        resource_str = ",".join(resources)
+        
+        # Use kubectl set resources command
+        command = f"set resources deployment {deployment_name} --limits={resource_str} --requests={resource_str} -n {self.namespace}"
+        success, output = self._run_kubectl(command)
+        
+        if success:
             logger.info(f"Successfully updated resources for {deployment_name}")
-            
             return {
                 "success": True,
                 "message": f"Updated {deployment_name} resources: CPU={cpu_limit}, Mem={memory_limit}",
                 "action": "vertical_scaling",
                 "changed": True
             }
-            
-        except ApiException as e:
-            error_msg = f"Kubernetes API error: {e.status} - {e.reason}"
-            logger.error(error_msg)
-            return {"success": False, "error": error_msg}
-        except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
-            logger.error(error_msg)
-            return {"success": False, "error": error_msg}
+        else:
+            return {"success": False, "error": output}
     
     def _execute_service_placement(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Move a pod to a different node using nodeSelector.
+        Move a pod to a different node using nodeSelector patch.
         
         Args:
             params: Must contain:
@@ -277,34 +250,32 @@ class ActionExecutor:
         
         logger.info(f"Placing {deployment_name} on node {target_node}")
         
-        try:
-            # Verify target node exists
-            try:
-                self.core_v1.read_node(name=target_node)
-            except ApiException:
-                return {"success": False, "error": f"Node {target_node} not found"}
-            
-            # Patch deployment with nodeSelector
-            patch = {
-                "spec": {
-                    "template": {
-                        "spec": {
-                            "nodeSelector": {
-                                "kubernetes.io/hostname": target_node
-                            }
+        # Verify target node exists
+        success, output = self._run_kubectl(f"get node {target_node}")
+        if not success:
+            return {"success": False, "error": f"Node {target_node} not found"}
+        
+        # Patch deployment with nodeSelector
+        patch_json = json.dumps({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "nodeSelector": {
+                            "kubernetes.io/hostname": target_node
                         }
                     }
                 }
             }
-            
-            self.apps_v1.patch_namespaced_deployment(
-                name=deployment_name,
-                namespace=self.namespace,
-                body=patch
-            )
-            
+        })
+        
+        # Escape quotes for shell
+        patch_json_escaped = patch_json.replace('"', '\\"')
+        
+        command = f'patch deployment {deployment_name} -n {self.namespace} -p "{patch_json_escaped}"'
+        success, output = self._run_kubectl(command)
+        
+        if success:
             logger.info(f"Successfully set nodeSelector for {deployment_name} to {target_node}")
-            
             return {
                 "success": True,
                 "message": f"Configured {deployment_name} to run on {target_node}",
@@ -312,15 +283,8 @@ class ActionExecutor:
                 "changed": True,
                 "target_node": target_node
             }
-            
-        except ApiException as e:
-            error_msg = f"Kubernetes API error: {e.status} - {e.reason}"
-            logger.error(error_msg)
-            return {"success": False, "error": error_msg}
-        except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
-            logger.error(error_msg)
-            return {"success": False, "error": error_msg}
+        else:
+            return {"success": False, "error": output}
     
     def _execute_flow_scheduling(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -330,7 +294,7 @@ class ActionExecutor:
             params: Must contain:
                 - src_ip: Source IP address
                 - dst_ip: Destination IP address
-                - path: List of switch IDs for the new path
+                - path: List of switch IDs for the new path (optional)
         
         Returns:
             Result dictionary
@@ -346,20 +310,13 @@ class ActionExecutor:
         
         try:
             # Create an ONOS intent for the new path
-            # Using HostToHostIntent for simplicity
             intent = {
                 "type": "HostToHostIntent",
                 "appId": "org.onosproject.cli",
                 "priority": 100,
-                "one": f"{src_ip}/-1",  # Host ID format
+                "one": f"{src_ip}/-1",
                 "two": f"{dst_ip}/-1"
             }
-            
-            # If specific path is provided, use PointToPointIntent with waypoints
-            if path:
-                logger.info(f"Path specified: {path}")
-                # For now, we use HostToHostIntent and let ONOS find the path
-                # Full path control would require more complex intent configuration
             
             # Submit intent to ONOS
             url = f"{self.onos_url}/onos/v1/intents"
@@ -393,6 +350,26 @@ class ActionExecutor:
             logger.error(error_msg)
             return {"success": False, "error": error_msg}
     
+    def _get_deployment_replicas(self, deployment_name: str) -> Optional[int]:
+        """
+        Get current replica count for a deployment.
+        
+        Args:
+            deployment_name: Name of the deployment
+            
+        Returns:
+            Number of replicas or None if not found
+        """
+        command = f"get deployment {deployment_name} -n {self.namespace} -o jsonpath='{{.spec.replicas}}'"
+        success, output = self._run_kubectl(command)
+        
+        if success and output.strip():
+            try:
+                return int(output.strip())
+            except ValueError:
+                return None
+        return None
+    
     def get_deployment_status(self, deployment_name: str) -> Optional[Dict[str, Any]]:
         """
         Get current status of a deployment.
@@ -403,20 +380,36 @@ class ActionExecutor:
         Returns:
             Status dictionary or None if not found
         """
+        command = f"get deployment {deployment_name} -n {self.namespace} -o json"
+        success, output = self._run_kubectl(command)
+        
+        if not success:
+            return None
+        
         try:
-            deployment = self.apps_v1.read_namespaced_deployment(
-                name=deployment_name,
-                namespace=self.namespace
-            )
-            
+            deployment = json.loads(output)
             return {
                 "name": deployment_name,
-                "replicas": deployment.spec.replicas,
-                "ready_replicas": deployment.status.ready_replicas or 0,
-                "available_replicas": deployment.status.available_replicas or 0
+                "replicas": deployment.get("spec", {}).get("replicas", 0),
+                "ready_replicas": deployment.get("status", {}).get("readyReplicas", 0),
+                "available_replicas": deployment.get("status", {}).get("availableReplicas", 0)
             }
-        except ApiException:
+        except json.JSONDecodeError:
             return None
+    
+    def list_deployments(self) -> list:
+        """
+        List all deployments in the namespace.
+        
+        Returns:
+            List of deployment names
+        """
+        command = f"get deployments -n {self.namespace} -o jsonpath='{{.items[*].metadata.name}}'"
+        success, output = self._run_kubectl(command)
+        
+        if success and output.strip():
+            return output.strip().split()
+        return []
     
     def wait_for_rollout(self, deployment_name: str, timeout: int = 120) -> bool:
         """
@@ -431,15 +424,12 @@ class ActionExecutor:
         """
         logger.info(f"Waiting for {deployment_name} rollout (timeout: {timeout}s)")
         
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            status = self.get_deployment_status(deployment_name)
-            if status:
-                if status["ready_replicas"] == status["replicas"]:
-                    logger.info(f"Rollout complete: {status['ready_replicas']}/{status['replicas']} ready")
-                    return True
-                logger.debug(f"Rollout in progress: {status['ready_replicas']}/{status['replicas']} ready")
-            time.sleep(5)
+        command = f"rollout status deployment/{deployment_name} -n {self.namespace} --timeout={timeout}s"
+        success, output = self._run_kubectl(command, timeout=timeout + 10)
         
-        logger.warning(f"Rollout timeout after {timeout}s")
-        return False
+        if success:
+            logger.info(f"Rollout complete for {deployment_name}")
+            return True
+        else:
+            logger.warning(f"Rollout timeout or failed: {output}")
+            return False
