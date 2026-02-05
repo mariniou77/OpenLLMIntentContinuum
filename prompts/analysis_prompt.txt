@@ -27,22 +27,22 @@ INSTRUCTIONS:
 5. For LOWER violations (response time too low): may have OVER-provisioned resources
 
 Respond ONLY with a valid JSON object in this exact format:
-{
+{{
   "analysis": "Brief explanation of the root cause",
   "source": "compute|network|unknown",
   "action": "horizontal_scaling",
-  "parameters": {
+  "parameters": {{
     "deployment_name": "name of deployment to scale",
     "replicas": number_of_replicas
-  }
-}
+  }}
+}}
 
 If no action is needed, respond with:
-{
+{{
   "analysis": "System is healthy",
   "source": "none",
   "action": "none",
-  "parameters": {}
-}
+  "parameters": {{}}
+}}
 
 JSON Response:
