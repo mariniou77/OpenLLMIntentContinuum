@@ -183,6 +183,11 @@ JSON Response:"""
         if "action" not in action:
             action["action"] = "none"
         
+        # Normalize action name (handle variations)
+        action_name = action["action"].lower().replace(" ", "_")
+        if action_name in ["horizontal_scaling", "horizontalscaling", "scale", "scaling"]:
+            action["action"] = "horizontal_scaling"
+        
         if "parameters" not in action:
             action["parameters"] = {}
         
@@ -196,11 +201,27 @@ JSON Response:"""
         if action["action"] == "horizontal_scaling":
             params = action["parameters"]
             
+            # Handle different parameter names for deployment
+            if "deployment_name" not in params:
+                # Try alternative names
+                for alt_name in ["deployment", "name", "deploy_name"]:
+                    if alt_name in params:
+                        params["deployment_name"] = params[alt_name]
+                        break
+            
             # Check deployment name exists
             if "deployment_name" not in params:
                 logger.warning("horizontal_scaling missing deployment_name")
                 action["action"] = "none"
                 return action
+            
+            # Handle different parameter names for replicas
+            if "replicas" not in params:
+                # Try alternative names
+                for alt_name in ["replica_count", "replica", "count", "num_replicas"]:
+                    if alt_name in params:
+                        params["replicas"] = params[alt_name]
+                        break
             
             # Check replicas is a valid number
             if "replicas" not in params:
