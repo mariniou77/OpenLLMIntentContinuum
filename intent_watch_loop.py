@@ -76,11 +76,25 @@ class IntentWatchLoop:
         """
         Measure response time by sending a request to the application.
         
+        The microservice chain expects specific headers:
+        - X-Webhooks: Comma-separated list of downstream service URLs
+        - X-Request-ID: Unique request identifier
+        - X-Special-Object: Object to detect (optional)
+        
         Returns:
             Response time in seconds, or None if request failed
         """
+        import uuid
+        
         try:
             start_time = time.time()
+            
+            # Build headers required by the microservice chain
+            headers = {
+                'X-Request-ID': str(uuid.uuid4()),
+                'X-Webhooks': self.config["application"].get("webhooks", ""),
+                'X-Special-Object': 'person'  # Default object to detect
+            }
             
             # If we have a test image, send it as multipart form data
             if self.test_image_path:
@@ -90,23 +104,26 @@ class IntentWatchLoop:
                         response = requests.post(
                             self.app_endpoint,
                             files=files,
+                            headers=headers,
                             timeout=30
                         )
                 except FileNotFoundError:
-                    # Fall back to simple GET request
-                    response = requests.get(self.app_endpoint, timeout=30)
+                    logger.error(f"Test image not found: {self.test_image_path}")
+                    return None
             else:
-                # Simple GET request
-                response = requests.get(self.app_endpoint, timeout=30)
+                # Simple GET request (may not work with this microservice)
+                response = requests.get(self.app_endpoint, headers=headers, timeout=30)
             
             end_time = time.time()
             response_time = end_time - start_time
             
             if response.status_code == 200:
+                logger.debug(f"Request successful, response time: {response_time:.3f}s")
                 return response_time
             else:
                 logger.warning(f"Application returned status {response.status_code}")
-                return response_time  # Still return the time even if not 200
+                # Still return the time for non-200 responses
+                return response_time
                 
         except requests.exceptions.Timeout:
             logger.error("Request to application timed out")
