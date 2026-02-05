@@ -79,7 +79,9 @@ class IntentWatchLoop:
         The microservice chain expects specific headers:
         - X-Webhooks: Comma-separated list of downstream service URLs
         - X-Request-ID: Unique request identifier
-        - X-Special-Object: Object to detect (optional)
+        - X-Special-Object: Object to detect
+        - X-Central-DB-URL: URL for time tracking database
+        - X-Logs-URL: URL for logging service
         
         Returns:
             Response time in seconds, or None if request failed
@@ -90,10 +92,13 @@ class IntentWatchLoop:
             start_time = time.time()
             
             # Build headers required by the microservice chain
+            app_config = self.config["application"]
             headers = {
                 'X-Request-ID': str(uuid.uuid4()),
-                'X-Webhooks': self.config["application"].get("webhooks", ""),
-                'X-Special-Object': 'person'  # Default object to detect
+                'X-Webhooks': app_config.get("webhooks", ""),
+                'X-Special-Object': 'person',
+                'X-Central-DB-URL': app_config.get("db_url", "http://db-service:5006/track_time"),
+                'X-Logs-URL': app_config.get("logs_url", "http://db-service:5006/log")
             }
             
             # If we have a test image, send it as multipart form data
@@ -105,14 +110,14 @@ class IntentWatchLoop:
                             self.app_endpoint,
                             files=files,
                             headers=headers,
-                            timeout=30
+                            timeout=60  # Increase timeout for full chain processing
                         )
                 except FileNotFoundError:
                     logger.error(f"Test image not found: {self.test_image_path}")
                     return None
             else:
                 # Simple GET request (may not work with this microservice)
-                response = requests.get(self.app_endpoint, headers=headers, timeout=30)
+                response = requests.get(self.app_endpoint, headers=headers, timeout=60)
             
             end_time = time.time()
             response_time = end_time - start_time
@@ -122,12 +127,11 @@ class IntentWatchLoop:
                 return response_time
             else:
                 logger.warning(f"Application returned status {response.status_code}")
-                # Still return the time for non-200 responses
                 return response_time
                 
         except requests.exceptions.Timeout:
             logger.error("Request to application timed out")
-            return 30.0  # Return timeout value
+            return 60.0  # Return timeout value
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed: {e}")
             return None
