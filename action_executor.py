@@ -1,435 +1,337 @@
 """
-Action Executor Module for IntentContinuum
+Action Executor Module
 
-This module executes the corrective actions recommended by the LLM Decision Maker.
-It interfaces with:
-- Kubernetes via SSH + kubectl on master node
-- ONOS API for network actions (flow scheduling)
+This module executes the actions recommended by the Decision Maker.
+It interfaces with Kubernetes and ONOS to implement changes.
 
-Actions supported:
-- horizontal_scaling: Adjust replica count
-- vertical_scaling: Adjust CPU/memory limits
-- service_placement: Move pod to different node
-- flow_scheduling: Reroute network traffic
+Supported actions:
+- horizontal_scaling: Scale deployment replicas up or down
+- vertical_scaling: Adjust CPU/memory limits (future)
+- service_placement: Migrate pods to different nodes (future)
+- flow_scheduling: Update network flow rules (future)
 """
 
-import subprocess
-import json
 import logging
 import time
-import requests
-from typing import Dict, Any, Optional
+from typing import Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+from utils.kubernetes_client import KubernetesClient
+from utils.onos_client import ONOSClient
+
 logger = logging.getLogger(__name__)
 
 
 class ActionExecutor:
     """
-    Executes corrective actions on the Kubernetes cluster and SDN network.
+    Executes recommended actions on the infrastructure.
     
-    Uses SSH + kubectl to communicate with Kubernetes (same pattern as KubernetesClient).
+    This class is responsible for translating high-level actions
+    (like "scale deployment X to Y replicas") into actual API calls
+    to Kubernetes and ONOS.
     """
     
-    def __init__(self, master_ip: str, username: str = "antonios-icontinuum",
-                 namespace: str = "default", onos_url: str = "http://localhost:8181"):
+    def __init__(self, config: dict):
         """
-        Initialize the Action Executor.
+        Initialize Action Executor with configuration.
         
         Args:
-            master_ip: IP address of the Kubernetes master node
-            username: SSH username for the master node
-            namespace: Kubernetes namespace where app is deployed
-            onos_url: ONOS controller REST API URL
+            config: Configuration dictionary containing endpoints and settings
         """
-        self.master_ip = master_ip
-        self.username = username
-        self.namespace = namespace
-        self.onos_url = onos_url
-        self.onos_auth = ("onos", "rocks")  # Default ONOS credentials
+        self.config = config
         
-        logger.info(f"ActionExecutor initialized - Master: {master_ip}, Namespace: {namespace}")
+        # Initialize clients
+        self.k8s_client = KubernetesClient(
+            master_ip=config["endpoints"]["kubernetes_master"]
+        )
+        
+        self.onos_client = ONOSClient(
+            base_url=config["endpoints"]["onos"],
+            username=config["endpoints"]["onos_user"],
+            password=config["endpoints"]["onos_password"]
+        )
+        
+        # Get enabled actions from config
+        self.enabled_actions = config.get("actions", {})
+        
+        # Get deployment constraints from config
+        self.deployment_config = {}
+        for dep in config.get("kubernetes", {}).get("deployments", []):
+            self.deployment_config[dep["name"]] = {
+                "min_replicas": dep.get("min_replicas", 1),
+                "max_replicas": dep.get("max_replicas", 5)
+            }
+        
+        # Track action history
+        self.action_history = []
     
-    def _run_kubectl(self, command: str, timeout: int = 30) -> tuple[bool, str]:
+    def execute(self, action: dict) -> dict:
         """
-        Run kubectl command on master node via SSH.
+        Execute a recommended action.
         
-        Args:
-            command: kubectl command to run (without 'kubectl' prefix)
-            timeout: Command timeout in seconds
-            
-        Returns:
-            Tuple of (success: bool, output: str)
-        """
-        ssh_command = f"ssh -o StrictHostKeyChecking=no {self.username}@{self.master_ip} 'sudo kubectl {command}'"
-        
-        try:
-            result = subprocess.run(
-                ssh_command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            
-            if result.returncode != 0:
-                logger.error(f"kubectl error: {result.stderr}")
-                return False, result.stderr
-            
-            return True, result.stdout
-            
-        except subprocess.TimeoutExpired:
-            logger.error(f"kubectl command timed out: {command}")
-            return False, "Command timed out"
-        except Exception as e:
-            logger.error(f"SSH/kubectl error: {e}")
-            return False, str(e)
-    
-    def execute(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute the recommended action.
+        This is the main entry point called after the Decision Maker
+        provides a recommendation.
         
         Args:
             action: Action dictionary from Decision Maker containing:
-                - action: Action type (horizontal_scaling, vertical_scaling, etc.)
+                - action: Action type (horizontal_scaling, etc.)
                 - parameters: Action-specific parameters
-                - analysis: LLM's analysis
-                - source: Source of violation (compute/network)
-        
+                - analysis: LLM's analysis (for logging)
+                
         Returns:
-            Result dictionary with success status and details
+            Result dictionary with:
+                - success: Boolean indicating if action succeeded
+                - message: Description of what happened
+                - details: Additional information
         """
         action_type = action.get("action", "none")
         parameters = action.get("parameters", {})
+        analysis = action.get("analysis", "No analysis")
         
         logger.info(f"Executing action: {action_type}")
-        logger.info(f"Parameters: {parameters}")
+        logger.info(f"Analysis: {analysis}")
+        
+        # Check if action type is "none"
+        if action_type == "none":
+            return {
+                "success": True,
+                "message": "No action required",
+                "details": {"analysis": analysis}
+            }
+        
+        # Check if action is enabled
+        if not self.enabled_actions.get(action_type, False):
+            logger.warning(f"Action '{action_type}' is not enabled in config")
+            return {
+                "success": False,
+                "message": f"Action '{action_type}' is disabled",
+                "details": {"enabled_actions": self.enabled_actions}
+            }
         
         # Route to appropriate handler
         if action_type == "horizontal_scaling":
-            return self._execute_horizontal_scaling(parameters)
+            result = self._execute_horizontal_scaling(parameters)
         elif action_type == "vertical_scaling":
-            return self._execute_vertical_scaling(parameters)
+            result = self._execute_vertical_scaling(parameters)
         elif action_type == "service_placement":
-            return self._execute_service_placement(parameters)
+            result = self._execute_service_placement(parameters)
         elif action_type == "flow_scheduling":
-            return self._execute_flow_scheduling(parameters)
-        elif action_type == "none":
-            logger.info("No action required")
-            return {"success": True, "message": "No action taken", "action": "none"}
+            result = self._execute_flow_scheduling(parameters)
         else:
-            logger.warning(f"Unknown action type: {action_type}")
-            return {"success": False, "error": f"Unknown action: {action_type}"}
+            logger.error(f"Unknown action type: {action_type}")
+            result = {
+                "success": False,
+                "message": f"Unknown action type: {action_type}",
+                "details": {}
+            }
+        
+        # Record action in history
+        self._record_action(action_type, parameters, result)
+        
+        return result
     
-    def _execute_horizontal_scaling(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _execute_horizontal_scaling(self, parameters: dict) -> dict:
         """
-        Scale deployment horizontally by adjusting replica count.
+        Execute horizontal scaling action.
         
         Args:
-            params: Must contain:
-                - deployment_name: Name of the deployment to scale
+            parameters: Dictionary containing:
+                - deployment_name: Name of deployment to scale
                 - replicas: Target number of replicas
-        
+                
         Returns:
             Result dictionary
         """
-        deployment_name = params.get("deployment_name")
-        replicas = params.get("replicas")
+        deployment_name = parameters.get("deployment_name")
+        target_replicas = parameters.get("replicas")
         
-        if not deployment_name or replicas is None:
+        if not deployment_name or target_replicas is None:
             return {
                 "success": False,
-                "error": "Missing deployment_name or replicas parameter"
+                "message": "Missing required parameters (deployment_name or replicas)",
+                "details": parameters
             }
         
-        try:
-            replicas = int(replicas)
-        except (ValueError, TypeError):
-            return {"success": False, "error": f"Invalid replicas value: {replicas}"}
-        
-        # Clamp replicas to reasonable range
-        replicas = max(1, min(10, replicas))
-        
-        # Get current replica count
-        current_replicas = self._get_deployment_replicas(deployment_name)
-        
-        if current_replicas is not None and current_replicas == replicas:
-            return {
-                "success": True,
-                "message": f"Already at {replicas} replicas",
-                "action": "horizontal_scaling",
-                "changed": False
-            }
-        
-        logger.info(f"Scaling {deployment_name} to {replicas} replicas")
-        
-        # Execute scale command
-        command = f"scale deployment {deployment_name} --replicas={replicas} -n {self.namespace}"
-        success, output = self._run_kubectl(command)
-        
-        if success:
-            logger.info(f"Successfully scaled {deployment_name}: {current_replicas} -> {replicas}")
-            return {
-                "success": True,
-                "message": f"Scaled {deployment_name} from {current_replicas} to {replicas} replicas",
-                "action": "horizontal_scaling",
-                "changed": True,
-                "previous_replicas": current_replicas,
-                "new_replicas": replicas
-            }
-        else:
-            return {"success": False, "error": output}
-    
-    def _execute_vertical_scaling(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Scale deployment vertically by adjusting CPU/memory limits.
-        
-        Args:
-            params: Must contain:
-                - deployment_name: Name of the deployment
-                - cpu_limit: New CPU limit (e.g., "500m")
-                - memory_limit: New memory limit (e.g., "512Mi")
-        
-        Returns:
-            Result dictionary
-        """
-        deployment_name = params.get("deployment_name")
-        cpu_limit = params.get("cpu_limit")
-        memory_limit = params.get("memory_limit")
-        
-        if not deployment_name:
-            return {"success": False, "error": "Missing deployment_name"}
-        
-        if not cpu_limit and not memory_limit:
-            return {"success": False, "error": "Must specify cpu_limit or memory_limit"}
-        
-        logger.info(f"Vertical scaling {deployment_name}: CPU={cpu_limit}, Mem={memory_limit}")
-        
-        # Build resource string
-        resources = []
-        if cpu_limit:
-            resources.append(f"cpu={cpu_limit}")
-        if memory_limit:
-            resources.append(f"memory={memory_limit}")
-        
-        resource_str = ",".join(resources)
-        
-        # Use kubectl set resources command
-        command = f"set resources deployment {deployment_name} --limits={resource_str} --requests={resource_str} -n {self.namespace}"
-        success, output = self._run_kubectl(command)
-        
-        if success:
-            logger.info(f"Successfully updated resources for {deployment_name}")
-            return {
-                "success": True,
-                "message": f"Updated {deployment_name} resources: CPU={cpu_limit}, Mem={memory_limit}",
-                "action": "vertical_scaling",
-                "changed": True
-            }
-        else:
-            return {"success": False, "error": output}
-    
-    def _execute_service_placement(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Move a pod to a different node using nodeSelector patch.
-        
-        Args:
-            params: Must contain:
-                - deployment_name: Name of the deployment
-                - target_node: Node to place the pod on
-        
-        Returns:
-            Result dictionary
-        """
-        deployment_name = params.get("deployment_name")
-        target_node = params.get("target_node")
-        
-        if not deployment_name or not target_node:
-            return {"success": False, "error": "Missing deployment_name or target_node"}
-        
-        logger.info(f"Placing {deployment_name} on node {target_node}")
-        
-        # Verify target node exists
-        success, output = self._run_kubectl(f"get node {target_node}")
-        if not success:
-            return {"success": False, "error": f"Node {target_node} not found"}
-        
-        # Patch deployment with nodeSelector
-        patch_json = json.dumps({
-            "spec": {
-                "template": {
-                    "spec": {
-                        "nodeSelector": {
-                            "kubernetes.io/hostname": target_node
-                        }
-                    }
-                }
-            }
+        # Get deployment constraints
+        constraints = self.deployment_config.get(deployment_name, {
+            "min_replicas": 1,
+            "max_replicas": 5
         })
         
-        # Escape quotes for shell
-        patch_json_escaped = patch_json.replace('"', '\\"')
+        # Enforce constraints
+        min_replicas = constraints["min_replicas"]
+        max_replicas = constraints["max_replicas"]
         
-        command = f'patch deployment {deployment_name} -n {self.namespace} -p "{patch_json_escaped}"'
-        success, output = self._run_kubectl(command)
+        original_target = target_replicas
+        target_replicas = max(min_replicas, min(max_replicas, int(target_replicas)))
         
-        if success:
-            logger.info(f"Successfully set nodeSelector for {deployment_name} to {target_node}")
+        if target_replicas != original_target:
+            logger.info(f"Adjusted replicas from {original_target} to {target_replicas} (constraints: {min_replicas}-{max_replicas})")
+        
+        # Get current replica count
+        deployments = self.k8s_client.get_deployments()
+        current_replicas = None
+        for dep in deployments:
+            if dep["name"] == deployment_name:
+                current_replicas = dep["replicas_desired"]
+                break
+        
+        if current_replicas is None:
+            return {
+                "success": False,
+                "message": f"Deployment '{deployment_name}' not found",
+                "details": {"available_deployments": [d["name"] for d in deployments]}
+            }
+        
+        # Check if scaling is needed
+        if current_replicas == target_replicas:
             return {
                 "success": True,
-                "message": f"Configured {deployment_name} to run on {target_node}",
-                "action": "service_placement",
-                "changed": True,
-                "target_node": target_node
+                "message": f"Deployment '{deployment_name}' already has {target_replicas} replicas",
+                "details": {
+                    "deployment": deployment_name,
+                    "replicas": target_replicas,
+                    "action_taken": False
+                }
+            }
+        
+        # Execute scaling
+        logger.info(f"Scaling {deployment_name}: {current_replicas} -> {target_replicas} replicas")
+        
+        success = self.k8s_client.scale_deployment(
+            deployment_name=deployment_name,
+            replicas=target_replicas
+        )
+        
+        if success:
+            return {
+                "success": True,
+                "message": f"Scaled '{deployment_name}' from {current_replicas} to {target_replicas} replicas",
+                "details": {
+                    "deployment": deployment_name,
+                    "previous_replicas": current_replicas,
+                    "new_replicas": target_replicas,
+                    "action_taken": True
+                }
             }
         else:
-            return {"success": False, "error": output}
+            return {
+                "success": False,
+                "message": f"Failed to scale '{deployment_name}'",
+                "details": {
+                    "deployment": deployment_name,
+                    "target_replicas": target_replicas
+                }
+            }
     
-    def _execute_flow_scheduling(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _execute_vertical_scaling(self, parameters: dict) -> dict:
         """
-        Reroute network traffic through ONOS SDN controller.
+        Execute vertical scaling action (adjust CPU/memory limits).
+        
+        NOT YET IMPLEMENTED.
         
         Args:
-            params: Must contain:
-                - src_ip: Source IP address
-                - dst_ip: Destination IP address
-                - path: List of switch IDs for the new path (optional)
-        
+            parameters: Dictionary containing scaling parameters
+            
         Returns:
             Result dictionary
         """
-        src_ip = params.get("src_ip")
-        dst_ip = params.get("dst_ip")
-        path = params.get("path", [])
+        logger.warning("Vertical scaling is not yet implemented")
+        return {
+            "success": False,
+            "message": "Vertical scaling is not yet implemented",
+            "details": parameters
+        }
+    
+    def _execute_service_placement(self, parameters: dict) -> dict:
+        """
+        Execute service placement action (migrate pod to different node).
         
-        if not src_ip or not dst_ip:
-            return {"success": False, "error": "Missing src_ip or dst_ip"}
+        NOT YET IMPLEMENTED.
         
-        logger.info(f"Rerouting traffic {src_ip} -> {dst_ip} via {path}")
-        
-        try:
-            # Create an ONOS intent for the new path
-            intent = {
-                "type": "HostToHostIntent",
-                "appId": "org.onosproject.cli",
-                "priority": 100,
-                "one": f"{src_ip}/-1",
-                "two": f"{dst_ip}/-1"
-            }
+        Args:
+            parameters: Dictionary containing placement parameters
             
-            # Submit intent to ONOS
-            url = f"{self.onos_url}/onos/v1/intents"
-            response = requests.post(
-                url,
-                json=intent,
-                auth=self.onos_auth,
-                headers={"Content-Type": "application/json"},
-                timeout=10
-            )
+        Returns:
+            Result dictionary
+        """
+        logger.warning("Service placement is not yet implemented")
+        return {
+            "success": False,
+            "message": "Service placement is not yet implemented",
+            "details": parameters
+        }
+    
+    def _execute_flow_scheduling(self, parameters: dict) -> dict:
+        """
+        Execute flow scheduling action (update network routes).
+        
+        NOT YET IMPLEMENTED.
+        
+        Args:
+            parameters: Dictionary containing flow parameters
             
-            if response.status_code in [200, 201]:
-                logger.info("Successfully submitted intent to ONOS")
-                return {
-                    "success": True,
-                    "message": f"Rerouted traffic between {src_ip} and {dst_ip}",
-                    "action": "flow_scheduling",
-                    "changed": True
+        Returns:
+            Result dictionary
+        """
+        logger.warning("Flow scheduling is not yet implemented")
+        return {
+            "success": False,
+            "message": "Flow scheduling is not yet implemented",
+            "details": parameters
+        }
+    
+    def _record_action(self, action_type: str, parameters: dict, result: dict):
+        """
+        Record an action in the history for tracking.
+        
+        Args:
+            action_type: Type of action executed
+            parameters: Parameters used
+            result: Result of the action
+        """
+        record = {
+            "timestamp": time.time(),
+            "action_type": action_type,
+            "parameters": parameters,
+            "success": result.get("success", False),
+            "message": result.get("message", "")
+        }
+        
+        self.action_history.append(record)
+        
+        # Keep only last 100 actions
+        if len(self.action_history) > 100:
+            self.action_history = self.action_history[-100:]
+    
+    def get_action_history(self, limit: int = 10) -> list:
+        """
+        Get recent action history.
+        
+        Args:
+            limit: Maximum number of records to return
+            
+        Returns:
+            List of recent action records
+        """
+        return self.action_history[-limit:]
+    
+    def get_current_state(self) -> dict:
+        """
+        Get current state of all managed deployments.
+        
+        Returns:
+            Dictionary with deployment states
+        """
+        deployments = self.k8s_client.get_deployments()
+        
+        state = {}
+        for dep in deployments:
+            name = dep["name"]
+            if name in self.deployment_config or "microservice" in name or "db" in name:
+                state[name] = {
+                    "replicas_desired": dep["replicas_desired"],
+                    "replicas_ready": dep["replicas_ready"],
+                    "replicas_available": dep["replicas_available"]
                 }
-            else:
-                error_msg = f"ONOS API error: {response.status_code} - {response.text}"
-                logger.error(error_msg)
-                return {"success": False, "error": error_msg}
-                
-        except requests.exceptions.RequestException as e:
-            error_msg = f"Network error communicating with ONOS: {str(e)}"
-            logger.error(error_msg)
-            return {"success": False, "error": error_msg}
-        except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
-            logger.error(error_msg)
-            return {"success": False, "error": error_msg}
-    
-    def _get_deployment_replicas(self, deployment_name: str) -> Optional[int]:
-        """
-        Get current replica count for a deployment.
         
-        Args:
-            deployment_name: Name of the deployment
-            
-        Returns:
-            Number of replicas or None if not found
-        """
-        command = f"get deployment {deployment_name} -n {self.namespace} -o jsonpath='{{.spec.replicas}}'"
-        success, output = self._run_kubectl(command)
-        
-        if success and output.strip():
-            try:
-                return int(output.strip())
-            except ValueError:
-                return None
-        return None
-    
-    def get_deployment_status(self, deployment_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Get current status of a deployment.
-        
-        Args:
-            deployment_name: Name of the deployment
-            
-        Returns:
-            Status dictionary or None if not found
-        """
-        command = f"get deployment {deployment_name} -n {self.namespace} -o json"
-        success, output = self._run_kubectl(command)
-        
-        if not success:
-            return None
-        
-        try:
-            deployment = json.loads(output)
-            return {
-                "name": deployment_name,
-                "replicas": deployment.get("spec", {}).get("replicas", 0),
-                "ready_replicas": deployment.get("status", {}).get("readyReplicas", 0),
-                "available_replicas": deployment.get("status", {}).get("availableReplicas", 0)
-            }
-        except json.JSONDecodeError:
-            return None
-    
-    def list_deployments(self) -> list:
-        """
-        List all deployments in the namespace.
-        
-        Returns:
-            List of deployment names
-        """
-        command = f"get deployments -n {self.namespace} -o jsonpath='{{.items[*].metadata.name}}'"
-        success, output = self._run_kubectl(command)
-        
-        if success and output.strip():
-            return output.strip().split()
-        return []
-    
-    def wait_for_rollout(self, deployment_name: str, timeout: int = 120) -> bool:
-        """
-        Wait for a deployment rollout to complete.
-        
-        Args:
-            deployment_name: Name of the deployment
-            timeout: Maximum seconds to wait
-            
-        Returns:
-            True if rollout completed, False if timeout
-        """
-        logger.info(f"Waiting for {deployment_name} rollout (timeout: {timeout}s)")
-        
-        command = f"rollout status deployment/{deployment_name} -n {self.namespace} --timeout={timeout}s"
-        success, output = self._run_kubectl(command, timeout=timeout + 10)
-        
-        if success:
-            logger.info(f"Rollout complete for {deployment_name}")
-            return True
-        else:
-            logger.warning(f"Rollout timeout or failed: {output}")
-            return False
+        return state
