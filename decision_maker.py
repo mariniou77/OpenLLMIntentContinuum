@@ -106,13 +106,14 @@ JSON Response:"""
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": self.temperature
+                "temperature": self.temperature,
+                "num_predict": 256  # Limit response length for faster generation
             }
         }
         
         try:
             logger.info(f"Querying Ollama ({self.model})...")
-            response = requests.post(url, json=payload, timeout=120)
+            response = requests.post(url, json=payload, timeout=300)  # 5 minute timeout
             response.raise_for_status()
             
             result = response.json()
