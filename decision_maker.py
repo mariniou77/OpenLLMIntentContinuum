@@ -60,16 +60,17 @@ class DecisionMaker:
     
     def _get_default_prompt_template(self) -> str:
         """Return a default prompt template if file not found."""
-        return """You are a Kubernetes administrator. Analyze this system state and recommend an action.
+        return """You are a Kubernetes scaling assistant. Respond with ONLY JSON.
 
-Violation: {violation_type}
-Thresholds: Upper={upper_threshold}s, Lower={lower_threshold}s
+VIOLATION: {violation_type}
+THRESHOLD: Upper={upper_threshold}s, Lower={lower_threshold}s
 
 {system_state}
 
-Respond with JSON: {{"analysis": "...", "source": "compute|network", "action": "horizontal_scaling|none", "parameters": {{"deployment_name": "...", "replicas": N}}}}
+Respond with ONLY this JSON format:
+{{"analysis": "brief explanation", "action": "horizontal_scaling", "deployment_name": "microservice3-deployment", "replicas": 2}}
 
-JSON Response:"""
+JSON:"""
     
     def _build_prompt(self, system_state_formatted: str, violation_type: str) -> str:
         """
@@ -108,13 +109,13 @@ JSON Response:"""
             "stream": False,
             "options": {
                 "temperature": self.temperature,
-                "num_predict": 256  # Limit response length for faster generation
+                "num_predict": 256
             }
         }
         
         try:
             logger.info(f"Querying Ollama ({self.model})...")
-            response = requests.post(url, json=payload, timeout=300)  # 5 minute timeout
+            response = requests.post(url, json=payload, timeout=300)
             response.raise_for_status()
             
             result = response.json()
@@ -147,31 +148,25 @@ JSON Response:"""
         
         # Try to extract JSON from the response
         try:
-            # First, try to parse the entire response as JSON
-            return json.loads(cleaned)
+            parsed = json.loads(cleaned)
+            # Ensure it's a dict, not a list
+            if isinstance(parsed, dict):
+                return self._normalize_response(parsed)
+            elif isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
+                return self._normalize_response(parsed[0])
         except json.JSONDecodeError:
             pass
         
         # Try to find JSON object in the response
         try:
-            # Look for JSON between curly braces
             start = cleaned.find('{')
             end = cleaned.rfind('}') + 1
             
             if start != -1 and end > start:
                 json_str = cleaned[start:end]
                 parsed = json.loads(json_str)
-                
-                # Convert flat format to nested format if needed
-                if "deployment_name" in parsed and "parameters" not in parsed:
-                    parsed["parameters"] = {
-                        "deployment_name": parsed.pop("deployment_name"),
-                        "replicas": parsed.pop("replicas", 2)
-                    }
-                if "source" not in parsed:
-                    parsed["source"] = "compute"
-                    
-                return parsed
+                if isinstance(parsed, dict):
+                    return self._normalize_response(parsed)
         except json.JSONDecodeError as e:
             logger.warning(f"JSON parse error: {e}")
         
@@ -187,7 +182,7 @@ JSON Response:"""
                     break
             
             # Look for replica counts
-            replicas = 2  # default
+            replicas = 2
             replica_match = re.search(r'replica[s]?["\s:]+(\d+)', response_lower)
             if replica_match:
                 replicas = int(replica_match.group(1))
@@ -205,8 +200,52 @@ JSON Response:"""
         except Exception as e:
             logger.warning(f"Fallback parsing failed: {e}")
         
-        logger.warning(f"Could not parse LLM response as JSON: {response_text[:200]}")
+        logger.warning(f"Could not parse LLM response: {response_text[:200]}")
         return self._get_fallback_response("Could not parse LLM response")
+    
+    def _normalize_response(self, parsed: dict) -> dict:
+        """
+        Normalize the parsed response to expected format.
+        
+        Args:
+            parsed: Raw parsed dictionary from LLM
+            
+        Returns:
+            Normalized dictionary with standard fields
+        """
+        result = {
+            "analysis": parsed.get("analysis", "No analysis provided"),
+            "source": parsed.get("source", "compute"),
+            "action": "none",
+            "parameters": {}
+        }
+        
+        # Check for action
+        action = parsed.get("action", "").lower().replace(" ", "_")
+        if action in ["horizontal_scaling", "horizontalscaling", "scale", "scaling"]:
+            result["action"] = "horizontal_scaling"
+        elif action == "none":
+            result["action"] = "none"
+        else:
+            result["action"] = action if action else "none"
+        
+        # Build parameters
+        if result["action"] == "horizontal_scaling":
+            # Handle different parameter formats
+            if "parameters" in parsed and isinstance(parsed["parameters"], dict):
+                result["parameters"] = parsed["parameters"]
+            else:
+                # Flat format - deployment_name and replicas at top level
+                dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
+                replicas = parsed.get("replicas") or parsed.get("replica_count") or parsed.get("count") or 2
+                
+                if dep_name:
+                    result["parameters"] = {
+                        "deployment_name": dep_name,
+                        "replicas": replicas
+                    }
+        
+        return result
     
     def _get_fallback_response(self, reason: str) -> dict:
         """Return a safe fallback response when LLM fails."""
@@ -227,14 +266,14 @@ JSON Response:"""
         Returns:
             Validated action dictionary
         """
+        # Ensure action is a dictionary
+        if not isinstance(action, dict):
+            logger.warning(f"Action is not a dict: {type(action)}")
+            return self._get_fallback_response("Invalid action format")
+        
         # Ensure required fields exist
         if "action" not in action:
             action["action"] = "none"
-        
-        # Normalize action name (handle variations)
-        action_name = action["action"].lower().replace(" ", "_")
-        if action_name in ["horizontal_scaling", "horizontalscaling", "scale", "scaling"]:
-            action["action"] = "horizontal_scaling"
         
         if "parameters" not in action:
             action["parameters"] = {}
@@ -247,29 +286,18 @@ JSON Response:"""
         
         # Validate horizontal_scaling parameters
         if action["action"] == "horizontal_scaling":
-            params = action["parameters"]
+            params = action.get("parameters", {})
             
-            # Handle different parameter names for deployment
-            if "deployment_name" not in params:
-                # Try alternative names
-                for alt_name in ["deployment", "name", "deploy_name"]:
-                    if alt_name in params:
-                        params["deployment_name"] = params[alt_name]
-                        break
+            if not isinstance(params, dict):
+                logger.warning("Parameters is not a dict")
+                action["action"] = "none"
+                return action
             
             # Check deployment name exists
             if "deployment_name" not in params:
                 logger.warning("horizontal_scaling missing deployment_name")
                 action["action"] = "none"
                 return action
-            
-            # Handle different parameter names for replicas
-            if "replicas" not in params:
-                # Try alternative names
-                for alt_name in ["replica_count", "replica", "count", "num_replicas"]:
-                    if alt_name in params:
-                        params["replicas"] = params[alt_name]
-                        break
             
             # Check replicas is a valid number
             if "replicas" not in params:
@@ -279,7 +307,6 @@ JSON Response:"""
             
             try:
                 replicas = int(params["replicas"])
-                # Enforce reasonable limits
                 if replicas < 1:
                     replicas = 1
                 if replicas > 10:
