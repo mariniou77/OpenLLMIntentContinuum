@@ -16,12 +16,15 @@ endpoints:
   onos_password: "rocks"
   sflow_rt: "http://localhost:8008"
   kubernetes_master: "10.132.0.14"
+  kubernetes_user: "antonios-icontinuum"
   locust: "http://10.132.0.14:8089"
 
 # Application
 application:
   entry_point: "http://10.132.0.14:5001/resize"
+  sdn_entry_point: "http://192.168.100.100:5001/resize"
   test_image: "/home/antonios-icontinuum/OpenLLMIntentContinuum/images/family.jpg"
+  remote_test_image: "/home/antonios-icontinuum/test_converted.jpg"
   webhooks: "http://microservice2-service:5002/bw,http://microservice3-service:8081/,http://microservice4-service:5004/notify"
   db_url: "http://db-service:5006/track_time"
   logs_url: "http://db-service:5006/log"

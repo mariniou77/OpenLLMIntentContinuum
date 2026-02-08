@@ -74,65 +74,77 @@ class IntentWatchLoop:
     
     def _measure_response_time(self) -> Optional[float]:
         """
-        Measure response time by sending a request to the application.
+        Measure response time by sending a request to the application via SSH.
         
-        The microservice chain expects specific headers:
-        - X-Webhooks: Comma-separated list of downstream service URLs
-        - X-Request-ID: Unique request identifier
-        - X-Special-Object: Object to detect
-        - X-Central-DB-URL: URL for time tracking database
-        - X-Logs-URL: URL for logging service
+        Since the SDN-Controller cannot directly reach the microservices via
+        the SDN network, we execute curl on the Master node via SSH.
         
         Returns:
             Response time in seconds, or None if request failed
         """
         import uuid
+        import subprocess
         
         try:
-            start_time = time.time()
-            
-            # Build headers required by the microservice chain
             app_config = self.config["application"]
-            headers = {
-                'X-Request-ID': str(uuid.uuid4()),
-                'X-Webhooks': app_config.get("webhooks", ""),
-                'X-Special-Object': 'person',
-                'X-Central-DB-URL': app_config.get("db_url", "http://db-service:5006/track_time"),
-                'X-Logs-URL': app_config.get("logs_url", "http://db-service:5006/log")
-            }
+            k8s_config = self.config["endpoints"]
             
-            # If we have a test image, send it as multipart form data
-            if self.test_image_path:
+            # Build the curl command to run on the Master node
+            request_id = str(uuid.uuid4())
+            
+            # Use the SDN IP (192.168.100.100) since we're running from Master
+            # The test image must exist on the Master node
+            curl_command = (
+                f'curl -X POST '
+                f'-F "image=@{app_config.get("remote_test_image", "/home/antonios-icontinuum/test_converted.jpg")}" '
+                f'-H "X-Request-ID: {request_id}" '
+                f'-H "X-Webhooks: {app_config.get("webhooks", "")}" '
+                f'-H "X-Special-Object: person" '
+                f'-H "X-Central-DB-URL: {app_config.get("db_url", "")}" '
+                f'-H "X-Logs-URL: {app_config.get("logs_url", "")}" '
+                f'{app_config.get("sdn_entry_point", "http://192.168.100.100:5001/resize")} '
+                f'--max-time 60 '
+                f'-w "%{{time_total}}" '
+                f'-o /dev/null -s'
+            )
+            
+            # Execute curl via SSH on the Master node
+            master_host = k8s_config.get("kubernetes_master", "10.132.0.14")
+            master_user = k8s_config.get("kubernetes_user", "antonios-icontinuum")
+            
+            ssh_command = [
+                "ssh",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=10",
+                f"{master_user}@{master_host}",
+                curl_command
+            ]
+            
+            result = subprocess.run(
+                ssh_command,
+                capture_output=True,
+                text=True,
+                timeout=90
+            )
+            
+            if result.returncode == 0:
+                # Parse the response time from curl output
                 try:
-                    with open(self.test_image_path, 'rb') as f:
-                        files = {'image': ('test.jpg', f, 'image/jpeg')}
-                        response = requests.post(
-                            self.app_endpoint,
-                            files=files,
-                            headers=headers,
-                            timeout=60  # Increase timeout for full chain processing
-                        )
-                except FileNotFoundError:
-                    logger.error(f"Test image not found: {self.test_image_path}")
+                    response_time = float(result.stdout.strip())
+                    logger.debug(f"Request successful, response time: {response_time:.3f}s")
+                    return response_time
+                except ValueError:
+                    logger.error(f"Could not parse response time: {result.stdout}")
                     return None
             else:
-                # Simple GET request (may not work with this microservice)
-                response = requests.get(self.app_endpoint, headers=headers, timeout=60)
-            
-            end_time = time.time()
-            response_time = end_time - start_time
-            
-            if response.status_code == 200:
-                logger.debug(f"Request successful, response time: {response_time:.3f}s")
-                return response_time
-            else:
-                logger.warning(f"Application returned status {response.status_code}")
-                return response_time
+                logger.warning(f"Curl failed with return code {result.returncode}")
+                logger.warning(f"Stderr: {result.stderr}")
+                return None
                 
-        except requests.exceptions.Timeout:
-            logger.error("Request to application timed out")
-            return 60.0  # Return timeout value
-        except requests.exceptions.RequestException as e:
+        except subprocess.TimeoutExpired:
+            logger.error("SSH request timed out after 90 seconds")
+            return 90.0
+        except Exception as e:
             logger.error(f"Request failed: {e}")
             return None
     
