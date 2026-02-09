@@ -213,8 +213,17 @@ JSON:"""
         Returns:
             Normalized dictionary with standard fields
         """
+        import re
+        
+        # Extract analysis using regex to handle misspellings like "analysiS", "analysii", "Analysis"
+        analysis = "No analysis provided"
+        for key in parsed.keys():
+            if re.match(r'^analys[iI]+[sS]*$', key, re.IGNORECASE):
+                analysis = parsed[key]
+                break
+        
         result = {
-            "analysis": parsed.get("analysis", "No analysis provided"),
+            "analysis": analysis,
             "source": parsed.get("source", "compute"),
             "action": "none",
             "parameters": {}
@@ -237,7 +246,15 @@ JSON:"""
             else:
                 # Flat format - deployment_name and replicas at top level
                 dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-                replicas = parsed.get("replicas") or parsed.get("replica_count") or parsed.get("count") or 2
+                
+                # Handle different replica parameter names
+                replicas = None
+                for key in parsed.keys():
+                    if re.match(r'^replica[s_]*[count]*$', key, re.IGNORECASE):
+                        replicas = parsed[key]
+                        break
+                if replicas is None:
+                    replicas = 2  # Default value
                 
                 if dep_name:
                     result["parameters"] = {
