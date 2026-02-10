@@ -121,3 +121,110 @@ class ONOSClient:
             return True
         except Exception:
             return False
+        
+    def add_point_to_point_intent(self, ingress_device: str, egress_device: str, path: list = None) -> dict:
+        """
+        Add a point-to-point intent in ONOS.
+        
+        This creates a connectivity intent between two switches.
+        ONOS will compute the path automatically if not specified.
+        
+        Args:
+            ingress_device: Source switch ID (e.g., "of:0000000000000001")
+            egress_device: Destination switch ID
+            path: Optional list of switches for explicit path
+            
+        Returns:
+            Dictionary with success status
+        """
+        # ONOS uses intents for high-level connectivity
+        # The PointToPointIntent connects two specific ports
+        
+        intent_data = {
+            "type": "PointToPointIntent",
+            "appId": "org.onosproject.cli",
+            "ingressPoint": {
+                "device": ingress_device,
+                "port": "1"
+            },
+            "egressPoint": {
+                "device": egress_device,
+                "port": "1"
+            }
+        }
+        
+        # If path is specified, we use it as waypoints
+        if path and len(path) > 2:
+            # ONOS doesn't directly support waypoints in basic intents
+            # We would need to use more advanced intent types or flow rules
+            # For now, we let ONOS compute the path
+            logger.info(f"Path hint provided: {path} (ONOS will compute actual path)")
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/onos/v1/intents",
+                auth=self.auth,
+                json=intent_data,
+                timeout=10
+            )
+            
+            if response.status_code in [200, 201]:
+                logger.info(f"Intent created: {ingress_device} -> {egress_device}")
+                return {"success": True, "message": "Intent created"}
+            else:
+                logger.error(f"Failed to create intent: {response.status_code} - {response.text}")
+                return {"success": False, "error": f"HTTP {response.status_code}: {response.text}"}
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"ONOS request failed: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def delete_intent(self, app_id: str, intent_key: str) -> dict:
+        """
+        Delete an intent from ONOS.
+        
+        Args:
+            app_id: Application ID that created the intent
+            intent_key: Unique key of the intent
+            
+        Returns:
+            Dictionary with success status
+        """
+        try:
+            response = requests.delete(
+                f"{self.base_url}/onos/v1/intents/{app_id}/{intent_key}",
+                auth=self.auth,
+                timeout=10
+            )
+            
+            if response.status_code in [200, 204]:
+                return {"success": True}
+            else:
+                return {"success": False, "error": f"HTTP {response.status_code}"}
+                
+        except requests.exceptions.RequestException as e:
+            return {"success": False, "error": str(e)}
+    
+    def get_intents(self) -> list:
+        """
+        Get all intents from ONOS.
+        
+        Returns:
+            List of intent dictionaries
+        """
+        try:
+            response = requests.get(
+                f"{self.base_url}/onos/v1/intents",
+                auth=self.auth,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return response.json().get("intents", [])
+            else:
+                logger.error(f"Failed to get intents: {response.status_code}")
+                return []
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get intents: {e}")
+            return []

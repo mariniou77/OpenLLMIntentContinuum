@@ -55,7 +55,11 @@ class IntentWatchLoop:
         # Initialize components
         self.data_collector = DataCollector(config)
         self.decision_maker = DecisionMaker(config)
-        self.action_executor = ActionExecutor(config)
+        self.action_executor = ActionExecutor(
+            config, 
+            self.data_collector.k8s_client,
+            self.data_collector.onos_client
+        )
         
         # EMA state
         self.ema_rt: Optional[float] = None

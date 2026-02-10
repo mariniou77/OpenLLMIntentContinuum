@@ -37,23 +37,32 @@ llm:
 # Actions enabled (start with horizontal scaling only)
 actions:
   horizontal_scaling: true
-  vertical_scaling: false
-  service_placement: false
-  flow_scheduling: false
+  vertical_scaling: true
+  service_placement: true
+  flow_scheduling: true
 
 # Kubernetes
 kubernetes:
   namespace: "default"
+  ssh_user: "antonios-icontinuum"
   deployments:
     - name: "microservice1-deployment"
       min_replicas: 1
       max_replicas: 5
+      default_cpu: "300m"
+      default_memory: "312Mi"
     - name: "microservice2-deployment"
       min_replicas: 1
       max_replicas: 5
+      default_cpu: "300m"
+      default_memory: "312Mi"
     - name: "microservice3-deployment"
       min_replicas: 1
       max_replicas: 5
+      default_cpu: "500m"
+      default_memory: "512Mi"
     - name: "microservice4-deployment"
       min_replicas: 1
       max_replicas: 3
+      default_cpu: "300m"
+      default_memory: "312Mi"

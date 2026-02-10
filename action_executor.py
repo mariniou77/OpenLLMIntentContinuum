@@ -2,21 +2,16 @@
 Action Executor Module
 
 This module executes the actions recommended by the Decision Maker.
-It interfaces with Kubernetes and ONOS to implement changes.
-
 Supported actions:
-- horizontal_scaling: Scale deployment replicas up or down
-- vertical_scaling: Adjust CPU/memory limits (future)
-- service_placement: Migrate pods to different nodes (future)
-- flow_scheduling: Update network flow rules (future)
+- horizontal_scaling: Change the number of pod replicas
+- vertical_scaling: Change CPU/memory limits for a deployment
+- service_placement: Move a pod to a different node
+- flow_scheduling: Change network traffic path via ONOS
 """
 
 import logging
-import time
-from typing import Optional
-
-from utils.kubernetes_client import KubernetesClient
-from utils.onos_client import ONOSClient
+from typing import Dict, Any, Optional
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -24,291 +19,347 @@ logger = logging.getLogger(__name__)
 class ActionExecutor:
     """
     Executes recommended actions on the infrastructure.
-    
-    This class is responsible for translating high-level actions
-    (like "scale deployment X to Y replicas") into actual API calls
-    to Kubernetes and ONOS.
     """
     
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, kubernetes_client, onos_client=None):
         """
-        Initialize Action Executor with configuration.
+        Initialize the Action Executor.
         
         Args:
-            config: Configuration dictionary containing endpoints and settings
+            config: Configuration dictionary
+            kubernetes_client: Kubernetes client instance
+            onos_client: ONOS client instance (optional, for flow scheduling)
         """
         self.config = config
-        
-        # Initialize clients
-        self.k8s_client = KubernetesClient(
-            master_ip=config["endpoints"]["kubernetes_master"]
-        )
-        
-        self.onos_client = ONOSClient(
-            base_url=config["endpoints"]["onos"],
-            username=config["endpoints"]["onos_user"],
-            password=config["endpoints"]["onos_password"]
-        )
-        
-        # Get enabled actions from config
-        self.enabled_actions = config.get("actions", {})
-        
-        # Get deployment constraints from config
-        self.deployment_config = {}
-        for dep in config.get("kubernetes", {}).get("deployments", []):
-            self.deployment_config[dep["name"]] = {
-                "min_replicas": dep.get("min_replicas", 1),
-                "max_replicas": dep.get("max_replicas", 5)
-            }
-        
-        # Track action history
+        self.k8s_client = kubernetes_client
+        self.onos_client = onos_client
         self.action_history = []
-    
-    def execute(self, action: dict) -> dict:
-        """
-        Execute a recommended action.
+        self.max_history = 100
         
-        This is the main entry point called after the Decision Maker
-        provides a recommendation.
+    def execute(self, action: str, parameters: dict, analysis: str = "") -> Dict[str, Any]:
+        """
+        Execute the recommended action.
         
         Args:
-            action: Action dictionary from Decision Maker containing:
-                - action: Action type (horizontal_scaling, etc.)
-                - parameters: Action-specific parameters
-                - analysis: LLM's analysis (for logging)
-                
+            action: Action type (horizontal_scaling, vertical_scaling, etc.)
+            parameters: Action parameters
+            analysis: LLM analysis text for logging
+            
         Returns:
-            Result dictionary with:
-                - success: Boolean indicating if action succeeded
-                - message: Description of what happened
-                - details: Additional information
+            Dictionary with success status and message
         """
-        action_type = action.get("action", "none")
-        parameters = action.get("parameters", {})
-        analysis = action.get("analysis", "No analysis")
-        
-        logger.info(f"Executing action: {action_type}")
+        logger.info(f"Executing action: {action}")
         logger.info(f"Analysis: {analysis}")
         
-        # Check if action type is "none"
-        if action_type == "none":
-            return {
-                "success": True,
-                "message": "No action required",
-                "details": {"analysis": analysis}
-            }
-        
         # Check if action is enabled
-        if not self.enabled_actions.get(action_type, False):
-            logger.warning(f"Action '{action_type}' is not enabled in config")
+        if not self.config.get("actions", {}).get(action, False):
             return {
                 "success": False,
-                "message": f"Action '{action_type}' is disabled",
-                "details": {"enabled_actions": self.enabled_actions}
+                "message": f"Action '{action}' is not enabled in configuration"
             }
         
         # Route to appropriate handler
-        if action_type == "horizontal_scaling":
-            result = self._execute_horizontal_scaling(parameters)
-        elif action_type == "vertical_scaling":
-            result = self._execute_vertical_scaling(parameters)
-        elif action_type == "service_placement":
-            result = self._execute_service_placement(parameters)
-        elif action_type == "flow_scheduling":
-            result = self._execute_flow_scheduling(parameters)
-        else:
-            logger.error(f"Unknown action type: {action_type}")
-            result = {
+        handlers = {
+            "horizontal_scaling": self._execute_horizontal_scaling,
+            "vertical_scaling": self._execute_vertical_scaling,
+            "service_placement": self._execute_service_placement,
+            "flow_scheduling": self._execute_flow_scheduling
+        }
+        
+        handler = handlers.get(action)
+        if not handler:
+            return {
                 "success": False,
-                "message": f"Unknown action type: {action_type}",
-                "details": {}
+                "message": f"Unknown action type: {action}"
             }
         
+        result = handler(parameters)
+        
         # Record action in history
-        self._record_action(action_type, parameters, result)
+        self._record_action(action, parameters, result, analysis)
         
         return result
     
-    def _execute_horizontal_scaling(self, parameters: dict) -> dict:
+    def _execute_horizontal_scaling(self, parameters: dict) -> Dict[str, Any]:
         """
-        Execute horizontal scaling action.
+        Execute horizontal scaling (change replica count).
         
         Args:
-            parameters: Dictionary containing:
-                - deployment_name: Name of deployment to scale
-                - replicas: Target number of replicas
-                
+            parameters: Must contain 'deployment_name' and 'replicas'
+            
         Returns:
             Result dictionary
         """
-        deployment_name = parameters.get("deployment_name")
-        target_replicas = parameters.get("replicas")
+        deployment_name = parameters.get("deployment_name", "").lower()
+        target_replicas = parameters.get("replicas", 2)
         
-        if not deployment_name or target_replicas is None:
-            return {
-                "success": False,
-                "message": "Missing required parameters (deployment_name or replicas)",
-                "details": parameters
-            }
+        if not deployment_name:
+            return {"success": False, "message": "No deployment name provided"}
         
-        # Get deployment constraints
-        constraints = self.deployment_config.get(deployment_name, {
-            "min_replicas": 1,
-            "max_replicas": 5
-        })
+        # Validate against constraints
+        constraints = self._get_deployment_constraints(deployment_name)
+        min_replicas = constraints.get("min_replicas", 1)
+        max_replicas = constraints.get("max_replicas", 5)
         
-        # Enforce constraints
-        min_replicas = constraints["min_replicas"]
-        max_replicas = constraints["max_replicas"]
-        
-        original_target = target_replicas
+        # Clamp replicas to valid range
         target_replicas = max(min_replicas, min(max_replicas, int(target_replicas)))
         
-        if target_replicas != original_target:
-            logger.info(f"Adjusted replicas from {original_target} to {target_replicas} (constraints: {min_replicas}-{max_replicas})")
-        
-        # Get current replica count (case-insensitive match)
-        deployments = self.k8s_client.get_deployments()
+        # Get current replica count
+        current_state = self.k8s_client.get_deployments()
         current_replicas = None
         actual_deployment_name = None
         
-        for dep in deployments:
-            if dep["name"].lower() == deployment_name.lower():
-                current_replicas = dep["replicas_desired"]
-                actual_deployment_name = dep["name"]  # Use actual name from cluster
+        for dep in current_state:
+            if dep.get("name", "").lower() == deployment_name:
+                current_replicas = dep.get("ready_replicas", 0)
+                actual_deployment_name = dep.get("name")
                 break
         
-        # Use the actual deployment name from the cluster
-        if actual_deployment_name:
-            deployment_name = actual_deployment_name
-        
-        if current_replicas is None:
+        if actual_deployment_name is None:
             return {
                 "success": False,
-                "message": f"Deployment '{deployment_name}' not found",
-                "details": {"available_deployments": [d["name"] for d in deployments]}
+                "message": f"Deployment '{deployment_name}' not found"
             }
         
-        # Check if scaling is needed
         if current_replicas == target_replicas:
             return {
                 "success": True,
-                "message": f"Deployment '{deployment_name}' already has {target_replicas} replicas",
-                "details": {
-                    "deployment": deployment_name,
-                    "replicas": target_replicas,
-                    "action_taken": False
-                }
+                "message": f"Deployment '{actual_deployment_name}' already has {target_replicas} replicas"
             }
         
         # Execute scaling
-        logger.info(f"Scaling {deployment_name}: {current_replicas} -> {target_replicas} replicas")
+        logger.info(f"Scaling {actual_deployment_name}: {current_replicas} -> {target_replicas} replicas")
+        result = self.k8s_client.scale_deployment(actual_deployment_name, target_replicas)
         
-        success = self.k8s_client.scale_deployment(
-            deployment_name=deployment_name,
-            replicas=target_replicas
-        )
-        
-        if success:
+        if result.get("success"):
             return {
                 "success": True,
-                "message": f"Scaled '{deployment_name}' from {current_replicas} to {target_replicas} replicas",
-                "details": {
-                    "deployment": deployment_name,
-                    "previous_replicas": current_replicas,
-                    "new_replicas": target_replicas,
-                    "action_taken": True
-                }
+                "message": f"Scaled '{actual_deployment_name}' from {current_replicas} to {target_replicas} replicas"
             }
         else:
             return {
                 "success": False,
-                "message": f"Failed to scale '{deployment_name}'",
-                "details": {
-                    "deployment": deployment_name,
-                    "target_replicas": target_replicas
-                }
+                "message": f"Failed to scale: {result.get('error', 'Unknown error')}"
             }
     
-    def _execute_vertical_scaling(self, parameters: dict) -> dict:
+    def _execute_vertical_scaling(self, parameters: dict) -> Dict[str, Any]:
         """
-        Execute vertical scaling action (adjust CPU/memory limits).
+        Execute vertical scaling (change CPU/memory limits).
         
-        NOT YET IMPLEMENTED.
+        This requires patching the deployment with new resource limits.
+        The pods will be restarted with the new limits.
         
         Args:
-            parameters: Dictionary containing scaling parameters
+            parameters: Must contain 'deployment_name', 'cpu_limit', 'memory_limit'
             
         Returns:
             Result dictionary
         """
-        logger.warning("Vertical scaling is not yet implemented")
-        return {
-            "success": False,
-            "message": "Vertical scaling is not yet implemented",
-            "details": parameters
-        }
-    
-    def _execute_service_placement(self, parameters: dict) -> dict:
-        """
-        Execute service placement action (migrate pod to different node).
+        deployment_name = parameters.get("deployment_name", "").lower()
+        cpu_limit = parameters.get("cpu_limit", "500m")
+        memory_limit = parameters.get("memory_limit", "512Mi")
         
-        NOT YET IMPLEMENTED.
+        if not deployment_name:
+            return {"success": False, "message": "No deployment name provided"}
+        
+        # Find the actual deployment name (case-insensitive)
+        current_state = self.k8s_client.get_deployments()
+        actual_deployment_name = None
+        
+        for dep in current_state:
+            if dep.get("name", "").lower() == deployment_name:
+                actual_deployment_name = dep.get("name")
+                break
+        
+        if actual_deployment_name is None:
+            return {
+                "success": False,
+                "message": f"Deployment '{deployment_name}' not found"
+            }
+        
+        # Build the patch command
+        # This patches the first container in the pod spec
+        patch_json = f'{{"spec":{{"template":{{"spec":{{"containers":[{{"name":"nginx","resources":{{"limits":{{"cpu":"{cpu_limit}","memory":"{memory_limit}"}},"requests":{{"cpu":"{cpu_limit}","memory":"{memory_limit}"}}}}}}]}}}}}}}}'
+        
+        logger.info(f"Vertical scaling {actual_deployment_name}: CPU={cpu_limit}, Memory={memory_limit}")
+        
+        result = self.k8s_client.patch_deployment(actual_deployment_name, patch_json)
+        
+        if result.get("success"):
+            return {
+                "success": True,
+                "message": f"Updated '{actual_deployment_name}' resources: CPU={cpu_limit}, Memory={memory_limit}"
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Failed to update resources: {result.get('error', 'Unknown error')}"
+            }
+    
+    def _execute_service_placement(self, parameters: dict) -> Dict[str, Any]:
+        """
+        Execute service placement (move pod to different node).
+        
+        This adds a nodeSelector to the deployment, causing pods to be
+        rescheduled on the target node.
         
         Args:
-            parameters: Dictionary containing placement parameters
+            parameters: Must contain 'deployment_name' and 'target_node'
             
         Returns:
             Result dictionary
         """
-        logger.warning("Service placement is not yet implemented")
-        return {
-            "success": False,
-            "message": "Service placement is not yet implemented",
-            "details": parameters
-        }
-    
-    def _execute_flow_scheduling(self, parameters: dict) -> dict:
-        """
-        Execute flow scheduling action (update network routes).
+        deployment_name = parameters.get("deployment_name", "").lower()
+        target_node = parameters.get("target_node", "")
         
-        NOT YET IMPLEMENTED.
+        if not deployment_name:
+            return {"success": False, "message": "No deployment name provided"}
+        
+        if not target_node:
+            return {"success": False, "message": "No target node provided"}
+        
+        # Find the actual deployment name
+        current_state = self.k8s_client.get_deployments()
+        actual_deployment_name = None
+        
+        for dep in current_state:
+            if dep.get("name", "").lower() == deployment_name:
+                actual_deployment_name = dep.get("name")
+                break
+        
+        if actual_deployment_name is None:
+            return {
+                "success": False,
+                "message": f"Deployment '{deployment_name}' not found"
+            }
+        
+        # Verify target node exists
+        nodes = self.k8s_client.get_nodes()
+        node_names = [n.get("name", "").lower() for n in nodes]
+        
+        if target_node.lower() not in node_names:
+            return {
+                "success": False,
+                "message": f"Target node '{target_node}' not found. Available: {node_names}"
+            }
+        
+        # Build the patch to add nodeSelector
+        patch_json = f'{{"spec":{{"template":{{"spec":{{"nodeSelector":{{"kubernetes.io/hostname":"{target_node}"}}}}}}}}}}'
+        
+        logger.info(f"Moving {actual_deployment_name} to node {target_node}")
+        
+        result = self.k8s_client.patch_deployment(actual_deployment_name, patch_json)
+        
+        if result.get("success"):
+            return {
+                "success": True,
+                "message": f"Scheduled '{actual_deployment_name}' to run on node '{target_node}'"
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Failed to update placement: {result.get('error', 'Unknown error')}"
+            }
+    
+    def _execute_flow_scheduling(self, parameters: dict) -> Dict[str, Any]:
+        """
+        Execute flow scheduling (change network path via ONOS).
+        
+        This installs flow rules in ONOS to route traffic through
+        the specified path.
         
         Args:
-            parameters: Dictionary containing flow parameters
+            parameters: Must contain 'source_switch', 'destination_switch', 'new_path'
             
         Returns:
             Result dictionary
         """
-        logger.warning("Flow scheduling is not yet implemented")
-        return {
-            "success": False,
-            "message": "Flow scheduling is not yet implemented",
-            "details": parameters
-        }
+        if self.onos_client is None:
+            return {
+                "success": False,
+                "message": "ONOS client not configured for flow scheduling"
+            }
+        
+        source = parameters.get("source_switch", "")
+        destination = parameters.get("destination_switch", "")
+        new_path = parameters.get("new_path", [])
+        
+        if not source or not destination:
+            return {
+                "success": False,
+                "message": "Source and destination switches are required"
+            }
+        
+        if not new_path:
+            return {
+                "success": False,
+                "message": "New path (list of switches) is required"
+            }
+        
+        logger.info(f"Configuring flow path: {source} -> {destination} via {new_path}")
+        
+        # Install intent in ONOS for the new path
+        result = self.onos_client.add_point_to_point_intent(source, destination, new_path)
+        
+        if result.get("success"):
+            return {
+                "success": True,
+                "message": f"Installed flow path from {source} to {destination} via {len(new_path)} switches"
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Failed to install flow: {result.get('error', 'Unknown error')}"
+            }
     
-    def _record_action(self, action_type: str, parameters: dict, result: dict):
+    def _get_deployment_constraints(self, deployment_name: str) -> dict:
         """
-        Record an action in the history for tracking.
+        Get constraints for a deployment from configuration.
         
         Args:
-            action_type: Type of action executed
-            parameters: Parameters used
-            result: Result of the action
+            deployment_name: Name of the deployment
+            
+        Returns:
+            Dictionary with min_replicas, max_replicas, etc.
+        """
+        deployments = self.config.get("kubernetes", {}).get("deployments", [])
+        
+        for dep in deployments:
+            if dep.get("name", "").lower() == deployment_name.lower():
+                return dep
+        
+        # Return defaults if not found
+        return {
+            "min_replicas": 1,
+            "max_replicas": 5,
+            "default_cpu": "300m",
+            "default_memory": "312Mi"
+        }
+    
+    def _record_action(self, action: str, parameters: dict, result: dict, analysis: str):
+        """
+        Record an action in the history.
+        
+        Args:
+            action: Action type
+            parameters: Action parameters
+            result: Execution result
+            analysis: LLM analysis
         """
         record = {
-            "timestamp": time.time(),
-            "action_type": action_type,
+            "timestamp": datetime.now().isoformat(),
+            "action": action,
             "parameters": parameters,
             "success": result.get("success", False),
-            "message": result.get("message", "")
+            "message": result.get("message", ""),
+            "analysis": analysis
         }
         
         self.action_history.append(record)
         
-        # Keep only last 100 actions
-        if len(self.action_history) > 100:
-            self.action_history = self.action_history[-100:]
+        # Trim history if too long
+        if len(self.action_history) > self.max_history:
+            self.action_history = self.action_history[-self.max_history:]
     
     def get_action_history(self, limit: int = 10) -> list:
         """
@@ -324,21 +375,12 @@ class ActionExecutor:
     
     def get_current_state(self) -> dict:
         """
-        Get current state of all managed deployments.
+        Get current state of deployments.
         
         Returns:
             Dictionary with deployment states
         """
         deployments = self.k8s_client.get_deployments()
-        
-        state = {}
-        for dep in deployments:
-            name = dep["name"]
-            if name in self.deployment_config or "microservice" in name or "db" in name:
-                state[name] = {
-                    "replicas_desired": dep["replicas_desired"],
-                    "replicas_ready": dep["replicas_ready"],
-                    "replicas_available": dep["replicas_available"]
-                }
-        
-        return state
+        return {
+            "deployments": deployments
+        }

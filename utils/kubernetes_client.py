@@ -186,6 +186,34 @@ class KubernetesClient:
         else:
             logger.error(f"Failed to scale {deployment_name}: {output}")
             return False
+        
+    def patch_deployment(self, deployment_name: str, patch_json: str, namespace: str = "default") -> dict:
+        """
+        Patch a deployment with the given JSON patch.
+        
+        Args:
+            deployment_name: Name of the deployment to patch
+            patch_json: JSON string with the patch content
+            namespace: Kubernetes namespace
+            
+        Returns:
+            Dictionary with success status and message
+        """
+        command = (
+            f"sudo kubectl patch deployment {deployment_name} "
+            f"-n {namespace} "
+            f"--type=strategic "
+            f"-p '{patch_json}'"
+        )
+        
+        result = self._run_kubectl(command)
+        
+        if result["success"]:
+            logger.info(f"Successfully patched {deployment_name}")
+            return {"success": True, "message": f"Patched {deployment_name}"}
+        else:
+            logger.error(f"Failed to patch {deployment_name}: {result.get('error')}")
+            return {"success": False, "error": result.get("error", "Unknown error")}
     
     def get_cluster_summary(self) -> dict:
         """

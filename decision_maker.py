@@ -213,9 +213,8 @@ JSON:"""
         Returns:
             Normalized dictionary with standard fields
         """
-        import re
         
-        # Extract analysis using regex to handle misspellings like "analysiS", "analysii", "Analysis"
+        # Extract analysis using regex to handle misspellings
         analysis = "No analysis provided"
         for key in parsed.keys():
             if re.match(r'^analys[iI]+[sS]*$', key, re.IGNORECASE):
@@ -224,43 +223,88 @@ JSON:"""
         
         result = {
             "analysis": analysis,
-            "source": parsed.get("source", "compute"),
+            "source": parsed.get("source", "unknown"),
             "action": "none",
             "parameters": {}
         }
         
-        # Check for action
-        action = parsed.get("action", "").lower().replace(" ", "_")
-        if action in ["horizontal_scaling", "horizontalscaling", "scale", "scaling"]:
-            result["action"] = "horizontal_scaling"
-        elif action == "none":
-            result["action"] = "none"
-        else:
-            result["action"] = action if action else "none"
+        # Normalize action name
+        action = parsed.get("action", "").lower().replace(" ", "_").replace("-", "_")
         
-        # Build parameters
+        # Map various action names to standard names
+        action_mapping = {
+            "horizontal_scaling": "horizontal_scaling",
+            "horizontalscaling": "horizontal_scaling",
+            "scale": "horizontal_scaling",
+            "scaling": "horizontal_scaling",
+            "vertical_scaling": "vertical_scaling",
+            "verticalscaling": "vertical_scaling",
+            "resize": "vertical_scaling",
+            "service_placement": "service_placement",
+            "serviceplacement": "service_placement",
+            "placement": "service_placement",
+            "migrate": "service_placement",
+            "move": "service_placement",
+            "flow_scheduling": "flow_scheduling",
+            "flowscheduling": "flow_scheduling",
+            "reroute": "flow_scheduling",
+            "routing": "flow_scheduling",
+            "network": "flow_scheduling",
+            "none": "none"
+        }
+        
+        result["action"] = action_mapping.get(action, action if action else "none")
+        
+        # Build parameters based on action type
         if result["action"] == "horizontal_scaling":
-            # Handle different parameter formats
-            if "parameters" in parsed and isinstance(parsed["parameters"], dict):
-                result["parameters"] = parsed["parameters"]
-            else:
-                # Flat format - deployment_name and replicas at top level
-                dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
+            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
+            replicas = None
+            for key in parsed.keys():
+                if re.match(r'^replica[s_]*[count]*$', key, re.IGNORECASE):
+                    replicas = parsed[key]
+                    break
+            if replicas is None:
+                replicas = 2
+            
+            if dep_name:
+                result["parameters"] = {
+                    "deployment_name": dep_name,
+                    "replicas": int(replicas)
+                }
                 
-                # Handle different replica parameter names
-                replicas = None
-                for key in parsed.keys():
-                    if re.match(r'^replica[s_]*[count]*$', key, re.IGNORECASE):
-                        replicas = parsed[key]
-                        break
-                if replicas is None:
-                    replicas = 2  # Default value
+        elif result["action"] == "vertical_scaling":
+            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
+            cpu_limit = parsed.get("cpu_limit") or parsed.get("cpu") or "500m"
+            memory_limit = parsed.get("memory_limit") or parsed.get("memory") or parsed.get("mem") or "512Mi"
+            
+            if dep_name:
+                result["parameters"] = {
+                    "deployment_name": dep_name,
+                    "cpu_limit": cpu_limit,
+                    "memory_limit": memory_limit
+                }
                 
-                if dep_name:
-                    result["parameters"] = {
-                        "deployment_name": dep_name,
-                        "replicas": replicas
-                    }
+        elif result["action"] == "service_placement":
+            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
+            target_node = parsed.get("target_node") or parsed.get("node") or parsed.get("destination")
+            
+            if dep_name and target_node:
+                result["parameters"] = {
+                    "deployment_name": dep_name,
+                    "target_node": target_node
+                }
+                
+        elif result["action"] == "flow_scheduling":
+            source = parsed.get("source_switch") or parsed.get("source") or parsed.get("src")
+            destination = parsed.get("destination_switch") or parsed.get("destination") or parsed.get("dst")
+            new_path = parsed.get("new_path") or parsed.get("path") or []
+            
+            if source and destination:
+                result["parameters"] = {
+                    "source_switch": source,
+                    "destination_switch": destination,
+                    "new_path": new_path if isinstance(new_path, list) else [new_path]
+                }
         
         return result
     
