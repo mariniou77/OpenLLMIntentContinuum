@@ -218,7 +218,11 @@ class IntentWatchLoop:
         # Step 3: Execute the action
         if recommendation.get("action") != "none":
             logger.info("Executing recommended action...")
-            result = self.action_executor.execute(recommendation)
+            result = self.action_executor.execute(
+                action=recommendation.get("action"),
+                parameters=recommendation.get("parameters", {}),
+                analysis=recommendation.get("analysis", "")
+            )
             
             if result["success"]:
                 logger.info(f"Action successful: {result['message']}")
