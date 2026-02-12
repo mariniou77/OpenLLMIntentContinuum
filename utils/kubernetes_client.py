@@ -164,7 +164,7 @@ class KubernetesClient:
             logger.error(f"Failed to parse deployments JSON: {e}")
             return []
     
-    def scale_deployment(self, deployment_name: str, replicas: int, namespace: str = "default") -> bool:
+    def scale_deployment(self, deployment_name: str, replicas: int, namespace: str = "default") -> dict:
         """
         Scale a deployment to a specific number of replicas.
         
@@ -174,7 +174,7 @@ class KubernetesClient:
             namespace: Kubernetes namespace
             
         Returns:
-            True if scaling was successful, False otherwise
+            Dictionary with success status and message
         """
         logger.info(f"Scaling {deployment_name} to {replicas} replicas")
         output = self._run_kubectl(f"scale deployment {deployment_name} --replicas={replicas} -n {namespace}")
@@ -182,10 +182,10 @@ class KubernetesClient:
         # kubectl scale returns something like "deployment.apps/xxx scaled"
         if "scaled" in output.lower():
             logger.info(f"Successfully scaled {deployment_name} to {replicas} replicas")
-            return True
+            return {"success": True, "message": f"Scaled {deployment_name} to {replicas} replicas"}
         else:
             logger.error(f"Failed to scale {deployment_name}: {output}")
-            return False
+            return {"success": False, "error": output}
         
     def patch_deployment(self, deployment_name: str, patch_json: str, namespace: str = "default") -> dict:
         """
