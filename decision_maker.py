@@ -237,6 +237,14 @@ JSON:"""
             "horizontalscaling": "horizontal_scaling",
             "scale": "horizontal_scaling",
             "scaling": "horizontal_scaling",
+            "scale_up": "horizontal_scaling",
+            "scale_down": "horizontal_scaling",
+            "scaleup": "horizontal_scaling",
+            "scaledown": "horizontal_scaling",
+            "upgrade_replica": "horizontal_scaling",
+            "downgrade_replica": "horizontal_scaling",
+            "add_replica": "horizontal_scaling",
+            "remove_replica": "horizontal_scaling",
             "vertical_scaling": "vertical_scaling",
             "verticalscaling": "vertical_scaling",
             "resize": "vertical_scaling",
@@ -258,13 +266,23 @@ JSON:"""
         # Build parameters based on action type
         if result["action"] == "horizontal_scaling":
             dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
+            
+            # Try to get replicas from various field names
             replicas = None
             for key in parsed.keys():
                 if re.match(r'^replica[s_]*[count]*$', key, re.IGNORECASE):
                     replicas = parsed[key]
                     break
+            
+            # If no replicas specified, infer from the original action
             if replicas is None:
-                replicas = 2
+                original_action = parsed.get("action", "").lower()
+                if any(word in original_action for word in ["up", "upgrade", "add", "increase"]):
+                    replicas = 3  # Scale up default
+                elif any(word in original_action for word in ["down", "downgrade", "remove", "decrease"]):
+                    replicas = 1  # Scale down default
+                else:
+                    replicas = 2  # Generic default
             
             if dep_name:
                 result["parameters"] = {
