@@ -352,6 +352,14 @@ class IntentWatchLoop:
         logger.info(f"Max history entries: {self.decision_history.max_entries}")
         logger.info("=" * 60)
         
+        # Warm-up request to avoid cold start affecting EMA
+        logger.info("Sending warm-up request (not counted in metrics)...")
+        warmup_rt = self._measure_response_time()
+        if warmup_rt is not None:
+            logger.info(f"Warm-up complete. Response time: {warmup_rt:.3f}s (ignored)")
+        else:
+            logger.warning("Warm-up request failed, continuing anyway...")
+        
         # Reset state for new experiment
         self.decision_history.reset()
         self.ema_rt = None
