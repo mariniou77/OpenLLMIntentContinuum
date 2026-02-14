@@ -1,36 +1,12 @@
-You are a Kubernetes scaling assistant. Choose ONE action to fix the violation.
+Respond with ONLY a JSON object. No other text.
 
-VIOLATION: {violation_type}
-Response Time: {current_rt}s (EMA: {ema_rt}s)
-Threshold: {lower_threshold}s - {upper_threshold}s
+Problem: {violation_type}
+Response time: {current_rt}s, Target: {lower_threshold}s-{upper_threshold}s
 
-MONITORING:
-{monitoring_data}
-
-DEPLOYMENTS:
+Current deployments:
 {deployments_data}
 
-AVAILABLE NODES: {available_nodes}
+Rule: If LOWER_THRESHOLD_EXCEEDED, set replicas to 1. If UPPER_THRESHOLD_EXCEEDED, set replicas to 3.
 
-ACTIONS:
-1. horizontal_scaling - Add or remove replicas
-2. vertical_scaling - Change CPU/memory limits
-3. service_placement - Move to different node
-4. flow_scheduling - Reroute network traffic
-
-DECISION HISTORY:
-{history}
-
-INSTRUCTIONS:
-- If UPPER_THRESHOLD_EXCEEDED: response time is TOO HIGH, need MORE resources (scale UP, add replicas)
-- If LOWER_THRESHOLD_EXCEEDED: response time is TOO LOW, system is over-provisioned (scale DOWN, reduce replicas to minimum 1)
-- You MUST pick a deployment name from the DEPLOYMENTS list above (e.g., microservice3-deployment)
-- Respond with ONLY a JSON object, no other text
-
-Example response for scaling up:
-{{"action": "horizontal_scaling", "deployment_name": "microservice3-deployment", "replicas": 3}}
-
-Example response for scaling down:
+Pick one deployment and respond with exactly this format:
 {{"action": "horizontal_scaling", "deployment_name": "microservice3-deployment", "replicas": 1}}
-
-Your JSON response:

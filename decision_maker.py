@@ -60,28 +60,19 @@ class DecisionMaker:
     
     def _get_default_prompt_template(self) -> str:
         """Return a default prompt template if file not found."""
-        return """Select ONE action to fix the violation. Respond with JSON only.
+        return """Respond with ONLY a JSON object. No other text.
 
-VIOLATION: {violation_type}
-Response Time: {current_rt}s (EMA: {ema_rt}s)
-Threshold: {lower_threshold}s - {upper_threshold}s
+Problem: {violation_type}
+Response time: {current_rt}s, Target: {lower_threshold}s-{upper_threshold}s
 
-MONITORING:
-{monitoring_data}
-
-DEPLOYMENTS:
+Current deployments:
 {deployments_data}
 
-ACTIONS (choose one):
-1. horizontal_scaling: {{"action": "horizontal_scaling", "deployment_name": "...", "replicas": N}}
-2. vertical_scaling: {{"action": "vertical_scaling", "deployment_name": "...", "cpu_limit": "500m", "memory_limit": "512Mi"}}
-3. service_placement: {{"action": "service_placement", "deployment_name": "...", "target_node": "worker1"}}
-4. flow_scheduling: {{"action": "flow_scheduling", "source_switch": "s1", "destination_switch": "s3", "new_path": ["s1","s2","s3"]}}
+Rule: If LOWER_THRESHOLD_EXCEEDED, set replicas to 1. If UPPER_THRESHOLD_EXCEEDED, set replicas to 3.
 
-HISTORY:
-{history}
-
-JSON:"""
+Pick one deployment and respond with exactly this format:
+{{"action": "horizontal_scaling", "deployment_name": "microservice3-deployment", "replicas": 1}}
+"""
 
     def build_prompt(
         self,
