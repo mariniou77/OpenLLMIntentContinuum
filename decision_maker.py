@@ -260,7 +260,10 @@ Pick one deployment and respond with exactly this format:
         
         if action == "horizontal_scaling" and deployment:
             replicas = 2  # default
+            # Try both "replicas" and "replica_count"
             rep_match = re.search(r'"replicas"\s*:\s*(\d+)', response_text)
+            if not rep_match:
+                rep_match = re.search(r'"replica_count"\s*:\s*(\d+)', response_text)
             if rep_match:
                 replicas = int(rep_match.group(1))
             result["parameters"] = {
@@ -353,7 +356,8 @@ Pick one deployment and respond with exactly this format:
         
         if normalized_action == "horizontal_scaling":
             dep_name = parsed.get("deployment_name") or parsed.get("deployment")
-            replicas = parsed.get("replicas", 2)
+            # Accept both "replicas" and "replica_count" (TinyLlama sometimes uses replica_count)
+            replicas = parsed.get("replicas") or parsed.get("replica_count", 2)
             if dep_name:
                 parameters = {
                     "deployment_name": dep_name,
