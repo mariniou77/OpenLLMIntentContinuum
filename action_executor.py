@@ -111,7 +111,7 @@ class ActionExecutor:
         
         for dep in current_state:
             if dep.get("name", "").lower() == deployment_name:
-                current_replicas = dep.get("ready_replicas", 0)
+                current_replicas = dep.get("replicas_desired") or dep.get("replicas_ready") or 0
                 actual_deployment_name = dep.get("name")
                 break
         
