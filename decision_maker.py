@@ -39,6 +39,7 @@ class DecisionMaker:
         self.ollama_url = config["endpoints"]["ollama"]
         self.model = config["llm"]["model"]
         self.temperature = config["llm"]["temperature"]
+        self.debug_llm = config.get("debug_llm", False)
         
         # Load prompt template
         self.prompt_template = self._load_prompt_template()
@@ -142,15 +143,30 @@ JSON:"""
             }
         }
         
+        # Debug logging - log full prompt
+        if self.debug_llm:
+            logger.info("=" * 60)
+            logger.info("LLM DEBUG - PROMPT:")
+            logger.info("=" * 60)
+            logger.info(f"\n{prompt}")
+            logger.info("=" * 60)
+        
         try:
             logger.info(f"Querying Ollama ({self.model})...")
-            logger.debug(f"Prompt:\n{prompt}")
             response = requests.post(url, json=payload, timeout=300)
             response.raise_for_status()
             
             result = response.json()
             llm_response = result.get("response", "")
-            logger.debug(f"Raw LLM response: {llm_response}")
+            
+            # Debug logging - log full response
+            if self.debug_llm:
+                logger.info("=" * 60)
+                logger.info("LLM DEBUG - RESPONSE:")
+                logger.info("=" * 60)
+                logger.info(f"\n{llm_response}")
+                logger.info("=" * 60)
+            
             return llm_response
             
         except requests.exceptions.Timeout:

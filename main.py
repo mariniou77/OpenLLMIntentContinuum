@@ -145,6 +145,11 @@ def main():
         action="store_true",
         help="Suppress banner and config summary"
     )
+    parser.add_argument(
+        "--debug-llm",
+        action="store_true",
+        help="Log full LLM prompts and responses for debugging"
+    )
     
     args = parser.parse_args()
     
@@ -170,6 +175,11 @@ def main():
     # Print config summary
     if not args.quiet:
         print_config_summary(config)
+    
+    # Add debug_llm flag to config
+    config["debug_llm"] = args.debug_llm
+    if args.debug_llm:
+        logger.info("LLM debugging enabled - will log full prompts and responses")
     
     # Initialize the Intent Watch Loop
     watch_loop = IntentWatchLoop(config)
