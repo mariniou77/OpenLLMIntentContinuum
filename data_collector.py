@@ -301,3 +301,184 @@ class DataCollector:
         lines.append("=== END SYSTEM STATE ===")
         
         return "\n".join(lines)
+    
+    # ===== NEW COMPACT FORMATTING METHODS FOR CLEANER LLM PROMPT =====
+    
+    def format_monitoring_compact(self, system_state: dict) -> str:
+        """
+        Format monitoring data in a compact per-node format.
+        
+        Args:
+            system_state: Complete system state from collect_all()
+            
+        Returns:
+            Compact string like "worker1: CPU 80%, Mem 65% | worker2: CPU 70%, Mem 55%"
+        """
+        monitoring = system_state.get("monitoring_data", {}).get("data", {})
+        cpu_data = monitoring.get("cpu_utilization", [])
+        memory_data = monitoring.get("memory_utilization", [])
+        
+        # Build a dict of node -> {cpu, memory}
+        node_metrics = {}
+        
+        for item in cpu_data:
+            agent = item.get("agent", "unknown")
+            # Extract node name from agent (could be IP or hostname)
+            node_name = self._extract_node_name(agent)
+            if node_name not in node_metrics:
+                node_metrics[node_name] = {"cpu": 0, "memory": 0}
+            node_metrics[node_name]["cpu"] = item.get("cpu_percent", 0)
+        
+        for item in memory_data:
+            agent = item.get("agent", "unknown")
+            node_name = self._extract_node_name(agent)
+            if node_name not in node_metrics:
+                node_metrics[node_name] = {"cpu": 0, "memory": 0}
+            node_metrics[node_name]["memory"] = item.get("memory_percent", 0)
+        
+        if not node_metrics:
+            return "No monitoring data available"
+        
+        # Format as compact string
+        parts = []
+        for node, metrics in sorted(node_metrics.items()):
+            parts.append(f"{node}: CPU {metrics['cpu']:.0f}%, Mem {metrics['memory']:.0f}%")
+        
+        return " | ".join(parts)
+    
+    def _extract_node_name(self, agent: str) -> str:
+        """
+        Extract a readable node name from agent identifier.
+        
+        Args:
+            agent: Agent identifier (IP or hostname)
+            
+        Returns:
+            Readable node name
+        """
+        # Map known IPs to node names (from your setup)
+        ip_to_name = {
+            "10.0.0.100": "master",
+            "10.0.0.101": "worker1",
+            "10.0.0.102": "worker2",
+            "10.132.0.14": "master",
+            "10.132.0.15": "worker1", 
+            "10.132.0.16": "worker2"
+        }
+        
+        # Check if agent is a known IP
+        if agent in ip_to_name:
+            return ip_to_name[agent]
+        
+        # If it looks like an IP, return last octet
+        if agent.count(".") == 3:
+            return f"node-{agent.split('.')[-1]}"
+        
+        # Otherwise return as-is
+        return agent
+    
+    def format_deployments_compact(self, system_state: dict) -> str:
+        """
+        Format deployments in a compact format showing replicas and node.
+        
+        Args:
+            system_state: Complete system state from collect_all()
+            
+        Returns:
+            Compact multi-line string with deployment info
+        """
+        cluster = system_state.get("cluster_info", {}).get("data", {})
+        deployments = cluster.get("deployments", {}).get("list", [])
+        pods = cluster.get("pods", {}).get("list", [])
+        
+        if not deployments:
+            return "No deployments found"
+        
+        # Map deployment to nodes where its pods run
+        deployment_nodes = {}
+        for pod in pods:
+            pod_name = pod.get("name", "")
+            node = pod.get("node", "unknown")
+            
+            # Find which deployment this pod belongs to
+            for dep in deployments:
+                dep_name = dep.get("name", "")
+                # Pod name typically starts with deployment name
+                if pod_name.startswith(dep_name.replace("-deployment", "")):
+                    if dep_name not in deployment_nodes:
+                        deployment_nodes[dep_name] = []
+                    if node not in deployment_nodes[dep_name]:
+                        deployment_nodes[dep_name].append(node)
+        
+        # Format each deployment
+        lines = []
+        for dep in deployments:
+            name = dep.get("name", "unknown")
+            replicas = dep.get("replicas_ready", 0)
+            desired = dep.get("replicas_desired", 0)
+            nodes = deployment_nodes.get(name, ["unknown"])
+            nodes_str = ", ".join(nodes)
+            lines.append(f"- {name}: {replicas}/{desired} replicas ({nodes_str})")
+        
+        return "\n".join(lines)
+    
+    def format_nodes_compact(self, system_state: dict) -> str:
+        """
+        Format available nodes in a compact format.
+        
+        Args:
+            system_state: Complete system state from collect_all()
+            
+        Returns:
+            Compact string listing available nodes
+        """
+        cluster = system_state.get("cluster_info", {}).get("data", {})
+        nodes = cluster.get("nodes", {}).get("list", [])
+        
+        if not nodes:
+            return "No nodes found"
+        
+        # Filter to ready worker nodes only
+        worker_nodes = []
+        for node in nodes:
+            name = node.get("name", "unknown")
+            status = node.get("status", "unknown")
+            role = node.get("role", "")
+            
+            # Skip master/control-plane nodes for placement
+            if "master" in name.lower() or "control-plane" in role.lower():
+                continue
+            
+            if status.lower() == "ready":
+                worker_nodes.append(name)
+        
+        if not worker_nodes:
+            return "No worker nodes available"
+        
+        return ", ".join(worker_nodes)
+    
+    def format_network_compact(self, system_state: dict) -> str:
+        """
+        Format network info in a compact format.
+        
+        Args:
+            system_state: Complete system state from collect_all()
+            
+        Returns:
+            Compact string with switch and link info
+        """
+        network = system_state.get("network_info", {}).get("data", {})
+        devices = network.get("devices", {})
+        links = network.get("links", {})
+        
+        switch_count = devices.get("count", 0)
+        link_count = links.get("count", 0)
+        
+        # Get switch names if available
+        switch_list = devices.get("list", [])
+        switch_names = [s.get("id", "unknown") for s in switch_list[:6]]  # Max 6 switches
+        
+        if switch_names:
+            return f"Switches: {', '.join(switch_names)} | Links: {link_count}"
+        else:
+            return f"Switches: {switch_count} | Links: {link_count}"

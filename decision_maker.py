@@ -4,18 +4,17 @@ Decision Maker Module
 This module integrates with the LLM (TinyLlama via Ollama) to analyze
 system state and recommend actions when SLO violations occur.
 
-It follows the IntentContinuum paper's approach:
-1. Receive system state from Data Collector
-2. Build a structured prompt for the LLM
-3. Query the LLM for root cause analysis and recommended action
-4. Parse and validate the LLM response
+Updated to use:
+- Cleaner, more structured prompts
+- Decision history for context
+- Simpler expected output format
 """
 
 import json
 import logging
 import re
 import requests
-from typing import Optional
+from typing import Optional, Dict, Any
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -60,34 +59,64 @@ class DecisionMaker:
     
     def _get_default_prompt_template(self) -> str:
         """Return a default prompt template if file not found."""
-        return """You are a Kubernetes scaling assistant. Respond with ONLY JSON.
+        return """Select ONE action to fix the violation. Respond with JSON only.
 
 VIOLATION: {violation_type}
-THRESHOLD: Upper={upper_threshold}s, Lower={lower_threshold}s
+Response Time: {current_rt}s (EMA: {ema_rt}s)
+Threshold: {lower_threshold}s - {upper_threshold}s
 
-{system_state}
+MONITORING:
+{monitoring_data}
 
-Respond with ONLY this JSON format:
-{{"analysis": "brief explanation", "action": "horizontal_scaling", "deployment_name": "microservice3-deployment", "replicas": 2}}
+DEPLOYMENTS:
+{deployments_data}
+
+ACTIONS (choose one):
+1. horizontal_scaling: {{"action": "horizontal_scaling", "deployment_name": "...", "replicas": N}}
+2. vertical_scaling: {{"action": "vertical_scaling", "deployment_name": "...", "cpu_limit": "500m", "memory_limit": "512Mi"}}
+3. service_placement: {{"action": "service_placement", "deployment_name": "...", "target_node": "worker1"}}
+4. flow_scheduling: {{"action": "flow_scheduling", "source_switch": "s1", "destination_switch": "s3", "new_path": ["s1","s2","s3"]}}
+
+HISTORY:
+{history}
 
 JSON:"""
-    
-    def _build_prompt(self, system_state_formatted: str, violation_type: str) -> str:
+
+    def build_prompt(
+        self,
+        violation_type: str,
+        current_rt: float,
+        ema_rt: float,
+        monitoring_data: str,
+        deployments_data: str,
+        available_nodes: str,
+        history: str
+    ) -> str:
         """
-        Build the complete prompt for the LLM.
+        Build the complete prompt for the LLM using the new clean format.
         
         Args:
-            system_state_formatted: Formatted system state string
-            violation_type: Type of violation (UPPER or LOWER)
+            violation_type: Type of violation (UPPER_THRESHOLD_EXCEEDED or LOWER_THRESHOLD_EXCEEDED)
+            current_rt: Current response time in seconds
+            ema_rt: EMA response time in seconds
+            monitoring_data: Compact monitoring string from DataCollector
+            deployments_data: Compact deployments string from DataCollector
+            available_nodes: Comma-separated list of available worker nodes
+            history: Formatted history string from DecisionHistory
             
         Returns:
             Complete prompt string
         """
         prompt = self.prompt_template.format(
             violation_type=violation_type,
-            upper_threshold=self.upper_threshold,
+            current_rt=round(current_rt, 2),
+            ema_rt=round(ema_rt, 2),
             lower_threshold=self.lower_threshold,
-            system_state=system_state_formatted
+            upper_threshold=self.upper_threshold,
+            monitoring_data=monitoring_data,
+            deployments_data=deployments_data,
+            available_nodes=available_nodes,
+            history=history
         )
         return prompt
     
@@ -115,11 +144,14 @@ JSON:"""
         
         try:
             logger.info(f"Querying Ollama ({self.model})...")
+            logger.debug(f"Prompt:\n{prompt}")
             response = requests.post(url, json=payload, timeout=300)
             response.raise_for_status()
             
             result = response.json()
-            return result.get("response", "")
+            llm_response = result.get("response", "")
+            logger.debug(f"Raw LLM response: {llm_response}")
+            return llm_response
             
         except requests.exceptions.Timeout:
             logger.error("Ollama request timed out")
@@ -132,32 +164,29 @@ JSON:"""
         """
         Parse LLM response to extract JSON action.
         
+        Handles various formats TinyLlama might produce.
+        
         Args:
             response_text: Raw response from LLM
             
         Returns:
-            Parsed action dictionary
+            Parsed action dictionary with 'action' and 'parameters' keys
         """
         if not response_text:
             return self._get_fallback_response("No response from LLM")
         
-        logger.debug(f"Raw LLM response: {response_text[:500]}")
-        
         # Clean up the response
         cleaned = response_text.strip()
         
-        # Try to extract JSON from the response
+        # Try 1: Direct JSON parse
         try:
             parsed = json.loads(cleaned)
-            # Ensure it's a dict, not a list
             if isinstance(parsed, dict):
                 return self._normalize_response(parsed)
-            elif isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
-                return self._normalize_response(parsed[0])
         except json.JSONDecodeError:
             pass
         
-        # Try to find JSON object in the response
+        # Try 2: Find JSON object in the response (between { and })
         try:
             start = cleaned.find('{')
             end = cleaned.rfind('}') + 1
@@ -167,176 +196,214 @@ JSON:"""
                 parsed = json.loads(json_str)
                 if isinstance(parsed, dict):
                     return self._normalize_response(parsed)
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON parse error: {e}")
+        except json.JSONDecodeError:
+            pass
         
-        # Try to extract key information using simple parsing
+        # Try 3: Extract using regex patterns
         try:
-            response_lower = response_text.lower()
-            
-            # Look for deployment names
-            deployment = None
-            for dep in ["microservice1", "microservice2", "microservice3", "microservice4", "db"]:
-                if dep in response_lower:
-                    deployment = f"{dep}-deployment"
-                    break
-            
-            # Look for replica counts
-            replicas = 2
-            replica_match = re.search(r'replica[s]?["\s:]+(\d+)', response_lower)
-            if replica_match:
-                replicas = int(replica_match.group(1))
-            
-            if deployment:
-                return {
-                    "analysis": "Extracted from unstructured response",
-                    "source": "compute",
-                    "action": "horizontal_scaling",
-                    "parameters": {
-                        "deployment_name": deployment,
-                        "replicas": min(max(replicas, 1), 5)
-                    }
-                }
+            return self._extract_with_regex(response_text)
         except Exception as e:
-            logger.warning(f"Fallback parsing failed: {e}")
+            logger.warning(f"Regex extraction failed: {e}")
         
         logger.warning(f"Could not parse LLM response: {response_text[:200]}")
         return self._get_fallback_response("Could not parse LLM response")
     
-    def _normalize_response(self, parsed: dict) -> dict:
+    def _extract_with_regex(self, response_text: str) -> dict:
         """
-        Normalize the parsed response to expected format.
+        Extract action information using regex patterns.
+        
+        Fallback method when JSON parsing fails.
         
         Args:
-            parsed: Raw parsed dictionary from LLM
+            response_text: Raw response text
             
         Returns:
-            Normalized dictionary with standard fields
+            Extracted action dictionary
         """
+        response_lower = response_text.lower()
         
-        # Extract analysis using regex to handle misspellings
-        analysis = "No analysis provided"
-        for key in parsed.keys():
-            if re.match(r'^analys[iI]+[sS]*$', key, re.IGNORECASE):
-                analysis = parsed[key]
-                break
+        # Detect action type
+        action = "none"
+        if "horizontal_scaling" in response_lower or "replica" in response_lower:
+            action = "horizontal_scaling"
+        elif "vertical_scaling" in response_lower or "cpu_limit" in response_lower:
+            action = "vertical_scaling"
+        elif "service_placement" in response_lower or "target_node" in response_lower:
+            action = "service_placement"
+        elif "flow_scheduling" in response_lower or "new_path" in response_lower:
+            action = "flow_scheduling"
         
+        # Extract deployment name
+        deployment = None
+        dep_match = re.search(r'"deployment_name"\s*:\s*"([^"]+)"', response_text)
+        if dep_match:
+            deployment = dep_match.group(1)
+        else:
+            # Try to find microservice mentions
+            for ms in ["microservice1", "microservice2", "microservice3", "microservice4"]:
+                if ms in response_lower:
+                    deployment = f"{ms}-deployment"
+                    break
+        
+        # Build result based on action type
         result = {
-            "analysis": analysis,
-            "source": parsed.get("source", "unknown"),
-            "action": "none",
+            "action": action,
             "parameters": {}
         }
         
-        # Normalize action name
-        action = parsed.get("action", "").lower().replace(" ", "_").replace("-", "_")
+        if action == "horizontal_scaling" and deployment:
+            replicas = 2  # default
+            rep_match = re.search(r'"replicas"\s*:\s*(\d+)', response_text)
+            if rep_match:
+                replicas = int(rep_match.group(1))
+            result["parameters"] = {
+                "deployment_name": deployment,
+                "replicas": min(max(replicas, 1), 5)
+            }
+            
+        elif action == "vertical_scaling" and deployment:
+            cpu = "500m"
+            mem = "512Mi"
+            cpu_match = re.search(r'"cpu_limit"\s*:\s*"([^"]+)"', response_text)
+            mem_match = re.search(r'"memory_limit"\s*:\s*"([^"]+)"', response_text)
+            if cpu_match:
+                cpu = cpu_match.group(1)
+            if mem_match:
+                mem = mem_match.group(1)
+            result["parameters"] = {
+                "deployment_name": deployment,
+                "cpu_limit": cpu,
+                "memory_limit": mem
+            }
+            
+        elif action == "service_placement" and deployment:
+            target = "worker1"
+            node_match = re.search(r'"target_node"\s*:\s*"([^"]+)"', response_text)
+            if node_match:
+                target = node_match.group(1)
+            result["parameters"] = {
+                "deployment_name": deployment,
+                "target_node": target
+            }
+            
+        elif action == "flow_scheduling":
+            src = dst = None
+            src_match = re.search(r'"source_switch"\s*:\s*"([^"]+)"', response_text)
+            dst_match = re.search(r'"destination_switch"\s*:\s*"([^"]+)"', response_text)
+            if src_match:
+                src = src_match.group(1)
+            if dst_match:
+                dst = dst_match.group(1)
+            if src and dst:
+                result["parameters"] = {
+                    "source_switch": src,
+                    "destination_switch": dst,
+                    "new_path": []
+                }
+            else:
+                result["action"] = "none"
+        else:
+            result["action"] = "none"
         
-        # Map various action names to standard names
+        return result
+    
+    def _normalize_response(self, parsed: dict) -> dict:
+        """
+        Normalize parsed JSON into standard format.
+        
+        Handles various field names TinyLlama might use.
+        
+        Args:
+            parsed: Parsed JSON dictionary
+            
+        Returns:
+            Normalized dictionary with 'action' and 'parameters'
+        """
+        # Normalize action name
+        action = str(parsed.get("action", "none")).lower().strip()
+        
         action_mapping = {
             "horizontal_scaling": "horizontal_scaling",
             "horizontalscaling": "horizontal_scaling",
             "scale": "horizontal_scaling",
-            "scaling": "horizontal_scaling",
             "scale_up": "horizontal_scaling",
             "scale_down": "horizontal_scaling",
-            "scaleup": "horizontal_scaling",
-            "scaledown": "horizontal_scaling",
-            "upgrade_replica": "horizontal_scaling",
-            "downgrade_replica": "horizontal_scaling",
-            "add_replica": "horizontal_scaling",
-            "remove_replica": "horizontal_scaling",
-            "upward_scaling": "horizontal_scaling",
-            "downward_scaling": "horizontal_scaling",
-            "increase_replicas": "horizontal_scaling",
-            "decrease_replicas": "horizontal_scaling",
             "vertical_scaling": "vertical_scaling",
             "verticalscaling": "vertical_scaling",
-            "resize": "vertical_scaling",
             "service_placement": "service_placement",
             "serviceplacement": "service_placement",
             "placement": "service_placement",
             "migrate": "service_placement",
-            "move": "service_placement",
             "flow_scheduling": "flow_scheduling",
             "flowscheduling": "flow_scheduling",
-            "reroute": "flow_scheduling",
-            "routing": "flow_scheduling",
-            "network": "flow_scheduling",
-            "none": "none"
+            "reroute": "flow_scheduling"
         }
         
-        result["action"] = action_mapping.get(action, action if action else "none")
+        normalized_action = action_mapping.get(action, "none")
         
         # Build parameters based on action type
-        if result["action"] == "horizontal_scaling":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-            
-            # Try to get replicas from various field names
-            replicas = None
-            for key in parsed.keys():
-                if re.match(r'^replica[s_]*[count]*$', key, re.IGNORECASE):
-                    replicas = parsed[key]
-                    break
-            
-            # If no replicas specified, infer from the original action
-            if replicas is None:
-                original_action = parsed.get("action", "").lower()
-                if any(word in original_action for word in ["up", "upgrade", "add", "increase"]):
-                    replicas = 3  # Scale up default
-                elif any(word in original_action for word in ["down", "downgrade", "remove", "decrease"]):
-                    replicas = 1  # Scale down default
-                else:
-                    replicas = 2  # Generic default
-            
-            if dep_name:
-                result["parameters"] = {
-                    "deployment_name": dep_name,
-                    "replicas": int(replicas)
-                }
-                
-        elif result["action"] == "vertical_scaling":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-            cpu_limit = parsed.get("cpu_limit") or parsed.get("cpu") or "500m"
-            memory_limit = parsed.get("memory_limit") or parsed.get("memory") or parsed.get("mem") or "512Mi"
-            
-            if dep_name:
-                result["parameters"] = {
-                    "deployment_name": dep_name,
-                    "cpu_limit": cpu_limit,
-                    "memory_limit": memory_limit
-                }
-                
-        elif result["action"] == "service_placement":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-            target_node = parsed.get("target_node") or parsed.get("node") or parsed.get("destination")
-            
-            if dep_name and target_node:
-                result["parameters"] = {
-                    "deployment_name": dep_name,
-                    "target_node": target_node
-                }
-                
-        elif result["action"] == "flow_scheduling":
-            source = parsed.get("source_switch") or parsed.get("source") or parsed.get("src")
-            destination = parsed.get("destination_switch") or parsed.get("destination") or parsed.get("dst")
-            new_path = parsed.get("new_path") or parsed.get("path") or []
-            
-            if source and destination:
-                result["parameters"] = {
-                    "source_switch": source,
-                    "destination_switch": destination,
-                    "new_path": new_path if isinstance(new_path, list) else [new_path]
-                }
+        parameters = {}
         
-        return result
+        if normalized_action == "horizontal_scaling":
+            dep_name = parsed.get("deployment_name") or parsed.get("deployment")
+            replicas = parsed.get("replicas", 2)
+            if dep_name:
+                parameters = {
+                    "deployment_name": dep_name,
+                    "replicas": min(max(int(replicas), 1), 5)
+                }
+            else:
+                normalized_action = "none"
+                
+        elif normalized_action == "vertical_scaling":
+            dep_name = parsed.get("deployment_name") or parsed.get("deployment")
+            cpu = parsed.get("cpu_limit", "500m")
+            mem = parsed.get("memory_limit", "512Mi")
+            if dep_name:
+                parameters = {
+                    "deployment_name": dep_name,
+                    "cpu_limit": cpu,
+                    "memory_limit": mem
+                }
+            else:
+                normalized_action = "none"
+                
+        elif normalized_action == "service_placement":
+            dep_name = parsed.get("deployment_name") or parsed.get("deployment")
+            target = parsed.get("target_node") or parsed.get("node")
+            if dep_name and target:
+                parameters = {
+                    "deployment_name": dep_name,
+                    "target_node": target
+                }
+            else:
+                normalized_action = "none"
+                
+        elif normalized_action == "flow_scheduling":
+            src = parsed.get("source_switch") or parsed.get("source")
+            dst = parsed.get("destination_switch") or parsed.get("destination")
+            path = parsed.get("new_path", [])
+            if src and dst:
+                parameters = {
+                    "source_switch": src,
+                    "destination_switch": dst,
+                    "new_path": path if isinstance(path, list) else []
+                }
+            else:
+                normalized_action = "none"
+        
+        return {
+            "action": normalized_action,
+            "parameters": parameters
+        }
     
     def _get_fallback_response(self, reason: str) -> dict:
         """Return a safe fallback response when LLM fails."""
+        logger.warning(f"Using fallback response: {reason}")
         return {
-            "analysis": f"Fallback response: {reason}",
-            "source": "unknown",
             "action": "none",
-            "parameters": {}
+            "parameters": {},
+            "fallback_reason": reason
         }
     
     def _validate_action(self, action: dict) -> dict:
@@ -349,75 +416,70 @@ JSON:"""
         Returns:
             Validated action dictionary
         """
-        # Ensure action is a dictionary
         if not isinstance(action, dict):
-            logger.warning(f"Action is not a dict: {type(action)}")
             return self._get_fallback_response("Invalid action format")
         
-        # Ensure required fields exist
         if "action" not in action:
             action["action"] = "none"
         
         if "parameters" not in action:
             action["parameters"] = {}
         
-        if "analysis" not in action:
-            action["analysis"] = "No analysis provided"
-        
-        if "source" not in action:
-            action["source"] = "unknown"
-        
-        # Validate horizontal_scaling parameters
+        # Validate specific action parameters
         if action["action"] == "horizontal_scaling":
             params = action.get("parameters", {})
-            
-            if not isinstance(params, dict):
-                logger.warning("Parameters is not a dict")
+            if not params.get("deployment_name"):
                 action["action"] = "none"
-                return action
-            
-            # Check deployment name exists
-            if "deployment_name" not in params:
-                logger.warning("horizontal_scaling missing deployment_name")
-                action["action"] = "none"
-                return action
-            
-            # Check replicas is a valid number
-            if "replicas" not in params:
-                logger.warning("horizontal_scaling missing replicas")
-                action["action"] = "none"
-                return action
-            
-            try:
-                replicas = int(params["replicas"])
-                if replicas < 1:
-                    replicas = 1
-                if replicas > 10:
-                    replicas = 10
-                params["replicas"] = replicas
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid replicas value: {params.get('replicas')}")
-                action["action"] = "none"
+                action["parameters"] = {}
+            elif not isinstance(params.get("replicas"), int):
+                try:
+                    params["replicas"] = int(params.get("replicas", 2))
+                except (ValueError, TypeError):
+                    params["replicas"] = 2
         
         return action
     
-    def analyze_and_recommend(self, system_state_formatted: str, violation_type: str) -> dict:
+    def analyze_and_recommend(
+        self,
+        violation_type: str,
+        current_rt: float,
+        ema_rt: float,
+        monitoring_data: str,
+        deployments_data: str,
+        available_nodes: str,
+        history: str
+    ) -> dict:
         """
         Main method: Analyze system state and recommend an action.
         
         This is called by the Intent Watch Loop when a violation is detected.
         
         Args:
-            system_state_formatted: Formatted system state from DataCollector
-            violation_type: "UPPER" (response time too high) or "LOWER" (too low)
+            violation_type: "UPPER_THRESHOLD_EXCEEDED" or "LOWER_THRESHOLD_EXCEEDED"
+            current_rt: Current response time in seconds
+            ema_rt: EMA response time in seconds
+            monitoring_data: Compact monitoring string
+            deployments_data: Compact deployments string
+            available_nodes: Available worker nodes string
+            history: Formatted decision history string
             
         Returns:
-            Dictionary with analysis and recommended action
+            Dictionary with 'action' and 'parameters' keys
         """
         logger.info(f"Analyzing {violation_type} violation...")
+        logger.info(f"Current RT: {current_rt:.2f}s, EMA: {ema_rt:.2f}s")
         
         # Build the prompt
-        prompt = self._build_prompt(system_state_formatted, violation_type)
+        prompt = self.build_prompt(
+            violation_type=violation_type,
+            current_rt=current_rt,
+            ema_rt=ema_rt,
+            monitoring_data=monitoring_data,
+            deployments_data=deployments_data,
+            available_nodes=available_nodes,
+            history=history
+        )
+        
         logger.debug(f"Prompt length: {len(prompt)} characters")
         
         # Query the LLM

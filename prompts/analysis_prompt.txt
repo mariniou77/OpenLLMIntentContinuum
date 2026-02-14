@@ -1,24 +1,37 @@
-You are a Kubernetes scaling assistant. Analyze the system and respond with ONLY a JSON object.
+Select ONE action to fix the violation. Respond with JSON only.
 
 VIOLATION: {violation_type}
-THRESHOLD: Upper={upper_threshold}s, Lower={lower_threshold}s
+Response Time: {current_rt}s (EMA: {ema_rt}s)
+Threshold: {lower_threshold}s - {upper_threshold}s
 
-SYSTEM STATE:
-{system_state}
+MONITORING:
+{monitoring_data}
+
+DEPLOYMENTS:
+{deployments_data}
+
+AVAILABLE NODES: {available_nodes}
+
+ACTIONS (choose one):
+1. horizontal_scaling - change replica count
+   {{"action": "horizontal_scaling", "deployment_name": "...", "replicas": N}}
+   
+2. vertical_scaling - change CPU/memory limits
+   {{"action": "vertical_scaling", "deployment_name": "...", "cpu_limit": "500m", "memory_limit": "512Mi"}}
+   
+3. service_placement - move deployment to different node
+   {{"action": "service_placement", "deployment_name": "...", "target_node": "worker1"}}
+   
+4. flow_scheduling - reroute network traffic
+   {{"action": "flow_scheduling", "source_switch": "s1", "destination_switch": "s3", "new_path": ["s1", "s2", "s3"]}}
+
+DECISION HISTORY:
+{history}
 
 RULES:
-- UPPER_THRESHOLD_EXCEEDED means response time is TOO HIGH. Scale UP (more replicas).
-- LOWER_THRESHOLD_EXCEEDED means response time is TOO LOW. Scale DOWN (fewer replicas, minimum 1).
-- You MUST respond with ONLY a JSON object
-- No explanations, no text before or after the JSON
-- Pick a real deployment from the system state above
-
-RESPOND WITH THIS EXACT FORMAT:
-{{
-  "analysis": "one sentence explanation",
-  "action": "horizontal_scaling",
-  "deployment_name": "microservice3-deployment",
-  "replicas": 2
-}}
+- UPPER_THRESHOLD_EXCEEDED: response time TOO HIGH → scale UP or add resources
+- LOWER_THRESHOLD_EXCEEDED: response time TOO LOW → scale DOWN (min 1 replica)
+- Pick a real deployment from the list above
+- Respond with ONLY valid JSON, no other text
 
 JSON:

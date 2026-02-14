@@ -6,16 +6,19 @@ This is the main entry point for the IntentContinuum system.
 It initializes all components and starts the Intent Watch Loop.
 
 Usage:
-    python main.py                  # Run with default config
-    python main.py --config my.yaml # Run with custom config
-    python main.py --iterations 10  # Run for 10 iterations only
+    python main.py                      # Run continuously
+    python main.py --time-window 10     # Run for 10 minutes
+    python main.py --iterations 10      # Run for 10 iterations only
+    python main.py --config my.yaml     # Run with custom config
 """
 
 import argparse
+import json
 import logging
 import signal
 import sys
 from pathlib import Path
+from datetime import datetime
 
 import yaml
 
@@ -60,10 +63,11 @@ def load_config(config_path: str) -> dict:
 def print_banner():
     """Print application banner."""
     banner = """
-║                                                                  ║
-║   LLM-Powered Intent-Based Resource Management                   ║
-║   for the Compute Continuum                                      ║
-║                                                                  ║
+╔══════════════════════════════════════════════════════════════╗
+║   OpenLLMIntentContinuum                                     ║
+║   LLM-Powered Intent-Based Resource Management               ║
+║   for the Compute Continuum                                  ║
+╚══════════════════════════════════════════════════════════════╝
 """
     print(banner)
 
@@ -79,6 +83,7 @@ def print_config_summary(config: dict):
     print(f"    EMA Alpha: {config['intent']['ema_alpha']}")
     print(f"  Check Interval: {config['intent']['check_interval']}s")
     print(f"  Wait After Action: {config['intent']['wait_after_action']}s")
+    print(f"  History Max Entries: {config.get('history', {}).get('max_entries', 3)}")
     print(f"  Application Endpoint: {config['application']['entry_point']}")
     print(f"  LLM Model: {config['llm']['model']}")
     print(f"  Enabled Actions:")
@@ -88,11 +93,24 @@ def print_config_summary(config: dict):
     print("=" * 60 + "\n")
 
 
+def save_experiment_results(results: dict, output_path: str):
+    """
+    Save experiment results to a JSON file.
+    
+    Args:
+        results: Experiment results dictionary
+        output_path: Path to save results
+    """
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"Results saved to: {output_path}")
+
+
 def main():
     """Main entry point."""
     # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description="IntentContinuum - LLM-Powered Intent-Based Resource Management"
+        description="OpenLLMIntentContinuum - LLM-Powered Intent-Based Resource Management"
     )
     parser.add_argument(
         "--config", "-c",
@@ -100,10 +118,21 @@ def main():
         help="Path to configuration file (default: config.yaml)"
     )
     parser.add_argument(
+        "--time-window", "-t",
+        type=int,
+        default=None,
+        help="Run for a fixed time window in minutes (e.g., --time-window 10)"
+    )
+    parser.add_argument(
         "--iterations", "-i",
         type=int,
         default=None,
         help="Number of iterations to run (default: run forever)"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default=None,
+        help="Path to save experiment results as JSON"
     )
     parser.add_argument(
         "--log-level", "-l",
@@ -173,16 +202,38 @@ def main():
     if not all_healthy:
         logger.warning("Some components are not healthy. Continuing anyway...")
     
-    # Start the watch loop
-    logger.info("Starting Intent Watch Loop...")
+    # Run the appropriate mode
+    results = None
     
     try:
-        watch_loop.run(max_iterations=args.iterations)
+        if args.time_window:
+            # Time window experiment mode
+            logger.info(f"Starting time window experiment ({args.time_window} minutes)...")
+            results = watch_loop.run_time_window(duration_minutes=args.time_window)
+        else:
+            # Continuous or iteration-limited mode
+            logger.info("Starting Intent Watch Loop...")
+            watch_loop.run(max_iterations=args.iterations)
+            results = {
+                "stats": watch_loop.stats,
+                "history": watch_loop.get_decision_history()
+            }
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     
-    logger.info("IntentContinuum stopped.")
+    # Save results if output path specified
+    if args.output and results:
+        save_experiment_results(results, args.output)
+    elif results:
+        # Generate default output filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_output = f"experiment_results_{timestamp}.json"
+        save_experiment_results(results, default_output)
+    
+    logger.info("OpenLLMIntentContinuum stopped.")
 
 
 if __name__ == "__main__":

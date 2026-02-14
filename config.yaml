@@ -34,7 +34,15 @@ llm:
   model: "tinyllama"
   temperature: 0.1
 
-# Actions enabled (start with horizontal scaling only)
+# Decision History
+history:
+  max_entries: 3  # Maximum past violations to include in prompt
+
+# Experiment Settings
+experiment:
+  default_duration_minutes: 10  # Default time window duration
+
+# Actions enabled
 actions:
   horizontal_scaling: true
   vertical_scaling: true
