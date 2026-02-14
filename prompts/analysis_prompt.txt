@@ -1,0 +1,12 @@
+Respond with ONLY a JSON object. No other text.
+
+Problem: {violation_type}
+Response time: {current_rt}s, Target: {lower_threshold}s-{upper_threshold}s
+
+Current deployments:
+{deployments_data}
+
+Rule: If LOWER_THRESHOLD_EXCEEDED, set replicas to 1. If UPPER_THRESHOLD_EXCEEDED, set replicas to 3.
+
+Pick one deployment from the list above. Respond in this JSON format:
+{{"action": "horizontal_scaling", "deployment_name": "DEPLOYMENT_NAME_HERE", "replicas": NUMBER}}
