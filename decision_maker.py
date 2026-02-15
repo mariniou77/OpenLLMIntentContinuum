@@ -357,8 +357,12 @@ Pick one deployment and respond with exactly this format:
         
         if normalized_action == "horizontal_scaling":
             dep_name = parsed.get("deployment_name") or parsed.get("deployment")
-            # Accept both "replicas" and "replica_count" (TinyLlama sometimes uses replica_count)
-            replicas = parsed.get("replicas") or parsed.get("replica_count", 2)
+            replicas = parsed.get("replicas") or parsed.get("replica_count") or 2
+            
+            # Handle case where replicas is not a number (e.g., list or dict)
+            if not isinstance(replicas, (int, float, str)):
+                replicas = 2  # default fallback
+            
             if dep_name:
                 parameters = {
                     "deployment_name": dep_name,
