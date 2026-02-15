@@ -6,6 +6,9 @@ Response time: {current_rt}s, Target: {lower_threshold}s-{upper_threshold}s
 Current deployments:
 {deployments_data}
 
+Previous decisions:
+{history}
+
 Rule: If LOWER_THRESHOLD_EXCEEDED, set replicas to 1. If UPPER_THRESHOLD_EXCEEDED, set replicas to 3.
 
 Pick one deployment from the list above. Respond in this JSON format:
