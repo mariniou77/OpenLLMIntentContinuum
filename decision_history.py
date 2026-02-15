@@ -35,6 +35,7 @@ class DecisionHistory:
         self.max_entries = max_entries
         self.history = deque(maxlen=max_entries)
         self.session_start: Optional[datetime] = None
+        self.violation_counter = 0
         
         logger.info(f"DecisionHistory initialized with max_entries={max_entries}")
     
@@ -46,6 +47,7 @@ class DecisionHistory:
         """
         self.history.clear()
         self.session_start = datetime.now()
+        self.violation_counter = 0
         logger.info("Decision history reset for new session")
     
     def add_entry(
@@ -70,9 +72,10 @@ class DecisionHistory:
             deployments_summary: Compact deployments data string
             decision: The decision made by LLM {"action": "...", "parameters": {...}}
         """
+        self.violation_counter += 1
         entry = {
             "timestamp": datetime.now().isoformat(),
-            "violation_number": len(self.history) + 1,
+            "violation_number": self.violation_counter,
             "violation_type": violation_type,
             "response_time": round(response_time, 3),
             "ema_response_time": round(ema_response_time, 3),

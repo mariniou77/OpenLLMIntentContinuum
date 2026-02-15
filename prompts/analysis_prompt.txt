@@ -10,6 +10,8 @@ Deployments:
 Previous decisions:
 {history}
 
-Task: If LOWER_THRESHOLD_EXCEEDED, pick a deployment with more than 1 replica and scale DOWN to 1. If UPPER_THRESHOLD_EXCEEDED, pick a deployment and scale UP to 3.
+Instructions:
+- LOWER_THRESHOLD_EXCEEDED means response time is TOO FAST. Reduce replicas.
+- UPPER_THRESHOLD_EXCEEDED means response time is TOO SLOW. Add replicas.
 
 Return JSON with keys: action, deployment_name, replicas
