@@ -128,6 +128,7 @@ Pick one deployment and respond with exactly this format:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            "format": "json",
             "options": {
                 "temperature": self.temperature,
                 "num_predict": 256
