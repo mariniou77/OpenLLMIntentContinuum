@@ -186,6 +186,34 @@ class KubernetesClient:
         else:
             logger.error(f"Failed to scale {deployment_name}: {output}")
             return {"success": False, "error": output}
+    
+    def set_resources(self, deployment_name: str, cpu_limit: str, memory_limit: str, namespace: str = "default") -> dict:
+        """
+        Set resource limits for a deployment using 'kubectl set resources'.
+        
+        This is more reliable than patching for resource updates.
+        
+        Args:
+            deployment_name: Name of the deployment
+            cpu_limit: CPU limit (e.g., "500m", "1")
+            memory_limit: Memory limit (e.g., "512Mi", "1Gi")
+            namespace: Kubernetes namespace
+            
+        Returns:
+            Dictionary with success status and message
+        """
+        logger.info(f"Setting resources for {deployment_name}: CPU={cpu_limit}, Memory={memory_limit}")
+        
+        command = f"set resources deployment {deployment_name} --limits=cpu={cpu_limit},memory={memory_limit} --requests=cpu={cpu_limit},memory={memory_limit} -n {namespace}"
+        output = self._run_kubectl(command)
+        
+        # kubectl set resources returns something like "deployment.apps/xxx resource requirements updated"
+        if "updated" in output.lower() or "configured" in output.lower():
+            logger.info(f"Successfully set resources for {deployment_name}")
+            return {"success": True, "message": f"Set resources for {deployment_name}: CPU={cpu_limit}, Memory={memory_limit}"}
+        else:
+            logger.error(f"Failed to set resources for {deployment_name}: {output}")
+            return {"success": False, "error": output or "Unknown error"}
         
     def patch_deployment(self, deployment_name: str, patch_json: str, namespace: str = "default") -> dict:
         """

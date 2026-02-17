@@ -110,7 +110,13 @@ test_horizontal_scaling() {
     
     DEPLOYMENT="microservice1-deployment"
     ORIGINAL_REPLICAS=${INITIAL_REPLICAS[$DEPLOYMENT]:-2}
-    NEW_REPLICAS=3
+    
+    # Determine new replicas (go up if low, down if high)
+    if [ "$ORIGINAL_REPLICAS" -lt 3 ]; then
+        NEW_REPLICAS=$((ORIGINAL_REPLICAS + 1))
+    else
+        NEW_REPLICAS=$((ORIGINAL_REPLICAS - 1))
+    fi
     
     # BEFORE STATE
     print_section "BEFORE STATE"
@@ -120,7 +126,7 @@ test_horizontal_scaling() {
     run_kubectl "get pods -l app=microservice1 -o wide"
     
     # APPLY CHANGE
-    print_section "APPLYING CHANGE: Scale to $NEW_REPLICAS replicas"
+    print_section "APPLYING CHANGE: Scale from $ORIGINAL_REPLICAS to $NEW_REPLICAS replicas"
     run_kubectl "scale deployment $DEPLOYMENT --replicas=$NEW_REPLICAS"
     
     echo "Waiting for scaling to complete..."
@@ -143,7 +149,7 @@ test_horizontal_scaling() {
     # REVERT
     print_section "REVERTING: Scale back to $ORIGINAL_REPLICAS replicas"
     run_kubectl "scale deployment $DEPLOYMENT --replicas=$ORIGINAL_REPLICAS"
-    sleep 5
+    sleep 8
     run_kubectl "get deployment $DEPLOYMENT"
     print_success "Reverted to original state"
 }
@@ -155,27 +161,31 @@ test_vertical_scaling() {
     print_header "TEST 2: VERTICAL SCALING"
     
     DEPLOYMENT="microservice1-deployment"
-    CONTAINER="microservice1"
-    ORIGINAL_CPU=${INITIAL_CPU[$DEPLOYMENT]:-"300m"}
-    ORIGINAL_MEMORY=${INITIAL_MEMORY[$DEPLOYMENT]:-"312Mi"}
     NEW_CPU="400m"
     NEW_MEMORY="400Mi"
     
     # BEFORE STATE
     print_section "BEFORE STATE"
     echo "Deployment: $DEPLOYMENT"
-    echo "Container: $CONTAINER"
     echo "Current resources:"
-    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  CPU Limit: {.spec.template.spec.containers[0].resources.limits.cpu}'"
+    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  Limits: {.spec.template.spec.containers[0].resources.limits}'"
     echo ""
-    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  Memory Limit: {.spec.template.spec.containers[0].resources.limits.memory}'"
+    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  Requests: {.spec.template.spec.containers[0].resources.requests}'"
     echo ""
+    
+    # Capture original values for revert
+    ORIGINAL_CPU=$(run_kubectl "get deployment $DEPLOYMENT -o jsonpath='{.spec.template.spec.containers[0].resources.limits.cpu}'" | tr -d "'")
+    ORIGINAL_MEMORY=$(run_kubectl "get deployment $DEPLOYMENT -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}'" | tr -d "'")
+    
+    # Set defaults if empty
+    ORIGINAL_CPU=${ORIGINAL_CPU:-"300m"}
+    ORIGINAL_MEMORY=${ORIGINAL_MEMORY:-"312Mi"}
+    
+    echo "Captured original: CPU=$ORIGINAL_CPU, Memory=$ORIGINAL_MEMORY"
     
     # APPLY CHANGE
     print_section "APPLYING CHANGE: CPU=$NEW_CPU, Memory=$NEW_MEMORY"
-    PATCH="{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$CONTAINER\",\"resources\":{\"limits\":{\"cpu\":\"$NEW_CPU\",\"memory\":\"$NEW_MEMORY\"},\"requests\":{\"cpu\":\"$NEW_CPU\",\"memory\":\"$NEW_MEMORY\"}}}]}}}}"
-    
-    run_kubectl "patch deployment $DEPLOYMENT --type=strategic -p '$PATCH'"
+    run_kubectl "set resources deployment $DEPLOYMENT --limits=cpu=$NEW_CPU,memory=$NEW_MEMORY --requests=cpu=$NEW_CPU,memory=$NEW_MEMORY"
     
     echo "Waiting for pods to restart with new limits..."
     sleep 15
@@ -183,14 +193,14 @@ test_vertical_scaling() {
     # AFTER STATE
     print_section "AFTER STATE"
     echo "New resources:"
-    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  CPU Limit: {.spec.template.spec.containers[0].resources.limits.cpu}'"
+    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  Limits: {.spec.template.spec.containers[0].resources.limits}'"
     echo ""
-    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  Memory Limit: {.spec.template.spec.containers[0].resources.limits.memory}'"
+    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  Requests: {.spec.template.spec.containers[0].resources.requests}'"
     echo ""
-    run_kubectl "get pods -l app=microservice1 -o wide"
+    run_kubectl "get pods -l app=microservice1"
     
     # Verify
-    CURRENT_CPU=$(run_kubectl "get deployment $DEPLOYMENT -o jsonpath='{.spec.template.spec.containers[0].resources.limits.cpu}'")
+    CURRENT_CPU=$(run_kubectl "get deployment $DEPLOYMENT -o jsonpath='{.spec.template.spec.containers[0].resources.limits.cpu}'" | tr -d "'")
     if [ "$CURRENT_CPU" == "$NEW_CPU" ]; then
         print_success "Vertical scaling successful: CPU $ORIGINAL_CPU -> $NEW_CPU"
     else
@@ -199,15 +209,11 @@ test_vertical_scaling() {
     
     # REVERT
     print_section "REVERTING: CPU=$ORIGINAL_CPU, Memory=$ORIGINAL_MEMORY"
-    PATCH_REVERT="{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$CONTAINER\",\"resources\":{\"limits\":{\"cpu\":\"$ORIGINAL_CPU\",\"memory\":\"$ORIGINAL_MEMORY\"},\"requests\":{\"cpu\":\"$ORIGINAL_CPU\",\"memory\":\"$ORIGINAL_MEMORY\"}}}]}}}}"
-    
-    run_kubectl "patch deployment $DEPLOYMENT --type=strategic -p '$PATCH_REVERT'"
+    run_kubectl "set resources deployment $DEPLOYMENT --limits=cpu=$ORIGINAL_CPU,memory=$ORIGINAL_MEMORY --requests=cpu=$ORIGINAL_CPU,memory=$ORIGINAL_MEMORY"
     sleep 10
     
     echo "Restored resources:"
-    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  CPU Limit: {.spec.template.spec.containers[0].resources.limits.cpu}'"
-    echo ""
-    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  Memory Limit: {.spec.template.spec.containers[0].resources.limits.memory}'"
+    run_kubectl "get deployment $DEPLOYMENT -o jsonpath='  Limits: {.spec.template.spec.containers[0].resources.limits}'"
     echo ""
     print_success "Reverted to original state"
 }
