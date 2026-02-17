@@ -199,21 +199,19 @@ class KubernetesClient:
         Returns:
             Dictionary with success status and message
         """
-        command = (
-            f"sudo kubectl patch deployment {deployment_name} "
-            f"-n {namespace} "
-            f"--type=strategic "
-            f"-p '{patch_json}'"
-        )
+        # Note: _run_kubectl already adds "sudo kubectl" prefix
+        command = f"patch deployment {deployment_name} -n {namespace} --type=strategic -p '{patch_json}'"
         
-        result = self._run_kubectl(command)
+        logger.info(f"Patching deployment {deployment_name}")
+        output = self._run_kubectl(command)
         
-        if result["success"]:
+        # kubectl patch returns something like "deployment.apps/xxx patched"
+        if "patched" in output.lower():
             logger.info(f"Successfully patched {deployment_name}")
             return {"success": True, "message": f"Patched {deployment_name}"}
         else:
-            logger.error(f"Failed to patch {deployment_name}: {result.get('error')}")
-            return {"success": False, "error": result.get("error", "Unknown error")}
+            logger.error(f"Failed to patch {deployment_name}: {output}")
+            return {"success": False, "error": output or "Unknown error"}
     
     def get_cluster_summary(self) -> dict:
         """

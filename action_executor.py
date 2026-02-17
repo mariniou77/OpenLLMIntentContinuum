@@ -177,9 +177,13 @@ class ActionExecutor:
                 "message": f"Deployment '{deployment_name}' not found"
             }
         
+        # Get the container name from the deployment
+        # The container name is typically the same as the deployment name without "-deployment"
+        container_name = actual_deployment_name.replace("-deployment", "")
+        
         # Build the patch command
         # This patches the first container in the pod spec
-        patch_json = f'{{"spec":{{"template":{{"spec":{{"containers":[{{"name":"nginx","resources":{{"limits":{{"cpu":"{cpu_limit}","memory":"{memory_limit}"}},"requests":{{"cpu":"{cpu_limit}","memory":"{memory_limit}"}}}}}}]}}}}}}}}'
+        patch_json = f'{{"spec":{{"template":{{"spec":{{"containers":[{{"name":"{container_name}","resources":{{"limits":{{"cpu":"{cpu_limit}","memory":"{memory_limit}"}},"requests":{{"cpu":"{cpu_limit}","memory":"{memory_limit}"}}}}}}]}}}}}}}}'
         
         logger.info(f"Vertical scaling {actual_deployment_name}: CPU={cpu_limit}, Memory={memory_limit}")
         
