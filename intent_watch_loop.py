@@ -212,10 +212,10 @@ class IntentWatchLoop:
         logger.info("Collecting system data...")
         system_state = self.data_collector.collect_all()
         
-        # Extract data for decision maker
-        cluster_data = system_state.get("kubernetes", {})
-        network_data = system_state.get("onos", {})
-        monitoring_data = system_state.get("sflow", {})
+        # Extract data for decision maker (correct keys from data_collector)
+        cluster_data = system_state.get("cluster_info", {}).get("data", {})
+        network_data = system_state.get("network_info", {}).get("data", {})
+        monitoring_data = system_state.get("monitoring_data", {}).get("data", {})
         
         # Get compact strings for logging
         monitoring_str = self.data_collector.format_monitoring_compact(system_state)

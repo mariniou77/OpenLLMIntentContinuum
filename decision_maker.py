@@ -125,6 +125,10 @@ Choose ONE action and return a JSON object with the appropriate fields for that 
         """Format system state for the prompt."""
         lines = []
         
+        # Debug: log what we received
+        logger.debug(f"cluster_data keys: {cluster_data.keys() if cluster_data else 'None'}")
+        logger.debug(f"network_data keys: {network_data.keys() if network_data else 'None'}")
+        
         # Deployments
         deployments = cluster_data.get("deployments", {}).get("list", [])
         if deployments:
@@ -134,6 +138,8 @@ Choose ONE action and return a JSON object with the appropriate fields for that 
                 replicas = d.get("replicas_desired", 0)
                 ready = d.get("replicas_ready", 0)
                 lines.append(f"  - {name}: {ready}/{replicas} replicas")
+        else:
+            logger.debug(f"No deployments found. cluster_data: {cluster_data}")
         
         # Nodes
         nodes = cluster_data.get("nodes", {}).get("list", [])
