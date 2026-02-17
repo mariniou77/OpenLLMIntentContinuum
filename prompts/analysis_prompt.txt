@@ -1,17 +1,20 @@
-You must respond with only a JSON object.
+You must respond with ONLY a JSON object. No other text.
 
 Problem: {violation_type}
-Current response time: {current_rt}s
-Target range: {lower_threshold}s-{upper_threshold}s
+Current response time: {current_rt}s (EMA: {ema_rt}s)
+Target range: {lower_threshold}s - {upper_threshold}s
 
-Deployments:
-{deployments_data}
+Current System State:
+{system_state}
+
+Available Actions:
+{available_actions}
 
 Previous decisions:
 {history}
 
 Instructions:
-- LOWER_THRESHOLD_EXCEEDED means response time is TOO FAST. Reduce replicas.
-- UPPER_THRESHOLD_EXCEEDED means response time is TOO SLOW. Add replicas.
+- If LOWER_THRESHOLD_EXCEEDED: response time is TOO FAST, system is over-provisioned. Reduce replicas or resources.
+- If UPPER_THRESHOLD_EXCEEDED: response time is TOO SLOW, system needs more resources. Increase replicas or resources.
 
-Return JSON with keys: action, deployment_name, replicas
+Choose ONE action and respond with a JSON object matching the format shown above.

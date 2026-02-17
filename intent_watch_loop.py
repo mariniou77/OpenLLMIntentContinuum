@@ -212,25 +212,27 @@ class IntentWatchLoop:
         logger.info("Collecting system data...")
         system_state = self.data_collector.collect_all()
         
-        # Step 2: Format data in compact format for new prompt
-        monitoring_data = self.data_collector.format_monitoring_compact(system_state)
-        deployments_data = self.data_collector.format_deployments_compact(system_state)
-        available_nodes = self.data_collector.format_nodes_compact(system_state)
+        # Extract data for decision maker
+        cluster_data = system_state.get("kubernetes", {})
+        network_data = system_state.get("onos", {})
+        monitoring_data = system_state.get("sflow", {})
+        
+        # Get compact strings for logging
+        monitoring_str = self.data_collector.format_monitoring_compact(system_state)
+        deployments_str = self.data_collector.format_deployments_compact(system_state)
         history_str = self.decision_history.format_for_prompt()
         
-        logger.info(f"Monitoring: {monitoring_data}")
-        logger.info(f"Deployments: {deployments_data}")
-        logger.info(f"Available nodes: {available_nodes}")
+        logger.info(f"Deployments: {deployments_str}")
         
-        # Step 3: Get LLM recommendation with history context
+        # Step 2: Get LLM recommendation
         logger.info("Querying LLM for recommendation...")
         recommendation = self.decision_maker.analyze_and_recommend(
             violation_type=violation_type,
             current_rt=current_rt,
             ema_rt=self.ema_rt,
+            cluster_data=cluster_data,
+            network_data=network_data,
             monitoring_data=monitoring_data,
-            deployments_data=deployments_data,
-            available_nodes=available_nodes,
             history=history_str
         )
         
@@ -238,14 +240,14 @@ class IntentWatchLoop:
         if recommendation.get('parameters'):
             logger.info(f"Parameters: {recommendation.get('parameters')}")
         
-        # Step 4: Execute the action
+        # Step 3: Execute the action
         action_executed = False
         if recommendation.get("action") != "none":
             logger.info("Executing recommended action...")
             result = self.action_executor.execute(
                 action=recommendation.get("action"),
                 parameters=recommendation.get("parameters", {}),
-                analysis=""  # No longer using analysis text
+                analysis=""
             )
             
             if result["success"]:
@@ -264,13 +266,13 @@ class IntentWatchLoop:
         else:
             logger.info("No action recommended by LLM")
         
-        # Step 5: Save decision to history (even if action was "none")
+        # Step 4: Save decision to history
         self.decision_history.add_entry(
             violation_type=violation_type,
             response_time=current_rt,
             ema_response_time=self.ema_rt if self.ema_rt else current_rt,
-            monitoring_summary=monitoring_data,
-            deployments_summary=deployments_data,
+            monitoring_summary=monitoring_str,
+            deployments_summary=deployments_str,
             decision={
                 "action": recommendation.get("action", "none"),
                 "parameters": recommendation.get("parameters", {})
