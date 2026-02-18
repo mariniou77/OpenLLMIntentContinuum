@@ -67,8 +67,12 @@ class TestHarness:
             password=self.config["endpoints"]["onos_password"]
         )
         
-        # Initialize action executor
-        self.action_executor = ActionExecutor(self.config)
+        # Initialize action executor (requires kubernetes_client and onos_client)
+        self.action_executor = ActionExecutor(
+            self.config, 
+            self.k8s_client, 
+            self.onos_client
+        )
         
         # Store state for revert
         self.initial_state = {}
