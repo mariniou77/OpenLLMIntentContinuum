@@ -146,7 +146,7 @@ class ActionExecutor:
         """
         Execute vertical scaling (change CPU/memory limits).
         
-        This requires patching the deployment with new resource limits.
+        This uses 'kubectl set resources' to update resource limits.
         The pods will be restarted with the new limits.
         
         Args:
@@ -177,13 +177,14 @@ class ActionExecutor:
                 "message": f"Deployment '{deployment_name}' not found"
             }
         
-        # Build the patch command
-        # This patches the first container in the pod spec
-        patch_json = f'{{"spec":{{"template":{{"spec":{{"containers":[{{"name":"nginx","resources":{{"limits":{{"cpu":"{cpu_limit}","memory":"{memory_limit}"}},"requests":{{"cpu":"{cpu_limit}","memory":"{memory_limit}"}}}}}}]}}}}}}}}'
-        
         logger.info(f"Vertical scaling {actual_deployment_name}: CPU={cpu_limit}, Memory={memory_limit}")
         
-        result = self.k8s_client.patch_deployment(actual_deployment_name, patch_json)
+        # Use kubectl set resources command (more reliable than patch for resources)
+        result = self.k8s_client.set_resources(
+            actual_deployment_name, 
+            cpu_limit, 
+            memory_limit
+        )
         
         if result.get("success"):
             return {

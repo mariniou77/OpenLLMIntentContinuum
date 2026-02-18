@@ -1,12 +1,20 @@
-Respond with ONLY a JSON object. No other text.
+You must respond with ONLY a JSON object. No other text.
 
 Problem: {violation_type}
-Response time: {current_rt}s, Target: {lower_threshold}s-{upper_threshold}s
+Current response time: {current_rt}s (EMA: {ema_rt}s)
+Target range: {lower_threshold}s - {upper_threshold}s
 
-Current deployments:
-{deployments_data}
+Current System State:
+{system_state}
 
-Rule: If LOWER_THRESHOLD_EXCEEDED, set replicas to 1. If UPPER_THRESHOLD_EXCEEDED, set replicas to 3.
+Available Actions:
+{available_actions}
 
-Pick one deployment from the list above. Respond in this JSON format:
-{{"action": "horizontal_scaling", "deployment_name": "DEPLOYMENT_NAME_HERE", "replicas": NUMBER}}
+Previous decisions:
+{history}
+
+Instructions:
+- If LOWER_THRESHOLD_EXCEEDED: response time is TOO FAST, system is over-provisioned. Reduce replicas or resources.
+- If UPPER_THRESHOLD_EXCEEDED: response time is TOO SLOW, system needs more resources. Increase replicas or resources.
+
+Choose ONE action and respond with a JSON object matching the format shown above.

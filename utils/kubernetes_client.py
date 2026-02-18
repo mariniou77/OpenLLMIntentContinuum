@@ -186,6 +186,34 @@ class KubernetesClient:
         else:
             logger.error(f"Failed to scale {deployment_name}: {output}")
             return {"success": False, "error": output}
+    
+    def set_resources(self, deployment_name: str, cpu_limit: str, memory_limit: str, namespace: str = "default") -> dict:
+        """
+        Set resource limits for a deployment using 'kubectl set resources'.
+        
+        This is more reliable than patching for resource updates.
+        
+        Args:
+            deployment_name: Name of the deployment
+            cpu_limit: CPU limit (e.g., "500m", "1")
+            memory_limit: Memory limit (e.g., "512Mi", "1Gi")
+            namespace: Kubernetes namespace
+            
+        Returns:
+            Dictionary with success status and message
+        """
+        logger.info(f"Setting resources for {deployment_name}: CPU={cpu_limit}, Memory={memory_limit}")
+        
+        command = f"set resources deployment {deployment_name} --limits=cpu={cpu_limit},memory={memory_limit} --requests=cpu={cpu_limit},memory={memory_limit} -n {namespace}"
+        output = self._run_kubectl(command)
+        
+        # kubectl set resources returns something like "deployment.apps/xxx resource requirements updated"
+        if "updated" in output.lower() or "configured" in output.lower():
+            logger.info(f"Successfully set resources for {deployment_name}")
+            return {"success": True, "message": f"Set resources for {deployment_name}: CPU={cpu_limit}, Memory={memory_limit}"}
+        else:
+            logger.error(f"Failed to set resources for {deployment_name}: {output}")
+            return {"success": False, "error": output or "Unknown error"}
         
     def patch_deployment(self, deployment_name: str, patch_json: str, namespace: str = "default") -> dict:
         """
@@ -199,21 +227,21 @@ class KubernetesClient:
         Returns:
             Dictionary with success status and message
         """
-        command = (
-            f"sudo kubectl patch deployment {deployment_name} "
-            f"-n {namespace} "
-            f"--type=strategic "
-            f"-p '{patch_json}'"
-        )
+        # Escape the JSON for shell - replace single quotes with escaped version
+        # Use double quotes in the outer command instead
+        escaped_json = patch_json.replace('"', '\\"')
+        command = f'patch deployment {deployment_name} -n {namespace} --type=strategic -p "{escaped_json}"'
         
-        result = self._run_kubectl(command)
+        logger.info(f"Patching deployment {deployment_name}")
+        output = self._run_kubectl(command)
         
-        if result["success"]:
+        # kubectl patch returns something like "deployment.apps/xxx patched"
+        if "patched" in output.lower():
             logger.info(f"Successfully patched {deployment_name}")
             return {"success": True, "message": f"Patched {deployment_name}"}
         else:
-            logger.error(f"Failed to patch {deployment_name}: {result.get('error')}")
-            return {"success": False, "error": result.get("error", "Unknown error")}
+            logger.error(f"Failed to patch {deployment_name}: {output}")
+            return {"success": False, "error": output or "Unknown error"}
     
     def get_cluster_summary(self) -> dict:
         """

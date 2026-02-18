@@ -4,17 +4,20 @@ Decision Maker Module
 This module integrates with the LLM (TinyLlama via Ollama) to analyze
 system state and recommend actions when SLO violations occur.
 
-Updated to use:
-- Cleaner, more structured prompts
-- Decision history for context
-- Simpler expected output format
+Supports 4 action types:
+1. horizontal_scaling - Change replica count
+2. vertical_scaling - Change CPU/memory limits
+3. service_placement - Move pod to different node
+4. flow_scheduling - Change network path via ONOS
+
+The LLM analyzes the system state and decides which action to take.
 """
 
 import json
 import logging
 import re
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -47,6 +50,9 @@ class DecisionMaker:
         # Intent thresholds for context
         self.upper_threshold = config["intent"]["upper_threshold"]
         self.lower_threshold = config["intent"]["lower_threshold"]
+        
+        # Enabled actions
+        self.actions_enabled = config.get("actions", {})
     
     def _load_prompt_template(self) -> str:
         """Load the prompt template from file."""
@@ -60,55 +66,138 @@ class DecisionMaker:
     
     def _get_default_prompt_template(self) -> str:
         """Return a default prompt template if file not found."""
-        return """Respond with ONLY a JSON object. No other text.
+        return """You must respond with ONLY a JSON object. No other text.
 
 Problem: {violation_type}
-Response time: {current_rt}s, Target: {lower_threshold}s-{upper_threshold}s
+Current response time: {current_rt}s (EMA: {ema_rt}s)
+Target range: {lower_threshold}s - {upper_threshold}s
 
-Current deployments:
-{deployments_data}
+Current System State:
+{system_state}
 
-Rule: If LOWER_THRESHOLD_EXCEEDED, set replicas to 1. If UPPER_THRESHOLD_EXCEEDED, set replicas to 3.
+Available Actions:
+{available_actions}
 
-Pick one deployment and respond with exactly this format:
-{{"action": "horizontal_scaling", "deployment_name": "microservice3-deployment", "replicas": 1}}
+Previous decisions:
+{history}
+
+Instructions:
+- If LOWER_THRESHOLD_EXCEEDED: response time is TOO FAST, system is over-provisioned. Reduce resources.
+- If UPPER_THRESHOLD_EXCEEDED: response time is TOO SLOW, system needs more resources. Increase resources.
+
+Choose ONE action and return a JSON object with the appropriate fields for that action type.
 """
+
+    def _get_enabled_actions_description(self) -> str:
+        """Get description of enabled actions for the prompt."""
+        descriptions = []
+        
+        if self.actions_enabled.get("horizontal_scaling"):
+            descriptions.append(
+                '1. horizontal_scaling: Change replica count\n'
+                '   JSON format: {"action": "horizontal_scaling", "deployment_name": "name", "replicas": N}'
+            )
+        
+        if self.actions_enabled.get("vertical_scaling"):
+            descriptions.append(
+                '2. vertical_scaling: Change CPU/memory limits\n'
+                '   JSON format: {"action": "vertical_scaling", "deployment_name": "name", "cpu_limit": "500m", "memory_limit": "512Mi"}'
+            )
+        
+        if self.actions_enabled.get("service_placement"):
+            descriptions.append(
+                '3. service_placement: Move pod to different node\n'
+                '   JSON format: {"action": "service_placement", "deployment_name": "name", "target_node": "worker1"}'
+            )
+        
+        if self.actions_enabled.get("flow_scheduling"):
+            descriptions.append(
+                '4. flow_scheduling: Change network path\n'
+                '   JSON format: {"action": "flow_scheduling", "source_switch": "of:...", "destination_switch": "of:..."}'
+            )
+        
+        if not descriptions:
+            descriptions.append('No actions enabled')
+        
+        return '\n'.join(descriptions)
+
+    def _format_system_state(self, cluster_data: dict, network_data: dict, monitoring_data: dict) -> str:
+        """Format system state for the prompt."""
+        lines = []
+        
+        # Debug: log what we received
+        logger.debug(f"cluster_data keys: {cluster_data.keys() if cluster_data else 'None'}")
+        logger.debug(f"network_data keys: {network_data.keys() if network_data else 'None'}")
+        
+        # Deployments
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if deployments:
+            lines.append("Deployments:")
+            for d in deployments:
+                name = d.get("name", "unknown")
+                replicas = d.get("replicas_desired", 0)
+                ready = d.get("replicas_ready", 0)
+                lines.append(f"  - {name}: {ready}/{replicas} replicas")
+        else:
+            logger.debug(f"No deployments found. cluster_data: {cluster_data}")
+        
+        # Nodes
+        nodes = cluster_data.get("nodes", {}).get("list", [])
+        if nodes:
+            lines.append("Nodes:")
+            for n in nodes:
+                name = n.get("name", "unknown")
+                status = n.get("status", "unknown")
+                lines.append(f"  - {name}: {status}")
+        
+        # Network devices
+        devices = network_data.get("devices", {}).get("list", [])
+        if devices:
+            lines.append("Network switches:")
+            for d in devices:
+                dev_id = d.get("id", "unknown")
+                available = d.get("available", False)
+                lines.append(f"  - {dev_id}: {'available' if available else 'unavailable'}")
+        
+        return '\n'.join(lines) if lines else "No system data available"
 
     def build_prompt(
         self,
         violation_type: str,
         current_rt: float,
         ema_rt: float,
-        monitoring_data: str,
-        deployments_data: str,
-        available_nodes: str,
+        cluster_data: dict,
+        network_data: dict,
+        monitoring_data: dict,
         history: str
     ) -> str:
         """
-        Build the complete prompt for the LLM using the new clean format.
+        Build the complete prompt for the LLM.
         
         Args:
-            violation_type: Type of violation (UPPER_THRESHOLD_EXCEEDED or LOWER_THRESHOLD_EXCEEDED)
+            violation_type: Type of violation
             current_rt: Current response time in seconds
             ema_rt: EMA response time in seconds
-            monitoring_data: Compact monitoring string from DataCollector
-            deployments_data: Compact deployments string from DataCollector
-            available_nodes: Comma-separated list of available worker nodes
-            history: Formatted history string from DecisionHistory
+            cluster_data: Kubernetes cluster state
+            network_data: ONOS network state
+            monitoring_data: sFlow monitoring metrics
+            history: Formatted history string
             
         Returns:
             Complete prompt string
         """
+        system_state = self._format_system_state(cluster_data, network_data, monitoring_data)
+        available_actions = self._get_enabled_actions_description()
+        
         prompt = self.prompt_template.format(
             violation_type=violation_type,
             current_rt=round(current_rt, 2),
             ema_rt=round(ema_rt, 2),
             lower_threshold=self.lower_threshold,
             upper_threshold=self.upper_threshold,
-            monitoring_data=monitoring_data,
-            deployments_data=deployments_data,
-            available_nodes=available_nodes,
-            history=history
+            system_state=system_state,
+            available_actions=available_actions,
+            history=history if history else "No previous decisions"
         )
         return prompt
     
@@ -128,13 +217,14 @@ Pick one deployment and respond with exactly this format:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            "format": "json",
             "options": {
                 "temperature": self.temperature,
                 "num_predict": 256
             }
         }
         
-        # Debug logging - log full prompt
+        # Debug logging
         if self.debug_llm:
             logger.info("=" * 60)
             logger.info("LLM DEBUG - PROMPT:")
@@ -150,9 +240,7 @@ Pick one deployment and respond with exactly this format:
             result = response.json()
             llm_response = result.get("response", "")
             
-            # Debug logging - log full response
             if self.debug_llm:
-                logger.info("=" * 60)
                 logger.info("LLM DEBUG - RESPONSE:")
                 logger.info("=" * 60)
                 logger.info(f"\n{llm_response}")
@@ -219,101 +307,63 @@ Pick one deployment and respond with exactly this format:
         """
         Extract action information using regex patterns.
         
-        Fallback method when JSON parsing fails.
-        
-        Args:
-            response_text: Raw response text
-            
-        Returns:
-            Extracted action dictionary
+        This is a fallback for when JSON parsing fails.
         """
-        response_lower = response_text.lower()
+        result = {"action": "none", "parameters": {}}
         
-        # Detect action type
-        action = "none"
-        if "horizontal_scaling" in response_lower or "replica" in response_lower:
-            action = "horizontal_scaling"
-        elif "vertical_scaling" in response_lower or "cpu_limit" in response_lower:
-            action = "vertical_scaling"
-        elif "service_placement" in response_lower or "target_node" in response_lower:
-            action = "service_placement"
-        elif "flow_scheduling" in response_lower or "new_path" in response_lower:
-            action = "flow_scheduling"
+        # Try to find action type
+        action_match = re.search(r'"action"\s*:\s*"([^"]+)"', response_text)
+        if action_match:
+            action = action_match.group(1).lower().strip()
+            result["action"] = action
         
-        # Extract deployment name
-        deployment = None
-        dep_match = re.search(r'"deployment_name"\s*:\s*"([^"]+)"', response_text)
-        if dep_match:
-            deployment = dep_match.group(1)
-        else:
-            # Try to find microservice mentions
-            for ms in ["microservice1", "microservice2", "microservice3", "microservice4"]:
-                if ms in response_lower:
-                    deployment = f"{ms}-deployment"
-                    break
-        
-        # Build result based on action type
-        result = {
-            "action": action,
-            "parameters": {}
-        }
-        
-        if action == "horizontal_scaling" and deployment:
-            replicas = 2  # default
-            # Try both "replicas" and "replica_count"
+        # Extract parameters based on action type
+        if "horizontal_scaling" in response_text.lower() or "scale" in response_text.lower():
+            dep_match = re.search(r'"deployment_name"\s*:\s*"([^"]+)"', response_text)
             rep_match = re.search(r'"replicas"\s*:\s*(\d+)', response_text)
-            if not rep_match:
-                rep_match = re.search(r'"replica_count"\s*:\s*(\d+)', response_text)
-            if rep_match:
-                replicas = int(rep_match.group(1))
-            result["parameters"] = {
-                "deployment_name": deployment,
-                "replicas": min(max(replicas, 1), 5)
-            }
             
-        elif action == "vertical_scaling" and deployment:
-            cpu = "500m"
-            mem = "512Mi"
+            if dep_match:
+                result["action"] = "horizontal_scaling"
+                result["parameters"] = {
+                    "deployment_name": dep_match.group(1),
+                    "replicas": int(rep_match.group(1)) if rep_match else 2
+                }
+        
+        elif "vertical_scaling" in response_text.lower():
+            dep_match = re.search(r'"deployment_name"\s*:\s*"([^"]+)"', response_text)
             cpu_match = re.search(r'"cpu_limit"\s*:\s*"([^"]+)"', response_text)
             mem_match = re.search(r'"memory_limit"\s*:\s*"([^"]+)"', response_text)
-            if cpu_match:
-                cpu = cpu_match.group(1)
-            if mem_match:
-                mem = mem_match.group(1)
-            result["parameters"] = {
-                "deployment_name": deployment,
-                "cpu_limit": cpu,
-                "memory_limit": mem
-            }
             
-        elif action == "service_placement" and deployment:
-            target = "worker1"
+            if dep_match:
+                result["action"] = "vertical_scaling"
+                result["parameters"] = {
+                    "deployment_name": dep_match.group(1),
+                    "cpu_limit": cpu_match.group(1) if cpu_match else "500m",
+                    "memory_limit": mem_match.group(1) if mem_match else "512Mi"
+                }
+        
+        elif "service_placement" in response_text.lower() or "placement" in response_text.lower():
+            dep_match = re.search(r'"deployment_name"\s*:\s*"([^"]+)"', response_text)
             node_match = re.search(r'"target_node"\s*:\s*"([^"]+)"', response_text)
-            if node_match:
-                target = node_match.group(1)
-            result["parameters"] = {
-                "deployment_name": deployment,
-                "target_node": target
-            }
             
-        elif action == "flow_scheduling":
-            src = dst = None
+            if dep_match and node_match:
+                result["action"] = "service_placement"
+                result["parameters"] = {
+                    "deployment_name": dep_match.group(1),
+                    "target_node": node_match.group(1)
+                }
+        
+        elif "flow_scheduling" in response_text.lower() or "reroute" in response_text.lower():
             src_match = re.search(r'"source_switch"\s*:\s*"([^"]+)"', response_text)
             dst_match = re.search(r'"destination_switch"\s*:\s*"([^"]+)"', response_text)
-            if src_match:
-                src = src_match.group(1)
-            if dst_match:
-                dst = dst_match.group(1)
-            if src and dst:
+            
+            if src_match and dst_match:
+                result["action"] = "flow_scheduling"
                 result["parameters"] = {
-                    "source_switch": src,
-                    "destination_switch": dst,
+                    "source_switch": src_match.group(1),
+                    "destination_switch": dst_match.group(1),
                     "new_path": []
                 }
-            else:
-                result["action"] = "none"
-        else:
-            result["action"] = "none"
         
         return result
     
@@ -321,7 +371,7 @@ Pick one deployment and respond with exactly this format:
         """
         Normalize parsed JSON into standard format.
         
-        Handles various field names TinyLlama might use.
+        Handles various field names the LLM might use.
         
         Args:
             parsed: Parsed JSON dictionary
@@ -340,64 +390,85 @@ Pick one deployment and respond with exactly this format:
             "scale_down": "horizontal_scaling",
             "vertical_scaling": "vertical_scaling",
             "verticalscaling": "vertical_scaling",
+            "resources": "vertical_scaling",
             "service_placement": "service_placement",
             "serviceplacement": "service_placement",
             "placement": "service_placement",
             "migrate": "service_placement",
+            "move": "service_placement",
             "flow_scheduling": "flow_scheduling",
             "flowscheduling": "flow_scheduling",
-            "reroute": "flow_scheduling"
+            "reroute": "flow_scheduling",
+            "network": "flow_scheduling",
+            "none": "none",
+            "no_action": "none"
         }
         
         normalized_action = action_mapping.get(action, "none")
+        
+        # Check if action is enabled
+        if normalized_action != "none" and not self.actions_enabled.get(normalized_action, False):
+            logger.warning(f"Action '{normalized_action}' is not enabled, falling back to none")
+            return {"action": "none", "parameters": {}}
         
         # Build parameters based on action type
         parameters = {}
         
         if normalized_action == "horizontal_scaling":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment")
-            # Accept both "replicas" and "replica_count" (TinyLlama sometimes uses replica_count)
-            replicas = parsed.get("replicas") or parsed.get("replica_count", 2)
+            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
+            replicas = parsed.get("replicas") or parsed.get("replica_count") or parsed.get("replica") or 2
+            
+            # Handle non-numeric replicas
+            if isinstance(replicas, (list, dict)):
+                replicas = 2
+            try:
+                replicas = int(replicas)
+            except (ValueError, TypeError):
+                replicas = 2
+            
             if dep_name:
                 parameters = {
-                    "deployment_name": dep_name,
-                    "replicas": min(max(int(replicas), 1), 5)
+                    "deployment_name": str(dep_name),
+                    "replicas": max(1, min(5, replicas))
                 }
             else:
                 normalized_action = "none"
                 
         elif normalized_action == "vertical_scaling":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment")
-            cpu = parsed.get("cpu_limit", "500m")
-            mem = parsed.get("memory_limit", "512Mi")
+            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
+            cpu = parsed.get("cpu_limit") or parsed.get("cpu") or "500m"
+            mem = parsed.get("memory_limit") or parsed.get("memory") or "512Mi"
+            
             if dep_name:
                 parameters = {
-                    "deployment_name": dep_name,
-                    "cpu_limit": cpu,
-                    "memory_limit": mem
+                    "deployment_name": str(dep_name),
+                    "cpu_limit": str(cpu),
+                    "memory_limit": str(mem)
                 }
             else:
                 normalized_action = "none"
                 
         elif normalized_action == "service_placement":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment")
-            target = parsed.get("target_node") or parsed.get("node")
+            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
+            target = parsed.get("target_node") or parsed.get("node") or parsed.get("target")
+            
             if dep_name and target:
                 parameters = {
-                    "deployment_name": dep_name,
-                    "target_node": target
+                    "deployment_name": str(dep_name),
+                    "target_node": str(target)
                 }
             else:
                 normalized_action = "none"
                 
         elif normalized_action == "flow_scheduling":
-            src = parsed.get("source_switch") or parsed.get("source")
-            dst = parsed.get("destination_switch") or parsed.get("destination")
-            path = parsed.get("new_path", [])
+            src = parsed.get("source_switch") or parsed.get("source") or parsed.get("ingress")
+            dst = parsed.get("destination_switch") or parsed.get("destination") or parsed.get("egress")
+            path = parsed.get("new_path") or parsed.get("path") or []
+            
             if src and dst:
                 parameters = {
-                    "source_switch": src,
-                    "destination_switch": dst,
+                    "source_switch": str(src),
+                    "destination_switch": str(dst),
                     "new_path": path if isinstance(path, list) else []
                 }
             else:
@@ -417,48 +488,19 @@ Pick one deployment and respond with exactly this format:
             "fallback_reason": reason
         }
     
-    def _validate_action(self, action: dict) -> dict:
-        """
-        Validate and sanitize the action from LLM.
-        
-        Args:
-            action: Parsed action dictionary
-            
-        Returns:
-            Validated action dictionary
-        """
-        if not isinstance(action, dict):
-            return self._get_fallback_response("Invalid action format")
-        
-        if "action" not in action:
-            action["action"] = "none"
-        
-        if "parameters" not in action:
-            action["parameters"] = {}
-        
-        # Validate specific action parameters
-        if action["action"] == "horizontal_scaling":
-            params = action.get("parameters", {})
-            if not params.get("deployment_name"):
-                action["action"] = "none"
-                action["parameters"] = {}
-            elif not isinstance(params.get("replicas"), int):
-                try:
-                    params["replicas"] = int(params.get("replicas", 2))
-                except (ValueError, TypeError):
-                    params["replicas"] = 2
-        
-        return action
-    
     def analyze_and_recommend(
         self,
         violation_type: str,
         current_rt: float,
         ema_rt: float,
-        monitoring_data: str,
-        deployments_data: str,
-        available_nodes: str,
-        history: str
+        cluster_data: dict = None,
+        network_data: dict = None,
+        monitoring_data: dict = None,
+        history: str = "",
+        # Legacy parameters for backward compatibility
+        monitoring_data_str: str = "",
+        deployments_data: str = "",
+        available_nodes: str = ""
     ) -> dict:
         """
         Main method: Analyze system state and recommend an action.
@@ -469,9 +511,9 @@ Pick one deployment and respond with exactly this format:
             violation_type: "UPPER_THRESHOLD_EXCEEDED" or "LOWER_THRESHOLD_EXCEEDED"
             current_rt: Current response time in seconds
             ema_rt: EMA response time in seconds
-            monitoring_data: Compact monitoring string
-            deployments_data: Compact deployments string
-            available_nodes: Available worker nodes string
+            cluster_data: Kubernetes cluster state dict
+            network_data: ONOS network state dict
+            monitoring_data: sFlow monitoring data dict
             history: Formatted decision history string
             
         Returns:
@@ -479,15 +521,21 @@ Pick one deployment and respond with exactly this format:
         """
         logger.info(f"Analyzing {violation_type} violation...")
         logger.info(f"Current RT: {current_rt:.2f}s, EMA: {ema_rt:.2f}s")
+        logger.info(f"Thresholds: [{self.lower_threshold}, {self.upper_threshold}]")
+        
+        # Use empty dicts if not provided
+        cluster_data = cluster_data or {}
+        network_data = network_data or {}
+        monitoring_data = monitoring_data or {}
         
         # Build the prompt
         prompt = self.build_prompt(
             violation_type=violation_type,
             current_rt=current_rt,
             ema_rt=ema_rt,
+            cluster_data=cluster_data,
+            network_data=network_data,
             monitoring_data=monitoring_data,
-            deployments_data=deployments_data,
-            available_nodes=available_nodes,
             history=history
         )
         
@@ -499,10 +547,7 @@ Pick one deployment and respond with exactly this format:
         # Parse the response
         action = self._parse_response(response_text)
         
-        # Validate the action
-        action = self._validate_action(action)
-        
-        logger.info(f"Recommended action: {action['action']}")
+        logger.info(f"LLM recommended action: {action['action']}")
         if action['action'] != 'none':
             logger.info(f"Parameters: {action['parameters']}")
         
