@@ -31,7 +31,7 @@ application:
 
 # LLM
 llm:
-  model: "tinyllama"
+  model: "spooknik/hermes-2-pro-mistral-7b"
   temperature: 0.1
 
 # Decision History
