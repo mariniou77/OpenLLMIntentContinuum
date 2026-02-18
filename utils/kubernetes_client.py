@@ -227,8 +227,10 @@ class KubernetesClient:
         Returns:
             Dictionary with success status and message
         """
-        # Note: _run_kubectl already adds "sudo kubectl" prefix
-        command = f"patch deployment {deployment_name} -n {namespace} --type=strategic -p '{patch_json}'"
+        # Escape the JSON for shell - replace single quotes with escaped version
+        # Use double quotes in the outer command instead
+        escaped_json = patch_json.replace('"', '\\"')
+        command = f'patch deployment {deployment_name} -n {namespace} --type=strategic -p "{escaped_json}"'
         
         logger.info(f"Patching deployment {deployment_name}")
         output = self._run_kubectl(command)

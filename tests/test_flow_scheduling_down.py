@@ -34,8 +34,9 @@ SOURCE_SWITCH = "of:0000000000000002"
 # Destination switch (OpenFlow ID)
 DESTINATION_SWITCH = "of:0000000000000003"
 
-# Optional: Intermediate switches for explicit path
-NEW_PATH = []  # Leave empty for ONOS to compute path automatically
+# Path: list of switches from source to destination
+# This creates an intent from switch 2 to switch 3 via switch 1
+NEW_PATH = ["of:0000000000000002", "of:0000000000000001", "of:0000000000000003"]
 
 # Simulated response time (below lower threshold of 1.0s)
 SIMULATED_RT = 0.5
@@ -61,7 +62,7 @@ def main():
     print(f"\nConfiguration:")
     print(f"  Source Switch: {SOURCE_SWITCH}")
     print(f"  Destination Switch: {DESTINATION_SWITCH}")
-    print(f"  New Path: {NEW_PATH if NEW_PATH else '(auto-computed by ONOS)'}")
+    print(f"  New Path: {' -> '.join(NEW_PATH)}")
     print(f"  Simulated RT: {SIMULATED_RT}s")
     print(f"  Auto Revert: {AUTO_REVERT}")
     print(f"  Wait Time: {WAIT_TIME}s")
