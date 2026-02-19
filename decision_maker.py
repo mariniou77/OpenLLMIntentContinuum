@@ -635,15 +635,27 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         # If same deployment failed multiple times, try a different deployment
         if same_deployment_failures >= 2 and action['action'] == 'horizontal_scaling':
             # Get list of deployments from cluster data
-            deployments = cluster_data.get('deployments', [])
+            # Structure: cluster_data["data"]["deployments"]["list"]
+            try:
+                deployments = cluster_data.get('data', {}).get('deployments', {}).get('list', [])
+            except (AttributeError, TypeError):
+                deployments = []
+            
             current_dep = action['parameters'].get('deployment_name', '')
             
             # Find a different deployment to try
             for dep in deployments:
-                dep_name = dep.get('name', '')
+                # Handle both dict and string formats
+                if isinstance(dep, dict):
+                    dep_name = dep.get('name', '')
+                    replicas = dep.get('replicas_desired', 1)
+                elif isinstance(dep, str):
+                    dep_name = dep
+                    replicas = 1
+                else:
+                    continue
+                
                 if dep_name and dep_name != current_dep and 'microservice' in dep_name:
-                    replicas = dep.get('replicas', 1)
-                    
                     if violation_type == "LOWER_THRESHOLD_EXCEEDED":
                         new_replicas = max(1, replicas - 1)  # Reduce
                     else:
