@@ -571,8 +571,8 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         # Parse the response
         action = self._parse_response(response_text)
         
-        # Check if this action has repeatedly failed
-        action = self._check_and_adjust_repeated_action(action, history, violation_type, cluster_data)
+        # 100% LLM decision-making - no Python override
+        # The LLM is fully responsible for learning from history and choosing appropriate actions
         
         logger.info(f"LLM recommended action: {action['action']}")
         if action['action'] != 'none':
