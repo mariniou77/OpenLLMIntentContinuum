@@ -259,8 +259,9 @@ class IntentWatchLoop:
                 logger.info(f"Waiting {self.wait_after_action}s for system to stabilize...")
                 time.sleep(self.wait_after_action)
                 
-                # Reset EMA after action to avoid immediate re-triggering
-                self.ema_rt = None
+                # Note: We no longer reset EMA after action
+                # This allows EMA to properly smooth response times over time
+                # The wait_after_action period gives the system time to stabilize
             else:
                 logger.error(f"Action failed: {result['message']}")
         else:

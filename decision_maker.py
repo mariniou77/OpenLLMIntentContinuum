@@ -571,9 +571,93 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         # Parse the response
         action = self._parse_response(response_text)
         
+        # Check if this action has repeatedly failed
+        action = self._check_and_adjust_repeated_action(action, history, violation_type, cluster_data)
+        
         logger.info(f"LLM recommended action: {action['action']}")
         if action['action'] != 'none':
             logger.info(f"Parameters: {action['parameters']}")
+        
+        return action
+    
+    def _check_and_adjust_repeated_action(self, action: dict, history: str, violation_type: str, cluster_data: dict) -> dict:
+        """
+        Check if the LLM is repeating a failed action and suggest an alternative.
+        
+        This helps overcome limitations of smaller LLMs that may not learn from feedback.
+        """
+        if action['action'] == 'none':
+            return action
+        
+        # Count how many times the same action appears in history with WORSENED or NO_CHANGE
+        action_str = f"action={action['action']}, params={action['parameters']}"
+        
+        # Look for patterns in history
+        failed_count = history.count("WORSENED") + history.count("NO_CHANGE")
+        same_deployment_failures = 0
+        
+        if action['action'] == 'horizontal_scaling':
+            dep_name = action['parameters'].get('deployment_name', '')
+            if dep_name and dep_name in history:
+                # Count failures involving this deployment
+                same_deployment_failures = history.count(f"'{dep_name}'") 
+        
+        # If we see repeated failures (3+) with horizontal_scaling, try vertical_scaling
+        if failed_count >= 3 and action['action'] == 'horizontal_scaling':
+            logger.warning(f"Detected {failed_count} failed attempts. Switching to vertical_scaling.")
+            
+            # Get the deployment name from the original action
+            dep_name = action['parameters'].get('deployment_name', 'microservice1-deployment')
+            
+            # For LOWER_THRESHOLD: reduce resources to slow down
+            if violation_type == "LOWER_THRESHOLD_EXCEEDED":
+                return {
+                    "action": "vertical_scaling",
+                    "parameters": {
+                        "deployment_name": dep_name,
+                        "cpu_limit": "100m",  # Reduce CPU to slow down
+                        "memory_limit": "128Mi"
+                    },
+                    "adjusted_reason": "Switched from repeated failed horizontal_scaling"
+                }
+            else:
+                # For UPPER_THRESHOLD: increase resources
+                return {
+                    "action": "vertical_scaling",
+                    "parameters": {
+                        "deployment_name": dep_name,
+                        "cpu_limit": "1000m",  # Increase CPU
+                        "memory_limit": "1024Mi"
+                    },
+                    "adjusted_reason": "Switched from repeated failed horizontal_scaling"
+                }
+        
+        # If same deployment failed multiple times, try a different deployment
+        if same_deployment_failures >= 2 and action['action'] == 'horizontal_scaling':
+            # Get list of deployments from cluster data
+            deployments = cluster_data.get('deployments', [])
+            current_dep = action['parameters'].get('deployment_name', '')
+            
+            # Find a different deployment to try
+            for dep in deployments:
+                dep_name = dep.get('name', '')
+                if dep_name and dep_name != current_dep and 'microservice' in dep_name:
+                    replicas = dep.get('replicas', 1)
+                    
+                    if violation_type == "LOWER_THRESHOLD_EXCEEDED":
+                        new_replicas = max(1, replicas - 1)  # Reduce
+                    else:
+                        new_replicas = replicas + 1  # Increase
+                    
+                    logger.warning(f"Same deployment failed {same_deployment_failures} times. Trying {dep_name} instead.")
+                    return {
+                        "action": "horizontal_scaling",
+                        "parameters": {
+                            "deployment_name": dep_name,
+                            "replicas": new_replicas
+                        },
+                        "adjusted_reason": f"Switched from {current_dep} due to repeated failures"
+                    }
         
         return action
     
