@@ -13,8 +13,32 @@ Available Actions:
 Previous decisions:
 {history}
 
-Instructions:
-- If LOWER_THRESHOLD_EXCEEDED: response time is TOO FAST, system is over-provisioned. Reduce replicas or resources.
-- If UPPER_THRESHOLD_EXCEEDED: response time is TOO SLOW, system needs more resources. Increase replicas or resources.
+CRITICAL INSTRUCTIONS:
 
-Choose ONE action and respond with a JSON object matching the format shown above.
+1. UNDERSTAND THE PROBLEM:
+   - LOWER_THRESHOLD_EXCEEDED means response time is TOO LOW (too fast) - system has TOO MANY resources
+   - UPPER_THRESHOLD_EXCEEDED means response time is TOO HIGH (too slow) - system needs MORE resources
+
+2. FOR LOWER_THRESHOLD_EXCEEDED (current problem if applicable):
+   - Goal: INCREASE response time to get it back above {lower_threshold}s
+   - REDUCE replicas (e.g., from 3 to 2, or 2 to 1)
+   - REDUCE CPU/memory limits (e.g., cpu_limit: "200m" instead of "500m")
+   - Do NOT increase replicas - that makes response time FASTER (wrong direction!)
+
+3. FOR UPPER_THRESHOLD_EXCEEDED:
+   - Goal: DECREASE response time to get it below {upper_threshold}s
+   - INCREASE replicas (e.g., from 1 to 2, or 2 to 3)
+   - INCREASE CPU/memory limits
+
+4. LEARN FROM PREVIOUS OUTCOMES:
+   - If previous action showed "WORSENED", try a DIFFERENT action or opposite approach
+   - If previous action showed "NO_CHANGE", try a different deployment or action type
+   - If previous action showed "IMPROVED", continue in same direction if still violating
+   - Do NOT repeat the exact same action that failed
+
+5. TRY DIFFERENT APPROACHES:
+   - If horizontal_scaling didn't help, try vertical_scaling
+   - If one deployment didn't help, try a different deployment (microservice1, microservice3, microservice4)
+   - Consider which microservice is the bottleneck based on monitoring data
+
+Choose ONE action and respond with ONLY a JSON object matching the format shown above.

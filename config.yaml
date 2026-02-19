@@ -36,11 +36,11 @@ llm:
 
 # Decision History
 history:
-  max_entries: 3  # Maximum past violations to include in prompt
+  max_entries: 5  # Maximum past violations to include in prompt
 
 # Experiment Settings
 experiment:
-  default_duration_minutes: 10  # Default time window duration
+  default_duration_minutes: 30  # Default time window duration
 
 # Actions enabled
 actions:
