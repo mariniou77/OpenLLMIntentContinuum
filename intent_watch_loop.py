@@ -324,6 +324,10 @@ class IntentWatchLoop:
             result["violation"] = violation
             self._handle_violation(violation, rt)
             result["action_taken"] = True
+        else:
+            # No violation - finalize outcome of previous decision if any
+            # This records that the previous action resolved the issue
+            self.decision_history.finalize_pending_outcome(rt, self.ema_rt, is_violation=False)
         
         return result
     
