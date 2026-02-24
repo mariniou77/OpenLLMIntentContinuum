@@ -264,7 +264,8 @@ JSON:
             status = "TOO FAST - must slow down to save resources"
             what_to_do = """- DECREASE replicas (e.g., 3→2 or 2→1) to reduce capacity
 - OR DECREASE cpu_limit (e.g., 400m→300m) to reduce power
-- NOTE: Replicas cannot go below 1"""
+- IMPORTANT: Only target deployments with replicas >= 2 (minimum is 1)
+- IMPORTANT: Only target deployments with cpu_limit >= 200m (minimum is 100m)"""
         
         # Format deployments table
         deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
