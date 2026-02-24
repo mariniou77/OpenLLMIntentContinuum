@@ -449,6 +449,14 @@ sudo systemctl restart ollama
 ssh -o StrictHostKeyChecking=no antonios-icontinuum@10.0.0.100 'echo OK'
 ```
 
-**5. Tests fail with "State may not be fully reverted"**
+**5. "sflow-RT is not working"**
+```bash
+# Start sflow-RT in the background
+nohup ~/sflow-rt/start.sh > sflow-rt.log 2>&1 & 
+# Verify it is working
+curl http://localhost:8008/version
+```
+
+**6. Tests fail with "State may not be fully reverted"**
 - This warning is usually harmless - it means node assignments changed during pod recreation
 - The actual resources/replicas are correctly reverted

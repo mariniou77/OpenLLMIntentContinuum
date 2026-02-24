@@ -55,8 +55,8 @@ class DecisionMaker:
         self.actions_enabled = config.get("actions", {})
     
     def _load_prompt_template(self) -> str:
-        """Load the v3 prompt template from file."""
-        template_path = Path(__file__).parent / "prompts" / "analysis_prompt_v3.txt"
+        """Load the prompt template from file."""
+        template_path = Path(__file__).parent / "prompts" / "analysis_prompt.txt"
         try:
             with open(template_path, "r") as f:
                 return f.read()
@@ -105,9 +105,9 @@ JSON:
         Format system state as a deployments table for the prompt.
         
         Returns a table format like:
-        | Name                       | Replicas | CPU Limit | CPU Used |
-        |----------------------------|----------|-----------|----------|
-        | microservice1-deployment   | 3        | 300m      | 11m/pod  |
+        | Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |
+        |----------------------------|----------|---------|----------|---------|----------|
+        | microservice1-deployment   | 3        | 300m    | 25m      | 312Mi   | 128Mi    |
         """
         lines = []
         
@@ -127,8 +127,8 @@ JSON:
             deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
         
         if deployments:
-            lines.append("| Name                       | Replicas | CPU Limit | CPU Used |")
-            lines.append("|----------------------------|----------|-----------|----------|")
+            lines.append("| Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |")
+            lines.append("|----------------------------|----------|---------|----------|---------|----------|")
             
             for d in deployments:
                 name = d.get("name", "unknown")
@@ -138,25 +138,17 @@ JSON:
                     
                 replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
                 
-                # Get resource limits
-                cpu_limit = d.get("cpu_limit", "N/A")
-                memory_limit = d.get("memory_limit", "N/A")
+                # Get resource limits (from deployment spec)
+                cpu_limit = d.get("cpu_limit") or "N/A"
+                memory_limit = d.get("memory_limit") or "N/A"
                 
-                # Get CPU usage from monitoring data if available
-                cpu_used = "N/A"
-                if monitoring_data:
-                    pod_metrics = monitoring_data.get("pods", {})
-                    # Try to find matching pod metrics
-                    for pod_name, metrics in pod_metrics.items():
-                        if name.replace("-deployment", "") in pod_name:
-                            cpu_used = metrics.get("cpu", "N/A")
-                            break
+                # Get current usage (from kubectl top)
+                cpu_usage = d.get("cpu_usage") or "N/A"
+                memory_usage = d.get("memory_usage") or "N/A"
                 
                 # Pad name for alignment
                 padded_name = name.ljust(26)
-                lines.append(f"| {padded_name} | {str(replicas).ljust(8)} | {str(cpu_limit).ljust(9)} | {str(cpu_used).ljust(8)} |")
-        
-        return '\n'.join(lines) if lines else "No deployment data available"
+                lines.append(f"| {padded_name} | {str(replicas).ljust(8)} | {str(cpu_limit).ljust(7)} | {str(cpu_usage).ljust(8)} | {str(memory_limit).ljust(7)} | {str(memory_usage).ljust(8)} |")
         
         return '\n'.join(lines) if lines else "No deployment data available"
     
@@ -527,12 +519,21 @@ JSON:
             logger.warning(f"Action '{normalized_action}' is not enabled, falling back to none")
             return {"action": "none", "parameters": {}}
         
+        # Extract parameters - they might be nested in "parameters" key or at top level
+        params = parsed.get("parameters", {})
+        if not params:
+            params = parsed  # Fall back to top-level if no nested parameters
+        
         # Build parameters based on action type
         parameters = {}
         
         if normalized_action == "horizontal_scaling":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-            replicas = parsed.get("replicas") or parsed.get("replica_count") or parsed.get("replica") or 2
+            dep_name = params.get("deployment_name") or params.get("deployment") or params.get("name")
+            replicas = params.get("replicas") or params.get("replica_count") or params.get("replica")
+            
+            # Handle missing replicas - default to 2
+            if replicas is None:
+                replicas = 2
             
             # Handle non-numeric replicas
             if isinstance(replicas, (list, dict)):
@@ -542,18 +543,21 @@ JSON:
             except (ValueError, TypeError):
                 replicas = 2
             
+            # Clamp replicas to valid range (1-5)
+            replicas = max(1, min(5, replicas))
+            
             if dep_name:
                 parameters = {
                     "deployment_name": str(dep_name),
-                    "replicas": max(1, min(5, replicas))
+                    "replicas": replicas
                 }
             else:
                 normalized_action = "none"
                 
         elif normalized_action == "vertical_scaling":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-            cpu = parsed.get("cpu_limit") or parsed.get("cpu") or "500m"
-            mem = parsed.get("memory_limit") or parsed.get("memory") or "512Mi"
+            dep_name = params.get("deployment_name") or params.get("deployment") or params.get("name")
+            cpu = params.get("cpu_limit") or params.get("cpu") or "500m"
+            mem = params.get("memory_limit") or params.get("memory") or "512Mi"
             
             if dep_name:
                 parameters = {
@@ -565,8 +569,8 @@ JSON:
                 normalized_action = "none"
                 
         elif normalized_action == "service_placement":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-            target = parsed.get("target_node") or parsed.get("node") or parsed.get("target")
+            dep_name = params.get("deployment_name") or params.get("deployment") or params.get("name")
+            target = params.get("target_node") or params.get("node") or params.get("target")
             
             if dep_name and target:
                 parameters = {
@@ -577,9 +581,9 @@ JSON:
                 normalized_action = "none"
                 
         elif normalized_action == "flow_scheduling":
-            src = parsed.get("source_switch") or parsed.get("source") or parsed.get("ingress")
-            dst = parsed.get("destination_switch") or parsed.get("destination") or parsed.get("egress")
-            path = parsed.get("new_path") or parsed.get("path") or []
+            src = params.get("source_switch") or params.get("source") or params.get("ingress")
+            dst = params.get("destination_switch") or params.get("destination") or params.get("egress")
+            path = params.get("new_path") or params.get("path") or []
             
             if src and dst:
                 parameters = {
