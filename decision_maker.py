@@ -55,135 +55,185 @@ class DecisionMaker:
         self.actions_enabled = config.get("actions", {})
     
     def _load_prompt_template(self) -> str:
-        """Load the prompt template from file."""
-        template_path = Path(__file__).parent / "prompts" / "analysis_prompt.txt"
+        """Load the v3 prompt template from file."""
+        template_path = Path(__file__).parent / "prompts" / "analysis_prompt_v3.txt"
         try:
             with open(template_path, "r") as f:
                 return f.read()
         except FileNotFoundError:
-            logger.warning(f"Prompt template not found at {template_path}, using default")
+            logger.warning(f"Prompt template not found at {template_path}, using embedded default")
             return self._get_default_prompt_template()
     
     def _get_default_prompt_template(self) -> str:
-        """Return a default prompt template if file not found."""
-        return """You must respond with ONLY a JSON object. No other text.
+        """Return embedded default template if file not found."""
+        return """You are a Kubernetes resource manager. Recommend ONE action.
 
-Problem: {violation_type}
-Current response time: {current_rt}s (EMA: {ema_rt}s)
-Target range: {lower_threshold}s - {upper_threshold}s
+## PROBLEM
+EMA Response Time: {ema_rt}s
+Target Range: {lower_threshold}s - {upper_threshold}s
+Status: {status}
 
-Current System State:
-{system_state}
+## WHAT TO DO
+{what_to_do}
 
-Available Actions:
-{available_actions}
+## DEPLOYMENTS
+{deployments_table}
 
-Previous decisions:
-{history}
+## CONSTRAINTS
+{constraints}
+{history_section}
+Respond ONLY with JSON:
+{{"action": "horizontal_scaling", "parameters": {{"deployment_name": "X-deployment", "replicas": N}}}}
+or
+{{"action": "vertical_scaling", "parameters": {{"deployment_name": "X-deployment", "cpu_limit": "Xm", "memory_limit": "XMi"}}}}
 
-CRITICAL INSTRUCTIONS:
-
-1. UNDERSTAND THE PROBLEM:
-   - LOWER_THRESHOLD_EXCEEDED means response time is TOO LOW (too fast) - system has TOO MANY resources
-   - UPPER_THRESHOLD_EXCEEDED means response time is TOO HIGH (too slow) - system needs MORE resources
-
-2. FOR LOWER_THRESHOLD_EXCEEDED (current problem if applicable):
-   - Goal: INCREASE response time to get it back above {lower_threshold}s
-   - REDUCE replicas (e.g., from 3 to 2, or 2 to 1)
-   - REDUCE CPU/memory limits (e.g., cpu_limit: "200m" instead of "500m")
-   - Do NOT increase replicas - that makes response time FASTER (wrong direction!)
-
-3. FOR UPPER_THRESHOLD_EXCEEDED:
-   - Goal: DECREASE response time to get it below {upper_threshold}s
-   - INCREASE replicas (e.g., from 1 to 2, or 2 to 3)
-   - INCREASE CPU/memory limits
-
-4. LEARN FROM PREVIOUS OUTCOMES:
-   - If previous action showed "WORSENED", try a DIFFERENT action or opposite approach
-   - If previous action showed "NO_CHANGE", try a different deployment or action type
-   - If previous action showed "IMPROVED", continue in same direction if still violating
-   - Do NOT repeat the exact same action that failed
-
-5. TRY DIFFERENT APPROACHES:
-   - If horizontal_scaling didn't help, try vertical_scaling
-   - If one deployment didn't help, try a different deployment (microservice1, microservice3, microservice4)
-   - Consider which microservice is the bottleneck based on monitoring data
-
-Choose ONE action and respond with ONLY a JSON object matching the format shown above.
+JSON:
 """
-
+    
     def _get_enabled_actions_description(self) -> str:
         """Get description of enabled actions for the prompt."""
-        descriptions = []
-        
-        if self.actions_enabled.get("horizontal_scaling"):
-            descriptions.append(
-                '1. horizontal_scaling: Change replica count\n'
-                '   JSON format: {"action": "horizontal_scaling", "deployment_name": "name", "replicas": N}'
-            )
-        
-        if self.actions_enabled.get("vertical_scaling"):
-            descriptions.append(
-                '2. vertical_scaling: Change CPU/memory limits\n'
-                '   JSON format: {"action": "vertical_scaling", "deployment_name": "name", "cpu_limit": "500m", "memory_limit": "512Mi"}'
-            )
-        
-        if self.actions_enabled.get("service_placement"):
-            descriptions.append(
-                '3. service_placement: Move pod to different node\n'
-                '   JSON format: {"action": "service_placement", "deployment_name": "name", "target_node": "worker1"}'
-            )
-        
-        if self.actions_enabled.get("flow_scheduling"):
-            descriptions.append(
-                '4. flow_scheduling: Change network path\n'
-                '   JSON format: {"action": "flow_scheduling", "source_switch": "of:...", "destination_switch": "of:..."}'
-            )
-        
-        if not descriptions:
-            descriptions.append('No actions enabled')
-        
-        return '\n'.join(descriptions)
+        # Only return horizontal and vertical scaling descriptions
+        # Other actions are kept in code but not offered to the LLM
+        return """1. horizontal_scaling: Change replicas.
+   {"action": "horizontal_scaling", "parameters": {"deployment_name": "X-deployment", "replicas": N}}
+
+2. vertical_scaling: Change CPU/memory limits.
+   {"action": "vertical_scaling", "parameters": {"deployment_name": "X-deployment", "cpu_limit": "Xm", "memory_limit": "XMi"}}"""
 
     def _format_system_state(self, cluster_data: dict, network_data: dict, monitoring_data: dict) -> str:
-        """Format system state for the prompt."""
+        """
+        Format system state as a deployments table for the prompt.
+        
+        Returns a table format like:
+        | Name                       | Replicas | CPU Limit | CPU Used |
+        |----------------------------|----------|-----------|----------|
+        | microservice1-deployment   | 3        | 300m      | 11m/pod  |
+        """
         lines = []
         
-        # Debug: log what we received
-        logger.debug(f"cluster_data keys: {cluster_data.keys() if cluster_data else 'None'}")
-        logger.debug(f"network_data keys: {network_data.keys() if network_data else 'None'}")
+        # Get valid deployment names from config
+        valid_deployment_names = set()
+        k8s_config = self.config.get("kubernetes", {})
+        for dep in k8s_config.get("deployments", []):
+            dep_name = dep.get("name", "")
+            if dep_name:
+                valid_deployment_names.add(dep_name)
         
-        # Deployments
+        # Get deployments from cluster data
         deployments = cluster_data.get("deployments", {}).get("list", [])
+        
+        if not deployments:
+            # Try alternative structure
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
         if deployments:
-            lines.append("Deployments:")
+            lines.append("| Name                       | Replicas | CPU Limit | CPU Used |")
+            lines.append("|----------------------------|----------|-----------|----------|")
+            
             for d in deployments:
                 name = d.get("name", "unknown")
-                replicas = d.get("replicas_desired", 0)
-                ready = d.get("replicas_ready", 0)
-                lines.append(f"  - {name}: {ready}/{replicas} replicas")
-        else:
-            logger.debug(f"No deployments found. cluster_data: {cluster_data}")
+                # Only include deployments that are in config
+                if valid_deployment_names and name not in valid_deployment_names:
+                    continue
+                    
+                replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
+                
+                # Get resource limits
+                cpu_limit = d.get("cpu_limit", "N/A")
+                memory_limit = d.get("memory_limit", "N/A")
+                
+                # Get CPU usage from monitoring data if available
+                cpu_used = "N/A"
+                if monitoring_data:
+                    pod_metrics = monitoring_data.get("pods", {})
+                    # Try to find matching pod metrics
+                    for pod_name, metrics in pod_metrics.items():
+                        if name.replace("-deployment", "") in pod_name:
+                            cpu_used = metrics.get("cpu", "N/A")
+                            break
+                
+                # Pad name for alignment
+                padded_name = name.ljust(26)
+                lines.append(f"| {padded_name} | {str(replicas).ljust(8)} | {str(cpu_limit).ljust(9)} | {str(cpu_used).ljust(8)} |")
         
-        # Nodes
-        nodes = cluster_data.get("nodes", {}).get("list", [])
-        if nodes:
-            lines.append("Nodes:")
-            for n in nodes:
-                name = n.get("name", "unknown")
-                status = n.get("status", "unknown")
-                lines.append(f"  - {name}: {status}")
+        return '\n'.join(lines) if lines else "No deployment data available"
         
-        # Network devices
-        devices = network_data.get("devices", {}).get("list", [])
-        if devices:
-            lines.append("Network switches:")
-            for d in devices:
-                dev_id = d.get("id", "unknown")
-                available = d.get("available", False)
-                lines.append(f"  - {dev_id}: {'available' if available else 'unavailable'}")
+        return '\n'.join(lines) if lines else "No deployment data available"
+    
+    def _format_history_for_prompt(self, history: str, violation_type: str) -> tuple:
+        """
+        Parse history and return (failed_deployments, successful_pattern).
         
-        return '\n'.join(lines) if lines else "No system data available"
+        For UPPER threshold: list deployments that WORSENED
+        For LOWER threshold: list deployments that IMPROVED (as a pattern to follow)
+        """
+        failed_deployments = []
+        successful_deployments = []
+        
+        if not history or history == "No previous decisions":
+            return [], []
+        
+        # Get deployment names from config (dynamic, not hardcoded)
+        deployment_names = []
+        k8s_config = self.config.get("kubernetes", {})
+        for dep in k8s_config.get("deployments", []):
+            dep_name = dep.get("name", "")
+            if dep_name:
+                deployment_names.append(dep_name)
+        
+        # Fallback: if no deployments in config, try to extract from history using regex
+        if not deployment_names:
+            import re
+            # Match patterns like "microservice1-deployment" or "my-app-deployment"
+            found = re.findall(r'[\w-]+-deployment', history)
+            deployment_names = list(set(found))
+        
+        # Parse history lines looking for outcomes
+        for line in history.split('\n'):
+            if 'WORSENED' in line:
+                # Extract deployment name
+                for dep_name in deployment_names:
+                    if dep_name in line:
+                        if dep_name not in failed_deployments:
+                            failed_deployments.append(dep_name)
+                        break
+            elif 'IMPROVED' in line:
+                for dep_name in deployment_names:
+                    if dep_name in line:
+                        if dep_name not in successful_deployments:
+                            successful_deployments.append(dep_name)
+                        break
+        
+        return failed_deployments, successful_deployments
+    
+    def _get_available_deployments(self, cluster_data: dict, failed_deployments: list) -> list:
+        """Get list of deployments that haven't failed, with a hint about good candidates."""
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        # Get valid deployment names from config
+        valid_deployment_names = set()
+        k8s_config = self.config.get("kubernetes", {})
+        for dep in k8s_config.get("deployments", []):
+            dep_name = dep.get("name", "")
+            if dep_name:
+                valid_deployment_names.add(dep_name)
+        
+        available = []
+        for d in deployments:
+            name = d.get("name", "")
+            # Only include deployments that are in config and haven't failed
+            if name in valid_deployment_names and name not in failed_deployments:
+                replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
+                hint = ""
+                if replicas == 1:
+                    hint = " (only 1 replica - good candidate)"
+                elif replicas >= 4:
+                    hint = f" ({replicas} replicas - can reduce)"
+                available.append(f"- {name}{hint}")
+        
+        return available
 
     def build_prompt(
         self,
@@ -196,33 +246,75 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         history: str
     ) -> str:
         """
-        Build the complete prompt for the LLM.
+        Build the v3 prompt using the template file.
+        
+        This prompt structure has been tested and validated to produce
+        correct horizontal and vertical scaling decisions with qwen2.5:3b.
         
         Args:
             violation_type: Type of violation
             current_rt: Current response time in seconds
             ema_rt: EMA response time in seconds
             cluster_data: Kubernetes cluster state
-            network_data: ONOS network state
+            network_data: ONOS network state (not used in v3)
             monitoring_data: sFlow monitoring metrics
-            history: Formatted history string
+            history: Formatted decision history string
             
         Returns:
             Complete prompt string
         """
-        system_state = self._format_system_state(cluster_data, network_data, monitoring_data)
-        available_actions = self._get_enabled_actions_description()
+        # Determine the problem status and what to do based on violation type
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+            status = "TOO SLOW - must speed up"
+            what_to_do = """- INCREASE replicas (e.g., 1→2 or 2→3) to add capacity
+- OR INCREASE cpu_limit (e.g., 300m→400m) to add power"""
+        else:  # LOWER_THRESHOLD_EXCEEDED
+            status = "TOO FAST - must slow down to save resources"
+            what_to_do = """- DECREASE replicas (e.g., 5→4 or 4→3) to reduce capacity
+- OR DECREASE cpu_limit (e.g., 400m→300m) to reduce power"""
         
+        # Format deployments table
+        deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
+        
+        # Parse history to find failed and successful deployments
+        failed_deployments, successful_deployments = self._format_history_for_prompt(history, violation_type)
+        
+        # Build history section based on violation type
+        history_section = ""
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED" and failed_deployments:
+            history_section = "\n## DO NOT USE (already failed)\n"
+            for dep in failed_deployments:
+                history_section += f"- {dep} (WORSENED)\n"
+            
+            # Add available deployments hint
+            available = self._get_available_deployments(cluster_data, failed_deployments)
+            if available:
+                history_section += "\n## MUST USE ONE OF\n"
+                history_section += '\n'.join(available) + "\n"
+        elif violation_type == "LOWER_THRESHOLD_EXCEEDED" and successful_deployments:
+            history_section = "\n## PREVIOUS SUCCESSFUL ACTIONS (follow this pattern)\n"
+            for dep in successful_deployments:
+                history_section += f"- {dep}: IMPROVED\n"
+        elif failed_deployments:
+            history_section = "\n## DO NOT USE (already failed)\n"
+            for dep in failed_deployments:
+                history_section += f"- {dep} (WORSENED)\n"
+        
+        # Get constraints from config or use defaults
+        constraints = "Replicas: 1-5 | CPU: 100m-500m | Memory: 128Mi-512Mi"
+        
+        # Fill in the template
         prompt = self.prompt_template.format(
-            violation_type=violation_type,
-            current_rt=round(current_rt, 2),
-            ema_rt=round(ema_rt, 2),
+            ema_rt=f"{ema_rt:.2f}",
             lower_threshold=self.lower_threshold,
             upper_threshold=self.upper_threshold,
-            system_state=system_state,
-            available_actions=available_actions,
-            history=history if history else "No previous decisions"
+            status=status,
+            what_to_do=what_to_do,
+            deployments_table=deployments_table,
+            constraints=constraints,
+            history_section=history_section
         )
+        
         return prompt
     
     def _query_ollama(self, prompt: str) -> Optional[str]:
