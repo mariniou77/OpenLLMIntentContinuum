@@ -5,16 +5,19 @@ EMA Response Time: {ema_rt}s
 Target Range: {lower_threshold}s - {upper_threshold}s
 Status: {status}
 
-## WHAT TO DO
+## RULES
 {what_to_do}
 
-## DEPLOYMENTS
+## CURRENT STATE
 {deployments_table}
 
-## CONSTRAINTS
+## LIMITS
 {constraints}
+
+## HISTORY
 {history_section}
-Respond ONLY with JSON:
+
+Respond with JSON only:
 {{"action": "horizontal_scaling", "parameters": {{"deployment_name": "X-deployment", "replicas": N}}}}
 or
 {{"action": "vertical_scaling", "parameters": {{"deployment_name": "X-deployment", "cpu_limit": "Xm", "memory_limit": "XMi"}}}}

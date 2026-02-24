@@ -411,7 +411,8 @@ class DataCollector:
                 if pod_name.startswith(dep_name.replace("-deployment", "")):
                     if dep_name not in deployment_nodes:
                         deployment_nodes[dep_name] = []
-                    if node not in deployment_nodes[dep_name]:
+                    # Only add non-None nodes
+                    if node and node not in deployment_nodes[dep_name]:
                         deployment_nodes[dep_name].append(node)
         
         # Format each deployment
@@ -420,8 +421,9 @@ class DataCollector:
             name = dep.get("name", "unknown")
             replicas = dep.get("replicas_ready", 0)
             desired = dep.get("replicas_desired", 0)
-            nodes = deployment_nodes.get(name, ["unknown"])
-            nodes_str = ", ".join(nodes)
+            nodes = deployment_nodes.get(name, [])
+            # Handle empty nodes list
+            nodes_str = ", ".join(nodes) if nodes else "pending"
             lines.append(f"- {name}: {replicas}/{desired} replicas ({nodes_str})")
         
         return "\n".join(lines)

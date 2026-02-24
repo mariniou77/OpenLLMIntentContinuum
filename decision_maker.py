@@ -262,8 +262,9 @@ JSON:
 - OR INCREASE cpu_limit (e.g., 300m→400m) to add power"""
         else:  # LOWER_THRESHOLD_EXCEEDED
             status = "TOO FAST - must slow down to save resources"
-            what_to_do = """- DECREASE replicas (e.g., 5→4 or 4→3) to reduce capacity
-- OR DECREASE cpu_limit (e.g., 400m→300m) to reduce power"""
+            what_to_do = """- DECREASE replicas (e.g., 3→2 or 2→1) to reduce capacity
+- OR DECREASE cpu_limit (e.g., 400m→300m) to reduce power
+- NOTE: Replicas cannot go below 1"""
         
         # Format deployments table
         deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
@@ -274,23 +275,23 @@ JSON:
         # Build history section based on violation type
         history_section = ""
         if violation_type == "UPPER_THRESHOLD_EXCEEDED" and failed_deployments:
-            history_section = "\n## DO NOT USE (already failed)\n"
+            history_section = "\n## HISTORY (do not repeat failed actions)\n"
             for dep in failed_deployments:
-                history_section += f"- {dep} (WORSENED)\n"
+                history_section += f"- {dep}: WORSENED (do not use)\n"
             
             # Add available deployments hint
             available = self._get_available_deployments(cluster_data, failed_deployments)
             if available:
-                history_section += "\n## MUST USE ONE OF\n"
+                history_section += "\n## AVAILABLE DEPLOYMENTS\n"
                 history_section += '\n'.join(available) + "\n"
         elif violation_type == "LOWER_THRESHOLD_EXCEEDED" and successful_deployments:
-            history_section = "\n## PREVIOUS SUCCESSFUL ACTIONS (follow this pattern)\n"
+            history_section = "\n## HISTORY (follow successful pattern)\n"
             for dep in successful_deployments:
-                history_section += f"- {dep}: IMPROVED\n"
+                history_section += f"- {dep}: IMPROVED (good choice)\n"
         elif failed_deployments:
-            history_section = "\n## DO NOT USE (already failed)\n"
+            history_section = "\n## HISTORY (do not repeat failed actions)\n"
             for dep in failed_deployments:
-                history_section += f"- {dep} (WORSENED)\n"
+                history_section += f"- {dep}: WORSENED (do not use)\n"
         
         # Get constraints from config or use defaults
         constraints = "Replicas: 1-5 | CPU: 100m-500m | Memory: 128Mi-512Mi"
@@ -529,11 +530,15 @@ JSON:
         
         if normalized_action == "horizontal_scaling":
             dep_name = params.get("deployment_name") or params.get("deployment") or params.get("name")
-            replicas = params.get("replicas") or params.get("replica_count") or params.get("replica")
             
-            # Handle missing replicas - default to 2
+            # Get replicas - handle 0 explicitly since it's falsy
+            replicas = params.get("replicas")
             if replicas is None:
-                replicas = 2
+                replicas = params.get("replica_count")
+            if replicas is None:
+                replicas = params.get("replica")
+            if replicas is None:
+                replicas = 2  # Default
             
             # Handle non-numeric replicas
             if isinstance(replicas, (list, dict)):
