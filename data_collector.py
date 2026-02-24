@@ -322,19 +322,19 @@ class DataCollector:
         node_metrics = {}
         
         for item in cpu_data:
-            agent = item.get("agent", "unknown")
+            agent = item.get("agent") or "unknown"  # Handle None values
             # Extract node name from agent (could be IP or hostname)
             node_name = self._extract_node_name(agent)
             if node_name not in node_metrics:
                 node_metrics[node_name] = {"cpu": 0, "memory": 0}
-            node_metrics[node_name]["cpu"] = item.get("cpu_percent", 0)
+            node_metrics[node_name]["cpu"] = item.get("cpu_percent", 0) or 0
         
         for item in memory_data:
-            agent = item.get("agent", "unknown")
+            agent = item.get("agent") or "unknown"  # Handle None values
             node_name = self._extract_node_name(agent)
             if node_name not in node_metrics:
                 node_metrics[node_name] = {"cpu": 0, "memory": 0}
-            node_metrics[node_name]["memory"] = item.get("memory_percent", 0)
+            node_metrics[node_name]["memory"] = item.get("memory_percent", 0) or 0
         
         if not node_metrics:
             return "No monitoring data available"
@@ -356,6 +356,10 @@ class DataCollector:
         Returns:
             Readable node name
         """
+        # Handle None or empty agent
+        if agent is None or agent == "":
+            return "unknown"
+        
         # Map known IPs to node names (from your setup)
         ip_to_name = {
             "10.0.0.100": "master",

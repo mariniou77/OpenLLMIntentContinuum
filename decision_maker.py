@@ -81,11 +81,35 @@ Available Actions:
 Previous decisions:
 {history}
 
-Instructions:
-- If LOWER_THRESHOLD_EXCEEDED: response time is TOO FAST, system is over-provisioned. Reduce resources.
-- If UPPER_THRESHOLD_EXCEEDED: response time is TOO SLOW, system needs more resources. Increase resources.
+CRITICAL INSTRUCTIONS:
 
-Choose ONE action and return a JSON object with the appropriate fields for that action type.
+1. UNDERSTAND THE PROBLEM:
+   - LOWER_THRESHOLD_EXCEEDED means response time is TOO LOW (too fast) - system has TOO MANY resources
+   - UPPER_THRESHOLD_EXCEEDED means response time is TOO HIGH (too slow) - system needs MORE resources
+
+2. FOR LOWER_THRESHOLD_EXCEEDED (current problem if applicable):
+   - Goal: INCREASE response time to get it back above {lower_threshold}s
+   - REDUCE replicas (e.g., from 3 to 2, or 2 to 1)
+   - REDUCE CPU/memory limits (e.g., cpu_limit: "200m" instead of "500m")
+   - Do NOT increase replicas - that makes response time FASTER (wrong direction!)
+
+3. FOR UPPER_THRESHOLD_EXCEEDED:
+   - Goal: DECREASE response time to get it below {upper_threshold}s
+   - INCREASE replicas (e.g., from 1 to 2, or 2 to 3)
+   - INCREASE CPU/memory limits
+
+4. LEARN FROM PREVIOUS OUTCOMES:
+   - If previous action showed "WORSENED", try a DIFFERENT action or opposite approach
+   - If previous action showed "NO_CHANGE", try a different deployment or action type
+   - If previous action showed "IMPROVED", continue in same direction if still violating
+   - Do NOT repeat the exact same action that failed
+
+5. TRY DIFFERENT APPROACHES:
+   - If horizontal_scaling didn't help, try vertical_scaling
+   - If one deployment didn't help, try a different deployment (microservice1, microservice3, microservice4)
+   - Consider which microservice is the bottleneck based on monitoring data
+
+Choose ONE action and respond with ONLY a JSON object matching the format shown above.
 """
 
     def _get_enabled_actions_description(self) -> str:
@@ -547,9 +571,105 @@ Choose ONE action and return a JSON object with the appropriate fields for that 
         # Parse the response
         action = self._parse_response(response_text)
         
+        # 100% LLM decision-making - no Python override
+        # The LLM is fully responsible for learning from history and choosing appropriate actions
+        
         logger.info(f"LLM recommended action: {action['action']}")
         if action['action'] != 'none':
             logger.info(f"Parameters: {action['parameters']}")
+        
+        return action
+    
+    def _check_and_adjust_repeated_action(self, action: dict, history: str, violation_type: str, cluster_data: dict) -> dict:
+        """
+        Check if the LLM is repeating a failed action and suggest an alternative.
+        
+        This helps overcome limitations of smaller LLMs that may not learn from feedback.
+        """
+        if action['action'] == 'none':
+            return action
+        
+        # Count how many times the same action appears in history with WORSENED or NO_CHANGE
+        action_str = f"action={action['action']}, params={action['parameters']}"
+        
+        # Look for patterns in history
+        failed_count = history.count("WORSENED") + history.count("NO_CHANGE")
+        same_deployment_failures = 0
+        
+        if action['action'] == 'horizontal_scaling':
+            dep_name = action['parameters'].get('deployment_name', '')
+            if dep_name and dep_name in history:
+                # Count failures involving this deployment
+                same_deployment_failures = history.count(f"'{dep_name}'") 
+        
+        # If we see repeated failures (3+) with horizontal_scaling, try vertical_scaling
+        if failed_count >= 3 and action['action'] == 'horizontal_scaling':
+            logger.warning(f"Detected {failed_count} failed attempts. Switching to vertical_scaling.")
+            
+            # Get the deployment name from the original action
+            dep_name = action['parameters'].get('deployment_name', 'microservice1-deployment')
+            
+            # For LOWER_THRESHOLD: reduce resources to slow down
+            if violation_type == "LOWER_THRESHOLD_EXCEEDED":
+                return {
+                    "action": "vertical_scaling",
+                    "parameters": {
+                        "deployment_name": dep_name,
+                        "cpu_limit": "100m",  # Reduce CPU to slow down
+                        "memory_limit": "128Mi"
+                    },
+                    "adjusted_reason": "Switched from repeated failed horizontal_scaling"
+                }
+            else:
+                # For UPPER_THRESHOLD: increase resources
+                return {
+                    "action": "vertical_scaling",
+                    "parameters": {
+                        "deployment_name": dep_name,
+                        "cpu_limit": "1000m",  # Increase CPU
+                        "memory_limit": "1024Mi"
+                    },
+                    "adjusted_reason": "Switched from repeated failed horizontal_scaling"
+                }
+        
+        # If same deployment failed multiple times, try a different deployment
+        if same_deployment_failures >= 2 and action['action'] == 'horizontal_scaling':
+            # Get list of deployments from cluster data
+            # Structure: cluster_data["data"]["deployments"]["list"]
+            try:
+                deployments = cluster_data.get('data', {}).get('deployments', {}).get('list', [])
+            except (AttributeError, TypeError):
+                deployments = []
+            
+            current_dep = action['parameters'].get('deployment_name', '')
+            
+            # Find a different deployment to try
+            for dep in deployments:
+                # Handle both dict and string formats
+                if isinstance(dep, dict):
+                    dep_name = dep.get('name', '')
+                    replicas = dep.get('replicas_desired', 1)
+                elif isinstance(dep, str):
+                    dep_name = dep
+                    replicas = 1
+                else:
+                    continue
+                
+                if dep_name and dep_name != current_dep and 'microservice' in dep_name:
+                    if violation_type == "LOWER_THRESHOLD_EXCEEDED":
+                        new_replicas = max(1, replicas - 1)  # Reduce
+                    else:
+                        new_replicas = replicas + 1  # Increase
+                    
+                    logger.warning(f"Same deployment failed {same_deployment_failures} times. Trying {dep_name} instead.")
+                    return {
+                        "action": "horizontal_scaling",
+                        "parameters": {
+                            "deployment_name": dep_name,
+                            "replicas": new_replicas
+                        },
+                        "adjusted_reason": f"Switched from {current_dep} due to repeated failures"
+                    }
         
         return action
     
