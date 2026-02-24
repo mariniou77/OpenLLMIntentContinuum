@@ -152,40 +152,40 @@ class DecisionHistory:
         prev_violation_type = self.pending_outcome["violation_type"]
         action = self.pending_outcome["action"]
         
-        # Calculate the change
-        rt_change = current_rt - before_rt
-        rt_change_pct = (rt_change / before_rt * 100) if before_rt > 0 else 0
+        # Calculate the change using EMA (more stable than instantaneous RT)
+        ema_change = current_ema - before_ema
+        ema_change_pct = (ema_change / before_ema * 100) if before_ema > 0 else 0
         
-        # Determine outcome based on violation type and RT change
+        # Determine outcome based on violation type and EMA change
         if current_violation_type is None:
             # No more violation - problem resolved!
             outcome = "RESOLVED"
-            outcome_details = f"RT changed {before_rt:.3f}s → {current_rt:.3f}s ({rt_change_pct:+.1f}%), now within target range"
+            outcome_details = f"EMA changed {before_ema:.3f}s → {current_ema:.3f}s ({ema_change_pct:+.1f}%), now within target range"
         elif prev_violation_type == "LOWER_THRESHOLD_EXCEEDED":
-            # For LOWER threshold, we want RT to INCREASE
-            if rt_change > 0.05:  # Significant increase
+            # For LOWER threshold, we want EMA to INCREASE
+            if ema_change > 0.02:  # Significant increase (using smaller threshold for EMA)
                 outcome = "IMPROVED"
-                outcome_details = f"RT increased {before_rt:.3f}s → {current_rt:.3f}s ({rt_change_pct:+.1f}%) - correct direction"
-            elif rt_change < -0.05:  # Decreased (wrong direction)
+                outcome_details = f"EMA increased {before_ema:.3f}s → {current_ema:.3f}s ({ema_change_pct:+.1f}%) - correct direction"
+            elif ema_change < -0.02:  # Decreased (wrong direction)
                 outcome = "WORSENED"
-                outcome_details = f"RT decreased {before_rt:.3f}s → {current_rt:.3f}s ({rt_change_pct:+.1f}%) - WRONG direction, should increase"
+                outcome_details = f"EMA decreased {before_ema:.3f}s → {current_ema:.3f}s ({ema_change_pct:+.1f}%) - WRONG direction, should increase"
             else:
                 outcome = "NO_CHANGE"
-                outcome_details = f"RT unchanged {before_rt:.3f}s → {current_rt:.3f}s ({rt_change_pct:+.1f}%)"
+                outcome_details = f"EMA unchanged {before_ema:.3f}s → {current_ema:.3f}s ({ema_change_pct:+.1f}%)"
         elif prev_violation_type == "UPPER_THRESHOLD_EXCEEDED":
-            # For UPPER threshold, we want RT to DECREASE
-            if rt_change < -0.05:  # Significant decrease
+            # For UPPER threshold, we want EMA to DECREASE
+            if ema_change < -0.02:  # Significant decrease
                 outcome = "IMPROVED"
-                outcome_details = f"RT decreased {before_rt:.3f}s → {current_rt:.3f}s ({rt_change_pct:+.1f}%) - correct direction"
-            elif rt_change > 0.05:  # Increased (wrong direction)
+                outcome_details = f"EMA decreased {before_ema:.3f}s → {current_ema:.3f}s ({ema_change_pct:+.1f}%) - correct direction"
+            elif ema_change > 0.02:  # Increased (wrong direction)
                 outcome = "WORSENED"
-                outcome_details = f"RT increased {before_rt:.3f}s → {current_rt:.3f}s ({rt_change_pct:+.1f}%) - WRONG direction, should decrease"
+                outcome_details = f"EMA increased {before_ema:.3f}s → {current_ema:.3f}s ({ema_change_pct:+.1f}%) - WRONG direction, should decrease"
             else:
                 outcome = "NO_CHANGE"
-                outcome_details = f"RT unchanged {before_rt:.3f}s → {current_rt:.3f}s ({rt_change_pct:+.1f}%)"
+                outcome_details = f"EMA unchanged {before_ema:.3f}s → {current_ema:.3f}s ({ema_change_pct:+.1f}%)"
         else:
             outcome = "UNKNOWN"
-            outcome_details = f"RT changed {before_rt:.3f}s → {current_rt:.3f}s"
+            outcome_details = f"EMA changed {before_ema:.3f}s → {current_ema:.3f}s"
         
         # Update the history entry
         last_entry["outcome"] = outcome
@@ -210,6 +210,20 @@ class DecisionHistory:
             is_violation: Whether current state is still a violation
         """
         violation_type = None if not is_violation else self.pending_outcome.get("violation_type") if self.pending_outcome else None
+        self._update_pending_outcome(current_rt, current_ema, violation_type)
+    
+    def update_pending_outcome_before_prompt(self, current_rt: float, current_ema: float, violation_type: str):
+        """
+        Update the pending outcome BEFORE building a new prompt.
+        
+        This ensures that when we format history for the prompt, the outcome
+        of the previous decision has already been evaluated.
+        
+        Args:
+            current_rt: Current response time
+            current_ema: Current EMA response time  
+            violation_type: Current violation type
+        """
         self._update_pending_outcome(current_rt, current_ema, violation_type)
     
     def get_history(self) -> list:

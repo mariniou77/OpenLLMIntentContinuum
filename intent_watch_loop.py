@@ -220,6 +220,15 @@ class IntentWatchLoop:
         # Get compact strings for logging
         monitoring_str = self.data_collector.format_monitoring_compact(system_state)
         deployments_str = self.data_collector.format_deployments_compact(system_state)
+        
+        # Update the outcome of the previous decision BEFORE getting history
+        # This ensures the history includes the outcome when building the prompt
+        self.decision_history.update_pending_outcome_before_prompt(
+            current_rt=current_rt,
+            current_ema=self.ema_rt,
+            violation_type=violation_type
+        )
+        
         history_str = self.decision_history.format_for_prompt()
         
         logger.info(f"Deployments: {deployments_str}")
