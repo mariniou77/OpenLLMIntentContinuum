@@ -46,8 +46,8 @@ experiment:
 actions:
   horizontal_scaling: true
   vertical_scaling: true
-  service_placement: true
-  flow_scheduling: true
+  service_placement: false
+  flow_scheduling: false
 
 # Kubernetes
 kubernetes:

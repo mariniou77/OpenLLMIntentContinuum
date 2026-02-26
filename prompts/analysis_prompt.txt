@@ -1,44 +1,20 @@
-You must respond with ONLY a JSON object. No other text.
+You are a Kubernetes resource manager. Pick ONE action to fix the problem.
 
-Problem: {violation_type}
-Current response time: {current_rt}s (EMA: {ema_rt}s)
-Target range: {lower_threshold}s - {upper_threshold}s
+PROBLEM: EMA Response Time is {ema_rt}s (target: {lower_threshold}s-{upper_threshold}s)
+STATUS: {status}
 
-Current System State:
-{system_state}
+RULE: {what_to_do}
 
-Available Actions:
-{available_actions}
+DEPLOYMENTS:
+{deployments_table}
+{bottleneck_hint}
+LIMITS: {constraints}
+{history_section}
+IMPORTANT: Target the deployment with HIGHEST CPU usage in the table. Use "horizontal_scaling" to change replicas or "vertical_scaling" to change CPU/memory.
 
-Previous decisions:
-{history}
+EXAMPLES:
+{{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
+{{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
 
-CRITICAL INSTRUCTIONS:
-
-1. UNDERSTAND THE PROBLEM:
-   - LOWER_THRESHOLD_EXCEEDED means response time is TOO LOW (too fast) - system has TOO MANY resources
-   - UPPER_THRESHOLD_EXCEEDED means response time is TOO HIGH (too slow) - system needs MORE resources
-
-2. FOR LOWER_THRESHOLD_EXCEEDED (current problem if applicable):
-   - Goal: INCREASE response time to get it back above {lower_threshold}s
-   - REDUCE replicas (e.g., from 3 to 2, or 2 to 1)
-   - REDUCE CPU/memory limits (e.g., cpu_limit: "200m" instead of "500m")
-   - Do NOT increase replicas - that makes response time FASTER (wrong direction!)
-
-3. FOR UPPER_THRESHOLD_EXCEEDED:
-   - Goal: DECREASE response time to get it below {upper_threshold}s
-   - INCREASE replicas (e.g., from 1 to 2, or 2 to 3)
-   - INCREASE CPU/memory limits
-
-4. LEARN FROM PREVIOUS OUTCOMES:
-   - If previous action showed "WORSENED", try a DIFFERENT action or opposite approach
-   - If previous action showed "NO_CHANGE", try a different deployment or action type
-   - If previous action showed "IMPROVED", continue in same direction if still violating
-   - Do NOT repeat the exact same action that failed
-
-5. TRY DIFFERENT APPROACHES:
-   - If horizontal_scaling didn't help, try vertical_scaling
-   - If one deployment didn't help, try a different deployment (microservice1, microservice3, microservice4)
-   - Consider which microservice is the bottleneck based on monitoring data
-
-Choose ONE action and respond with ONLY a JSON object matching the format shown above.
+Respond with ONLY a JSON object. Target the busiest deployment.
+JSON:

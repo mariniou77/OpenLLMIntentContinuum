@@ -152,11 +152,23 @@ class KubernetesClient:
             data = json.loads(output)
             deployments = []
             for item in data.get("items", []):
+                # Get resource limits from the container spec
+                containers = item.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+                cpu_limit = None
+                memory_limit = None
+                if containers:
+                    resources = containers[0].get("resources", {})
+                    limits = resources.get("limits", {})
+                    cpu_limit = limits.get("cpu")
+                    memory_limit = limits.get("memory")
+                
                 deployment = {
                     "name": item.get("metadata", {}).get("name"),
                     "replicas_desired": item.get("spec", {}).get("replicas", 0),
                     "replicas_ready": item.get("status", {}).get("readyReplicas", 0),
-                    "replicas_available": item.get("status", {}).get("availableReplicas", 0)
+                    "replicas_available": item.get("status", {}).get("availableReplicas", 0),
+                    "cpu_limit": cpu_limit,
+                    "memory_limit": memory_limit
                 }
                 deployments.append(deployment)
             return deployments
@@ -249,10 +261,12 @@ class KubernetesClient:
         
         Returns:
             Dictionary with nodes, pods, and deployments information.
+            Deployments include both resource limits and current usage.
         """
         nodes = self.get_nodes()
         pods = self.get_pods()
-        deployments = self.get_deployments()
+        # Use get_deployment_metrics to include current CPU/memory usage
+        deployments = self.get_deployment_metrics()
         
         # Filter to only show microservice pods
         microservice_pods = [p for p in pods if "microservice" in p.get("name", "") or "db" in p.get("name", "")]
@@ -279,3 +293,70 @@ class KubernetesClient:
             return len(nodes) > 0
         except Exception:
             return False
+    
+    def get_pod_metrics(self, namespace: str = "default") -> dict:
+        """
+        Get current CPU and memory usage for pods using kubectl top.
+        
+        Args:
+            namespace: Kubernetes namespace
+            
+        Returns:
+            Dictionary mapping pod names to their current resource usage.
+        """
+        output = self._run_kubectl(f"top pods -n {namespace} --no-headers")
+        if not output:
+            return {}
+        
+        metrics = {}
+        try:
+            for line in output.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) >= 3:
+                    pod_name = parts[0]
+                    cpu_usage = parts[1]  # e.g., "25m" or "100m"
+                    memory_usage = parts[2]  # e.g., "128Mi"
+                    metrics[pod_name] = {
+                        "cpu_usage": cpu_usage,
+                        "memory_usage": memory_usage
+                    }
+            return metrics
+        except Exception as e:
+            logger.error(f"Failed to parse pod metrics: {e}")
+            return {}
+    
+    def get_deployment_metrics(self, namespace: str = "default") -> list:
+        """
+        Get deployments with their resource limits AND current usage.
+        
+        This combines deployment spec (limits) with kubectl top (current usage).
+        
+        Args:
+            namespace: Kubernetes namespace
+            
+        Returns:
+            List of deployment dictionaries with limits and current usage.
+        """
+        deployments = self.get_deployments(namespace)
+        pod_metrics = self.get_pod_metrics(namespace)
+        
+        for dep in deployments:
+            dep_name = dep.get("name", "")
+            # Find matching pod metrics (pod names contain deployment name)
+            matching_pods = []
+            for pod_name, metrics in pod_metrics.items():
+                # Pod names are like "microservice1-deployment-xxxx-yyyy"
+                if dep_name.replace("-deployment", "") in pod_name:
+                    matching_pods.append(metrics)
+            
+            # Aggregate CPU usage across replicas (show average or first pod)
+            if matching_pods:
+                dep["cpu_usage"] = matching_pods[0].get("cpu_usage", "N/A")
+                dep["memory_usage"] = matching_pods[0].get("memory_usage", "N/A")
+            else:
+                dep["cpu_usage"] = "N/A"
+                dep["memory_usage"] = "N/A"
+        
+        return deployments

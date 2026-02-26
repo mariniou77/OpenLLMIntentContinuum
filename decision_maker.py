@@ -1,16 +1,21 @@
 """
-Decision Maker Module
+Decision Maker Module (Improved for Small LLMs)
 
-This module integrates with the LLM (TinyLlama via Ollama) to analyze
+This module integrates with a local LLM (e.g., Qwen2.5:3b via Ollama) to analyze
 system state and recommend actions when SLO violations occur.
+
+Key improvements over the original:
+- Few-shot examples in prompt for better structured output
+- Validation + retry loop (up to 3 attempts with corrective micro-prompts)
+- Deployment name validation against actual config
+- Re-enabled safety net for repeated failed actions
+- Smarter default values and clamping
 
 Supports 4 action types:
 1. horizontal_scaling - Change replica count
 2. vertical_scaling - Change CPU/memory limits
 3. service_placement - Move pod to different node
 4. flow_scheduling - Change network path via ONOS
-
-The LLM analyzes the system state and decides which action to take.
 """
 
 import json
@@ -22,13 +27,18 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of LLM query attempts before falling back
+MAX_LLM_RETRIES = 3
+
 
 class DecisionMaker:
     """
     LLM-powered decision maker for intent-based resource management.
     
-    This class handles communication with the Ollama API to get
-    intelligent recommendations for handling SLO violations.
+    Optimized for small open-source LLMs (1-7B parameters) with:
+    - Constrained prompts with few-shot examples
+    - Validation and retry logic
+    - Fallback safety nets for repeated failures
     """
     
     def __init__(self, config: dict):
@@ -53,6 +63,17 @@ class DecisionMaker:
         
         # Enabled actions
         self.actions_enabled = config.get("actions", {})
+        
+        # Build valid deployment names set from config (used for validation)
+        self.valid_deployment_names = set()
+        k8s_config = config.get("kubernetes", {})
+        for dep in k8s_config.get("deployments", []):
+            dep_name = dep.get("name", "")
+            if dep_name:
+                self.valid_deployment_names.add(dep_name.lower())
+        
+        # Track consecutive parse failures for diagnostics
+        self._consecutive_failures = 0
     
     def _load_prompt_template(self) -> str:
         """Load the prompt template from file."""
@@ -61,129 +82,134 @@ class DecisionMaker:
             with open(template_path, "r") as f:
                 return f.read()
         except FileNotFoundError:
-            logger.warning(f"Prompt template not found at {template_path}, using default")
+            logger.warning(f"Prompt template not found at {template_path}, using embedded default")
             return self._get_default_prompt_template()
     
     def _get_default_prompt_template(self) -> str:
-        """Return a default prompt template if file not found."""
-        return """You must respond with ONLY a JSON object. No other text.
+        """Return embedded default template if file not found."""
+        return """You are a Kubernetes resource manager. Pick ONE action to fix the problem.
 
-Problem: {violation_type}
-Current response time: {current_rt}s (EMA: {ema_rt}s)
-Target range: {lower_threshold}s - {upper_threshold}s
+PROBLEM: EMA Response Time is {ema_rt}s (target: {lower_threshold}s-{upper_threshold}s)
+STATUS: {status}
 
-Current System State:
-{system_state}
+RULE: {what_to_do}
 
-Available Actions:
-{available_actions}
+DEPLOYMENTS:
+{deployments_table}
+{bottleneck_hint}
+LIMITS: {constraints}
+{history_section}
+IMPORTANT: Target the deployment with HIGHEST CPU usage in the table. Use "horizontal_scaling" to change replicas or "vertical_scaling" to change CPU/memory.
 
-Previous decisions:
-{history}
+EXAMPLES:
+{{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
+{{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
 
-CRITICAL INSTRUCTIONS:
-
-1. UNDERSTAND THE PROBLEM:
-   - LOWER_THRESHOLD_EXCEEDED means response time is TOO LOW (too fast) - system has TOO MANY resources
-   - UPPER_THRESHOLD_EXCEEDED means response time is TOO HIGH (too slow) - system needs MORE resources
-
-2. FOR LOWER_THRESHOLD_EXCEEDED (current problem if applicable):
-   - Goal: INCREASE response time to get it back above {lower_threshold}s
-   - REDUCE replicas (e.g., from 3 to 2, or 2 to 1)
-   - REDUCE CPU/memory limits (e.g., cpu_limit: "200m" instead of "500m")
-   - Do NOT increase replicas - that makes response time FASTER (wrong direction!)
-
-3. FOR UPPER_THRESHOLD_EXCEEDED:
-   - Goal: DECREASE response time to get it below {upper_threshold}s
-   - INCREASE replicas (e.g., from 1 to 2, or 2 to 3)
-   - INCREASE CPU/memory limits
-
-4. LEARN FROM PREVIOUS OUTCOMES:
-   - If previous action showed "WORSENED", try a DIFFERENT action or opposite approach
-   - If previous action showed "NO_CHANGE", try a different deployment or action type
-   - If previous action showed "IMPROVED", continue in same direction if still violating
-   - Do NOT repeat the exact same action that failed
-
-5. TRY DIFFERENT APPROACHES:
-   - If horizontal_scaling didn't help, try vertical_scaling
-   - If one deployment didn't help, try a different deployment (microservice1, microservice3, microservice4)
-   - Consider which microservice is the bottleneck based on monitoring data
-
-Choose ONE action and respond with ONLY a JSON object matching the format shown above.
+Respond with ONLY a JSON object. Target the busiest deployment.
+JSON:
 """
 
     def _get_enabled_actions_description(self) -> str:
         """Get description of enabled actions for the prompt."""
-        descriptions = []
-        
-        if self.actions_enabled.get("horizontal_scaling"):
-            descriptions.append(
-                '1. horizontal_scaling: Change replica count\n'
-                '   JSON format: {"action": "horizontal_scaling", "deployment_name": "name", "replicas": N}'
-            )
-        
-        if self.actions_enabled.get("vertical_scaling"):
-            descriptions.append(
-                '2. vertical_scaling: Change CPU/memory limits\n'
-                '   JSON format: {"action": "vertical_scaling", "deployment_name": "name", "cpu_limit": "500m", "memory_limit": "512Mi"}'
-            )
-        
-        if self.actions_enabled.get("service_placement"):
-            descriptions.append(
-                '3. service_placement: Move pod to different node\n'
-                '   JSON format: {"action": "service_placement", "deployment_name": "name", "target_node": "worker1"}'
-            )
-        
-        if self.actions_enabled.get("flow_scheduling"):
-            descriptions.append(
-                '4. flow_scheduling: Change network path\n'
-                '   JSON format: {"action": "flow_scheduling", "source_switch": "of:...", "destination_switch": "of:..."}'
-            )
-        
-        if not descriptions:
-            descriptions.append('No actions enabled')
-        
-        return '\n'.join(descriptions)
+        return """1. horizontal_scaling: Change replicas.
+   {"action": "horizontal_scaling", "parameters": {"deployment_name": "X-deployment", "replicas": N}}
+
+2. vertical_scaling: Change CPU/memory limits.
+   {"action": "vertical_scaling", "parameters": {"deployment_name": "X-deployment", "cpu_limit": "Xm", "memory_limit": "XMi"}}"""
 
     def _format_system_state(self, cluster_data: dict, network_data: dict, monitoring_data: dict) -> str:
-        """Format system state for the prompt."""
+        """
+        Format system state as a deployments table for the prompt.
+        
+        Returns a table format like:
+        | Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |
+        """
         lines = []
         
-        # Debug: log what we received
-        logger.debug(f"cluster_data keys: {cluster_data.keys() if cluster_data else 'None'}")
-        logger.debug(f"network_data keys: {network_data.keys() if network_data else 'None'}")
-        
-        # Deployments
+        # Get deployments from cluster data
         deployments = cluster_data.get("deployments", {}).get("list", [])
+        
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
         if deployments:
-            lines.append("Deployments:")
+            lines.append("| Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |")
+            lines.append("|----------------------------|----------|---------|----------|---------|----------|")
+            
             for d in deployments:
                 name = d.get("name", "unknown")
-                replicas = d.get("replicas_desired", 0)
-                ready = d.get("replicas_ready", 0)
-                lines.append(f"  - {name}: {ready}/{replicas} replicas")
-        else:
-            logger.debug(f"No deployments found. cluster_data: {cluster_data}")
+                # Only include deployments that are in config
+                if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
+                    continue
+                    
+                replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
+                cpu_limit = d.get("cpu_limit") or "N/A"
+                memory_limit = d.get("memory_limit") or "N/A"
+                cpu_usage = d.get("cpu_usage") or "N/A"
+                memory_usage = d.get("memory_usage") or "N/A"
+                
+                padded_name = name.ljust(26)
+                lines.append(f"| {padded_name} | {str(replicas).ljust(8)} | {str(cpu_limit).ljust(7)} | {str(cpu_usage).ljust(8)} | {str(memory_limit).ljust(7)} | {str(memory_usage).ljust(8)} |")
         
-        # Nodes
-        nodes = cluster_data.get("nodes", {}).get("list", [])
-        if nodes:
-            lines.append("Nodes:")
-            for n in nodes:
-                name = n.get("name", "unknown")
-                status = n.get("status", "unknown")
-                lines.append(f"  - {name}: {status}")
+        return '\n'.join(lines) if lines else "No deployment data available"
+    
+    def _format_history_for_prompt(self, history: str, violation_type: str) -> tuple:
+        """
+        Parse history and return (failed_deployments, successful_deployments).
+        """
+        failed_deployments = []
+        successful_deployments = []
         
-        # Network devices
-        devices = network_data.get("devices", {}).get("list", [])
-        if devices:
-            lines.append("Network switches:")
-            for d in devices:
-                dev_id = d.get("id", "unknown")
-                available = d.get("available", False)
-                lines.append(f"  - {dev_id}: {'available' if available else 'unavailable'}")
+        if not history or history == "(none)":
+            return [], []
         
-        return '\n'.join(lines) if lines else "No system data available"
+        # Get deployment names from config
+        deployment_names = [dep.get("name", "") for dep in 
+                          self.config.get("kubernetes", {}).get("deployments", [])
+                          if dep.get("name")]
+        
+        # Fallback: extract from history using regex
+        if not deployment_names:
+            found = re.findall(r'[\w-]+-deployment', history)
+            deployment_names = list(set(found))
+        
+        for line in history.split('\n'):
+            if 'WORSENED' in line:
+                for dep_name in deployment_names:
+                    if dep_name in line:
+                        if dep_name not in failed_deployments:
+                            failed_deployments.append(dep_name)
+                        break
+            elif 'IMPROVED' in line:
+                for dep_name in deployment_names:
+                    if dep_name in line:
+                        if dep_name not in successful_deployments:
+                            successful_deployments.append(dep_name)
+                        break
+        
+        return failed_deployments, successful_deployments
+    
+    def _get_available_deployments(self, cluster_data: dict, failed_deployments: list) -> list:
+        """Get list of deployments that haven't failed."""
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        available = []
+        for d in deployments:
+            name = d.get("name", "")
+            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
+                continue
+            if name not in failed_deployments:
+                replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
+                hint = ""
+                if replicas == 1:
+                    hint = " (only 1 replica - good candidate)"
+                elif replicas >= 4:
+                    hint = f" ({replicas} replicas - can reduce)"
+                available.append(f"- {name}{hint}")
+        
+        return available
 
     def build_prompt(
         self,
@@ -196,35 +222,148 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         history: str
     ) -> str:
         """
-        Build the complete prompt for the LLM.
-        
-        Args:
-            violation_type: Type of violation
-            current_rt: Current response time in seconds
-            ema_rt: EMA response time in seconds
-            cluster_data: Kubernetes cluster state
-            network_data: ONOS network state
-            monitoring_data: sFlow monitoring metrics
-            history: Formatted history string
-            
-        Returns:
-            Complete prompt string
+        Build the prompt using the template file with few-shot examples.
         """
-        system_state = self._format_system_state(cluster_data, network_data, monitoring_data)
-        available_actions = self._get_enabled_actions_description()
+        # Determine the problem status and what to do
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+            status = "TOO SLOW - must speed up"
+            what_to_do = "INCREASE replicas (e.g., 1->2) OR INCREASE cpu_limit (e.g., 300m->500m)"
+        else:
+            status = "TOO FAST - must slow down to save resources"
+            what_to_do = "DECREASE replicas (e.g., 2->1, min=1) OR DECREASE cpu_limit (e.g., 500m->300m, min=100m)"
         
+        # Format deployments table
+        deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
+        
+        # Compute bottleneck hint to guide the LLM to the right deployment
+        bottleneck_hint = self._compute_bottleneck_hint(cluster_data, violation_type)
+        
+        # Parse history for failed/successful deployments
+        failed_deployments, successful_deployments = self._format_history_for_prompt(history, violation_type)
+        
+        # Build history section
+        history_section = ""
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED" and failed_deployments:
+            history_section = "\nHISTORY (avoid these - they WORSENED):\n"
+            for dep in failed_deployments:
+                history_section += f"- {dep}: FAILED\n"
+            available = self._get_available_deployments(cluster_data, failed_deployments)
+            if available:
+                history_section += "TRY INSTEAD:\n" + '\n'.join(available) + "\n"
+        elif violation_type == "LOWER_THRESHOLD_EXCEEDED" and successful_deployments:
+            history_section = "\nHISTORY (these worked well):\n"
+            for dep in successful_deployments:
+                history_section += f"- {dep}: IMPROVED\n"
+        elif failed_deployments:
+            history_section = "\nHISTORY (avoid these):\n"
+            for dep in failed_deployments:
+                history_section += f"- {dep}: FAILED\n"
+        
+        # Constraints
+        constraints = "Replicas: 1-5 | CPU: 100m-1000m | Memory: 128Mi-1024Mi"
+        
+        # Fill in the template
         prompt = self.prompt_template.format(
-            violation_type=violation_type,
-            current_rt=round(current_rt, 2),
-            ema_rt=round(ema_rt, 2),
+            ema_rt=f"{ema_rt:.2f}",
             lower_threshold=self.lower_threshold,
             upper_threshold=self.upper_threshold,
-            system_state=system_state,
-            available_actions=available_actions,
-            history=history if history else "No previous decisions"
+            status=status,
+            what_to_do=what_to_do,
+            deployments_table=deployments_table,
+            bottleneck_hint=bottleneck_hint,
+            constraints=constraints,
+            history_section=history_section
         )
+        
         return prompt
     
+    def _compute_bottleneck_hint(self, cluster_data: dict, violation_type: str) -> str:
+        """
+        Identify the most likely bottleneck deployment and return a hint string.
+        
+        For UPPER violations: find the deployment with highest CPU usage ratio.
+        For LOWER violations: find the deployment with most replicas or lowest usage.
+        
+        This guides the small LLM toward the right target instead of picking randomly.
+        """
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        if not deployments:
+            return ""
+        
+        # Filter to valid deployments
+        valid_deps = []
+        for d in deployments:
+            name = d.get("name", "")
+            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
+                continue
+            valid_deps.append(d)
+        
+        if not valid_deps:
+            return ""
+        
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+            # Find deployment with highest CPU usage (the bottleneck)
+            def cpu_usage_ratio(d):
+                usage = d.get("cpu_usage", "0m")
+                limit = d.get("cpu_limit", "1000m")
+                try:
+                    u = int(str(usage).replace("m", "").strip())
+                except (ValueError, TypeError):
+                    u = 0
+                try:
+                    l = int(str(limit).replace("m", "").strip())
+                except (ValueError, TypeError):
+                    l = 1000
+                return u / max(l, 1)
+            
+            busiest = max(valid_deps, key=cpu_usage_ratio)
+            ratio = cpu_usage_ratio(busiest)
+            if ratio > 0.5:
+                return f"BOTTLENECK: {busiest['name']} (CPU {busiest.get('cpu_usage', '?')}/{busiest.get('cpu_limit', '?')}) - target this one"
+            else:
+                return ""
+        else:
+            # LOWER: find deployment with most replicas (can be scaled down)
+            def replica_count(d):
+                return d.get("replicas_ready", d.get("replicas_desired", 1))
+            
+            biggest = max(valid_deps, key=replica_count)
+            reps = replica_count(biggest)
+            if reps > 1:
+                return f"OVER-PROVISIONED: {biggest['name']} has {reps} replicas - target this one"
+            else:
+                return ""
+    
+    def _build_retry_prompt(self, previous_response: str, error_reason: str) -> str:
+        """
+        Build a short corrective prompt for retry attempts.
+        
+        Small LLMs often fix their output when given specific feedback
+        about what was wrong.
+        
+        Args:
+            previous_response: The LLM's previous (failed) response
+            error_reason: What was wrong with it
+            
+        Returns:
+            Short corrective prompt
+        """
+        valid_names = sorted(self.valid_deployment_names)
+        names_str = ", ".join(valid_names) if valid_names else "microservice1-deployment, microservice3-deployment"
+        
+        return f"""Your previous response was invalid: {error_reason}
+
+Valid deployment names: {names_str}
+
+Respond with ONLY a JSON object like one of these:
+{{"action":"horizontal_scaling","parameters":{{"deployment_name":"{valid_names[0] if valid_names else 'microservice1-deployment'}","replicas":2}}}}
+{{"action":"vertical_scaling","parameters":{{"deployment_name":"{valid_names[0] if valid_names else 'microservice1-deployment'}","cpu_limit":"500m","memory_limit":"512Mi"}}}}
+
+JSON:"""
+
     def _query_ollama(self, prompt: str) -> Optional[str]:
         """
         Send prompt to Ollama API and get response.
@@ -279,11 +418,73 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
             logger.error(f"Ollama API error: {e}")
             return None
     
+    def _validate_action(self, action: dict) -> tuple:
+        """
+        Validate a parsed action against known constraints.
+        
+        Returns:
+            (is_valid: bool, error_reason: str)
+        """
+        action_type = action.get("action", "none")
+        params = action.get("parameters", {})
+        
+        if action_type == "none":
+            return False, "No action recommended"
+        
+        # Check action type is known
+        valid_actions = {"horizontal_scaling", "vertical_scaling", "service_placement", "flow_scheduling"}
+        if action_type not in valid_actions:
+            return False, f"Unknown action type: {action_type}"
+        
+        # Check action is enabled
+        if not self.actions_enabled.get(action_type, False):
+            return False, f"Action '{action_type}' is not enabled"
+        
+        # Validate deployment name exists
+        dep_name = params.get("deployment_name", "")
+        if action_type in ("horizontal_scaling", "vertical_scaling", "service_placement"):
+            if not dep_name:
+                return False, "Missing deployment_name"
+            if self.valid_deployment_names and dep_name.lower() not in self.valid_deployment_names:
+                return False, f"Invalid deployment_name '{dep_name}'. Must be one of: {sorted(self.valid_deployment_names)}"
+        
+        # Validate horizontal_scaling parameters
+        if action_type == "horizontal_scaling":
+            replicas = params.get("replicas")
+            if replicas is None:
+                return False, "Missing replicas count"
+            try:
+                replicas = int(replicas)
+            except (ValueError, TypeError):
+                return False, f"Invalid replicas value: {replicas}"
+            if replicas < 1 or replicas > 10:
+                return False, f"Replicas {replicas} out of range (1-10)"
+        
+        # Validate vertical_scaling parameters
+        if action_type == "vertical_scaling":
+            cpu = params.get("cpu_limit", "")
+            mem = params.get("memory_limit", "")
+            if not cpu:
+                return False, "Missing cpu_limit"
+            # Auto-fill memory_limit if missing (common with small LLMs)
+            # Use a sensible default: ~1Mi per 1m CPU (e.g., 500m -> 512Mi)
+            if not mem:
+                try:
+                    cpu_val = int(str(cpu).replace("m", "").strip())
+                    mem_val = max(128, (cpu_val // 100) * 100 + 12)  # e.g., 600m -> 612Mi
+                    params["memory_limit"] = f"{mem_val}Mi"
+                    logger.info(f"Auto-filled missing memory_limit: {params['memory_limit']} (based on cpu_limit={cpu})")
+                except (ValueError, TypeError):
+                    params["memory_limit"] = "512Mi"
+                    logger.info(f"Auto-filled missing memory_limit: 512Mi (default)")
+        
+        return True, ""
+    
     def _parse_response(self, response_text: str) -> dict:
         """
         Parse LLM response to extract JSON action.
         
-        Handles various formats TinyLlama might produce.
+        Handles various formats small LLMs might produce.
         
         Args:
             response_text: Raw response from LLM
@@ -297,6 +498,11 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         # Clean up the response
         cleaned = response_text.strip()
         
+        # Remove markdown code fences if present
+        cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+        cleaned = re.sub(r'\s*```$', '', cleaned)
+        cleaned = cleaned.strip()
+        
         # Try 1: Direct JSON parse
         try:
             parsed = json.loads(cleaned)
@@ -305,7 +511,7 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         except json.JSONDecodeError:
             pass
         
-        # Try 2: Find JSON object in the response (between { and })
+        # Try 2: Find JSON object in the response (between first { and last })
         try:
             start = cleaned.find('{')
             end = cleaned.rfind('}') + 1
@@ -318,20 +524,35 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         except json.JSONDecodeError:
             pass
         
-        # Try 3: Extract using regex patterns
+        # Try 3: Find nested JSON (some models wrap in extra braces or arrays)
         try:
-            return self._extract_with_regex(response_text)
+            # Find all JSON-like objects
+            json_objects = re.findall(r'\{[^{}]*\}', cleaned)
+            for obj_str in json_objects:
+                try:
+                    parsed = json.loads(obj_str)
+                    if isinstance(parsed, dict) and ("action" in parsed or "deployment_name" in parsed):
+                        return self._normalize_response(parsed)
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
+        
+        # Try 4: Extract using regex patterns
+        try:
+            result = self._extract_with_regex(response_text)
+            if result.get("action") != "none":
+                return result
         except Exception as e:
             logger.warning(f"Regex extraction failed: {e}")
         
-        logger.warning(f"Could not parse LLM response: {response_text[:200]}")
+        logger.warning(f"Could not parse LLM response: {response_text[:300]}")
         return self._get_fallback_response("Could not parse LLM response")
     
     def _extract_with_regex(self, response_text: str) -> dict:
         """
         Extract action information using regex patterns.
-        
-        This is a fallback for when JSON parsing fails.
+        Fallback for when JSON parsing fails.
         """
         result = {"action": "none", "parameters": {}}
         
@@ -341,8 +562,7 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
             action = action_match.group(1).lower().strip()
             result["action"] = action
         
-        # Extract parameters based on action type
-        if "horizontal_scaling" in response_text.lower() or "scale" in response_text.lower():
+        if "horizontal_scaling" in response_text.lower() or (result["action"] == "none" and "scale" in response_text.lower() and "replicas" in response_text.lower()):
             dep_match = re.search(r'"deployment_name"\s*:\s*"([^"]+)"', response_text)
             rep_match = re.search(r'"replicas"\s*:\s*(\d+)', response_text)
             
@@ -353,7 +573,7 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
                     "replicas": int(rep_match.group(1)) if rep_match else 2
                 }
         
-        elif "vertical_scaling" in response_text.lower():
+        elif "vertical_scaling" in response_text.lower() or (result["action"] == "none" and "cpu_limit" in response_text.lower()):
             dep_match = re.search(r'"deployment_name"\s*:\s*"([^"]+)"', response_text)
             cpu_match = re.search(r'"cpu_limit"\s*:\s*"([^"]+)"', response_text)
             mem_match = re.search(r'"memory_limit"\s*:\s*"([^"]+)"', response_text)
@@ -394,14 +614,7 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
     def _normalize_response(self, parsed: dict) -> dict:
         """
         Normalize parsed JSON into standard format.
-        
         Handles various field names the LLM might use.
-        
-        Args:
-            parsed: Parsed JSON dictionary
-            
-        Returns:
-            Normalized dictionary with 'action' and 'parameters'
         """
         # Normalize action name
         action = str(parsed.get("action", "none")).lower().strip()
@@ -412,9 +625,18 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
             "scale": "horizontal_scaling",
             "scale_up": "horizontal_scaling",
             "scale_down": "horizontal_scaling",
+            "increase_replicas": "horizontal_scaling",
+            "decrease_replicas": "horizontal_scaling",
+            "add_replicas": "horizontal_scaling",
+            "remove_replicas": "horizontal_scaling",
+            "replicas": "horizontal_scaling",
             "vertical_scaling": "vertical_scaling",
             "verticalscaling": "vertical_scaling",
             "resources": "vertical_scaling",
+            "resize": "vertical_scaling",
+            "increase_cpu": "vertical_scaling",
+            "decrease_cpu": "vertical_scaling",
+            "cpu_scaling": "vertical_scaling",
             "service_placement": "service_placement",
             "serviceplacement": "service_placement",
             "placement": "service_placement",
@@ -435,12 +657,26 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
             logger.warning(f"Action '{normalized_action}' is not enabled, falling back to none")
             return {"action": "none", "parameters": {}}
         
+        # Extract parameters - might be nested in "parameters" key or at top level
+        params = parsed.get("parameters", {})
+        if not isinstance(params, dict):
+            params = {}
+        if not params:
+            # Fall back to top-level keys (some models flatten the structure)
+            params = {k: v for k, v in parsed.items() if k != "action"}
+        
         # Build parameters based on action type
         parameters = {}
         
         if normalized_action == "horizontal_scaling":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-            replicas = parsed.get("replicas") or parsed.get("replica_count") or parsed.get("replica") or 2
+            dep_name = (params.get("deployment_name") or params.get("deployment") 
+                       or params.get("name") or params.get("pod") or "")
+            
+            replicas = params.get("replicas")
+            if replicas is None:
+                replicas = params.get("replica_count") or params.get("replica") or params.get("count")
+            if replicas is None:
+                replicas = 2
             
             # Handle non-numeric replicas
             if isinstance(replicas, (list, dict)):
@@ -450,44 +686,63 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
             except (ValueError, TypeError):
                 replicas = 2
             
+            # Clamp replicas to valid range
+            replicas = max(1, min(5, replicas))
+            
             if dep_name:
                 parameters = {
-                    "deployment_name": str(dep_name),
-                    "replicas": max(1, min(5, replicas))
+                    "deployment_name": str(dep_name).lower(),
+                    "replicas": replicas
                 }
             else:
                 normalized_action = "none"
                 
         elif normalized_action == "vertical_scaling":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-            cpu = parsed.get("cpu_limit") or parsed.get("cpu") or "500m"
-            mem = parsed.get("memory_limit") or parsed.get("memory") or "512Mi"
+            dep_name = (params.get("deployment_name") or params.get("deployment") 
+                       or params.get("name") or "")
+            cpu = params.get("cpu_limit") or params.get("cpu") or params.get("cpu_limits") or "500m"
+            mem = (params.get("memory_limit") or params.get("memory") 
+                  or params.get("mem_limit") or params.get("memory_limits") or "512Mi")
+            
+            # Normalize CPU format (ensure it ends with 'm')
+            cpu = str(cpu)
+            if cpu.isdigit():
+                cpu = f"{cpu}m"
+            
+            # Normalize memory format (ensure it ends with 'Mi')
+            mem = str(mem)
+            if mem.isdigit():
+                mem = f"{mem}Mi"
             
             if dep_name:
                 parameters = {
-                    "deployment_name": str(dep_name),
-                    "cpu_limit": str(cpu),
-                    "memory_limit": str(mem)
+                    "deployment_name": str(dep_name).lower(),
+                    "cpu_limit": cpu,
+                    "memory_limit": mem
                 }
             else:
                 normalized_action = "none"
                 
         elif normalized_action == "service_placement":
-            dep_name = parsed.get("deployment_name") or parsed.get("deployment") or parsed.get("name")
-            target = parsed.get("target_node") or parsed.get("node") or parsed.get("target")
+            dep_name = (params.get("deployment_name") or params.get("deployment") 
+                       or params.get("name") or "")
+            target = (params.get("target_node") or params.get("node") 
+                     or params.get("target") or "")
             
             if dep_name and target:
                 parameters = {
-                    "deployment_name": str(dep_name),
+                    "deployment_name": str(dep_name).lower(),
                     "target_node": str(target)
                 }
             else:
                 normalized_action = "none"
                 
         elif normalized_action == "flow_scheduling":
-            src = parsed.get("source_switch") or parsed.get("source") or parsed.get("ingress")
-            dst = parsed.get("destination_switch") or parsed.get("destination") or parsed.get("egress")
-            path = parsed.get("new_path") or parsed.get("path") or []
+            src = (params.get("source_switch") or params.get("source") 
+                  or params.get("ingress") or "")
+            dst = (params.get("destination_switch") or params.get("destination") 
+                  or params.get("egress") or "")
+            path = params.get("new_path") or params.get("path") or []
             
             if src and dst:
                 parameters = {
@@ -512,6 +767,73 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
             "fallback_reason": reason
         }
     
+    def _get_smart_fallback(self, violation_type: str, cluster_data: dict) -> dict:
+        """
+        Generate an intelligent fallback when the LLM fails after all retries.
+        
+        Instead of returning 'none', pick a reasonable default action based on
+        the violation type and current cluster state.
+        
+        Args:
+            violation_type: Type of violation
+            cluster_data: Current cluster state
+            
+        Returns:
+            A reasonable default action
+        """
+        # Get deployments from cluster data
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        # Filter to valid deployments
+        valid_deps = []
+        for d in deployments:
+            name = d.get("name", "")
+            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
+                continue
+            valid_deps.append(d)
+        
+        if not valid_deps:
+            return self._get_fallback_response("No valid deployments found for smart fallback")
+        
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+            # Find deployment with lowest replica count (bottleneck candidate)
+            best = min(valid_deps, key=lambda d: d.get("replicas_ready", d.get("replicas_desired", 1)))
+            current_replicas = best.get("replicas_ready", best.get("replicas_desired", 1))
+            new_replicas = min(5, current_replicas + 1)
+            
+            logger.warning(f"Smart fallback: scaling up {best['name']} from {current_replicas} to {new_replicas}")
+            return {
+                "action": "horizontal_scaling",
+                "parameters": {
+                    "deployment_name": best["name"],
+                    "replicas": new_replicas
+                },
+                "fallback_reason": "LLM failed after retries, using smart fallback"
+            }
+        else:  # LOWER_THRESHOLD_EXCEEDED
+            # Find deployment with highest replica count (can be scaled down)
+            candidates = [d for d in valid_deps 
+                         if d.get("replicas_ready", d.get("replicas_desired", 1)) > 1]
+            
+            if candidates:
+                best = max(candidates, key=lambda d: d.get("replicas_ready", d.get("replicas_desired", 1)))
+                current_replicas = best.get("replicas_ready", best.get("replicas_desired", 1))
+                new_replicas = max(1, current_replicas - 1)
+                
+                logger.warning(f"Smart fallback: scaling down {best['name']} from {current_replicas} to {new_replicas}")
+                return {
+                    "action": "horizontal_scaling",
+                    "parameters": {
+                        "deployment_name": best["name"],
+                        "replicas": new_replicas
+                    },
+                    "fallback_reason": "LLM failed after retries, using smart fallback"
+                }
+            else:
+                return self._get_fallback_response("All deployments at minimum replicas, no scale-down possible")
+
     def analyze_and_recommend(
         self,
         violation_type: str,
@@ -529,7 +851,8 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         """
         Main method: Analyze system state and recommend an action.
         
-        This is called by the Intent Watch Loop when a violation is detected.
+        Uses a retry loop: if the first LLM response is invalid, retries
+        with a corrective micro-prompt up to MAX_LLM_RETRIES times.
         
         Args:
             violation_type: "UPPER_THRESHOLD_EXCEEDED" or "LOWER_THRESHOLD_EXCEEDED"
@@ -552,7 +875,7 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         network_data = network_data or {}
         monitoring_data = monitoring_data or {}
         
-        # Build the prompt
+        # Build the initial prompt
         prompt = self.build_prompt(
             violation_type=violation_type,
             current_rt=current_rt,
@@ -565,87 +888,122 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
         
         logger.debug(f"Prompt length: {len(prompt)} characters")
         
-        # Query the LLM
-        response_text = self._query_ollama(prompt)
+        # === RETRY LOOP ===
+        last_response_text = None
+        last_error = ""
         
-        # Parse the response
-        action = self._parse_response(response_text)
+        for attempt in range(1, MAX_LLM_RETRIES + 1):
+            if attempt == 1:
+                current_prompt = prompt
+            else:
+                # Use corrective micro-prompt on retry
+                logger.warning(f"Retry {attempt}/{MAX_LLM_RETRIES}: {last_error}")
+                current_prompt = self._build_retry_prompt(last_response_text or "", last_error)
+            
+            # Query the LLM
+            response_text = self._query_ollama(current_prompt)
+            last_response_text = response_text
+            
+            if not response_text:
+                last_error = "No response from LLM"
+                continue
+            
+            # Parse the response
+            action = self._parse_response(response_text)
+            
+            # Validate the parsed action
+            is_valid, error_reason = self._validate_action(action)
+            
+            if is_valid:
+                self._consecutive_failures = 0
+                logger.info(f"Valid action on attempt {attempt}: {action['action']}")
+                
+                # Apply safety net for repeated failures
+                action = self._check_and_adjust_repeated_action(
+                    action, history, violation_type, cluster_data
+                )
+                
+                logger.info(f"Final recommended action: {action['action']}")
+                if action['action'] != 'none':
+                    logger.info(f"Parameters: {action['parameters']}")
+                
+                return action
+            else:
+                last_error = error_reason
+                logger.warning(f"Attempt {attempt}: invalid action - {error_reason}")
         
-        # 100% LLM decision-making - no Python override
-        # The LLM is fully responsible for learning from history and choosing appropriate actions
+        # All retries exhausted
+        self._consecutive_failures += 1
+        logger.error(f"All {MAX_LLM_RETRIES} LLM attempts failed. Consecutive failures: {self._consecutive_failures}")
         
-        logger.info(f"LLM recommended action: {action['action']}")
-        if action['action'] != 'none':
-            logger.info(f"Parameters: {action['parameters']}")
-        
-        return action
+        # Use smart fallback instead of returning 'none'
+        if self._consecutive_failures <= 3:
+            return self._get_smart_fallback(violation_type, cluster_data)
+        else:
+            logger.error("Too many consecutive failures, returning no-action to avoid instability")
+            return self._get_fallback_response(f"All {MAX_LLM_RETRIES} attempts failed: {last_error}")
     
     def _check_and_adjust_repeated_action(self, action: dict, history: str, violation_type: str, cluster_data: dict) -> dict:
         """
         Check if the LLM is repeating a failed action and suggest an alternative.
         
-        This helps overcome limitations of smaller LLMs that may not learn from feedback.
+        This safety net helps overcome limitations of smaller LLMs that may not 
+        learn from feedback in the history.
         """
         if action['action'] == 'none':
             return action
         
-        # Count how many times the same action appears in history with WORSENED or NO_CHANGE
-        action_str = f"action={action['action']}, params={action['parameters']}"
-        
-        # Look for patterns in history
+        # Count failures in history
         failed_count = history.count("WORSENED") + history.count("NO_CHANGE")
-        same_deployment_failures = 0
         
-        if action['action'] == 'horizontal_scaling':
+        # Track failures for the specific deployment
+        same_deployment_failures = 0
+        if action['action'] in ('horizontal_scaling', 'vertical_scaling'):
             dep_name = action['parameters'].get('deployment_name', '')
             if dep_name and dep_name in history:
-                # Count failures involving this deployment
-                same_deployment_failures = history.count(f"'{dep_name}'") 
+                same_deployment_failures = history.count(dep_name)
         
-        # If we see repeated failures (3+) with horizontal_scaling, try vertical_scaling
-        if failed_count >= 3 and action['action'] == 'horizontal_scaling':
+        # If we see 3+ failures with horizontal_scaling, try vertical_scaling
+        if failed_count >= 3 and action['action'] == 'horizontal_scaling' and self.actions_enabled.get('vertical_scaling', False):
+            dep_name = action['parameters'].get('deployment_name', '')
+            if not dep_name:
+                return action
+                
             logger.warning(f"Detected {failed_count} failed attempts. Switching to vertical_scaling.")
             
-            # Get the deployment name from the original action
-            dep_name = action['parameters'].get('deployment_name', 'microservice1-deployment')
-            
-            # For LOWER_THRESHOLD: reduce resources to slow down
             if violation_type == "LOWER_THRESHOLD_EXCEEDED":
                 return {
                     "action": "vertical_scaling",
                     "parameters": {
                         "deployment_name": dep_name,
-                        "cpu_limit": "100m",  # Reduce CPU to slow down
+                        "cpu_limit": "100m",
                         "memory_limit": "128Mi"
                     },
                     "adjusted_reason": "Switched from repeated failed horizontal_scaling"
                 }
             else:
-                # For UPPER_THRESHOLD: increase resources
                 return {
                     "action": "vertical_scaling",
                     "parameters": {
                         "deployment_name": dep_name,
-                        "cpu_limit": "1000m",  # Increase CPU
+                        "cpu_limit": "1000m",
                         "memory_limit": "1024Mi"
                     },
                     "adjusted_reason": "Switched from repeated failed horizontal_scaling"
                 }
         
-        # If same deployment failed multiple times, try a different deployment
+        # If same deployment failed 2+ times, try a different deployment
         if same_deployment_failures >= 2 and action['action'] == 'horizontal_scaling':
-            # Get list of deployments from cluster data
-            # Structure: cluster_data["data"]["deployments"]["list"]
             try:
-                deployments = cluster_data.get('data', {}).get('deployments', {}).get('list', [])
+                deployments = cluster_data.get('deployments', {}).get('list', [])
+                if not deployments:
+                    deployments = cluster_data.get('data', {}).get('deployments', {}).get('list', [])
             except (AttributeError, TypeError):
                 deployments = []
             
             current_dep = action['parameters'].get('deployment_name', '')
             
-            # Find a different deployment to try
             for dep in deployments:
-                # Handle both dict and string formats
                 if isinstance(dep, dict):
                     dep_name = dep.get('name', '')
                     replicas = dep.get('replicas_desired', 1)
@@ -655,11 +1013,13 @@ Choose ONE action and respond with ONLY a JSON object matching the format shown 
                 else:
                     continue
                 
-                if dep_name and dep_name != current_dep and 'microservice' in dep_name:
+                # Only consider valid deployments that aren't the current one
+                if (dep_name and dep_name.lower() != current_dep.lower() 
+                    and dep_name.lower() in self.valid_deployment_names):
                     if violation_type == "LOWER_THRESHOLD_EXCEEDED":
-                        new_replicas = max(1, replicas - 1)  # Reduce
+                        new_replicas = max(1, replicas - 1)
                     else:
-                        new_replicas = replicas + 1  # Increase
+                        new_replicas = replicas + 1
                     
                     logger.warning(f"Same deployment failed {same_deployment_failures} times. Trying {dep_name} instead.")
                     return {
