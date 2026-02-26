@@ -173,8 +173,14 @@ def validate_response(response_text):
     if action == "vertical_scaling":
         if not params.get("cpu_limit"):
             return False, parsed, "Missing cpu_limit"
+        # Auto-fill memory_limit if missing (common with small LLMs)
         if not params.get("memory_limit"):
-            return False, parsed, "Missing memory_limit"
+            try:
+                cpu_val = int(str(params["cpu_limit"]).replace("m", "").strip())
+                mem_val = max(128, (cpu_val // 100) * 100 + 12)
+                params["memory_limit"] = f"{mem_val}Mi"
+            except (ValueError, TypeError):
+                params["memory_limit"] = "512Mi"
 
     return True, parsed, ""
 

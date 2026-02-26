@@ -464,8 +464,19 @@ JSON:"""
         if action_type == "vertical_scaling":
             cpu = params.get("cpu_limit", "")
             mem = params.get("memory_limit", "")
-            if not cpu or not mem:
-                return False, "Missing cpu_limit or memory_limit"
+            if not cpu:
+                return False, "Missing cpu_limit"
+            # Auto-fill memory_limit if missing (common with small LLMs)
+            # Use a sensible default: ~1Mi per 1m CPU (e.g., 500m -> 512Mi)
+            if not mem:
+                try:
+                    cpu_val = int(str(cpu).replace("m", "").strip())
+                    mem_val = max(128, (cpu_val // 100) * 100 + 12)  # e.g., 600m -> 612Mi
+                    params["memory_limit"] = f"{mem_val}Mi"
+                    logger.info(f"Auto-filled missing memory_limit: {params['memory_limit']} (based on cpu_limit={cpu})")
+                except (ValueError, TypeError):
+                    params["memory_limit"] = "512Mi"
+                    logger.info(f"Auto-filled missing memory_limit: 512Mi (default)")
         
         return True, ""
     
