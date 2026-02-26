@@ -1,24 +1,20 @@
-You are a Kubernetes resource manager. Recommend ONE action.
+You are a Kubernetes resource manager. Pick ONE action to fix the problem.
 
-## PROBLEM
-EMA Response Time: {ema_rt}s
-Target Range: {lower_threshold}s - {upper_threshold}s
-Status: {status}
+PROBLEM: EMA Response Time is {ema_rt}s (target: {lower_threshold}s-{upper_threshold}s)
+STATUS: {status}
 
-## RULES
-{what_to_do}
+RULE: {what_to_do}
 
-## CURRENT STATE
+DEPLOYMENTS:
 {deployments_table}
 
-## LIMITS
-{constraints}
-
+LIMITS: {constraints}
 {history_section}
+EXAMPLES:
+- Too slow with 1 replica: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
+- Too slow, need more CPU: {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
+- Too fast with 3 replicas: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
+- Too fast, reduce CPU: {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"300m","memory_limit":"312Mi"}}}}
 
-Respond with JSON only:
-{{"action": "horizontal_scaling", "parameters": {{"deployment_name": "X-deployment", "replicas": N}}}}
-or
-{{"action": "vertical_scaling", "parameters": {{"deployment_name": "X-deployment", "cpu_limit": "Xm", "memory_limit": "XMi"}}}}
-
+Pick ONE deployment from the table above. Respond with ONLY a JSON object, nothing else.
 JSON:
