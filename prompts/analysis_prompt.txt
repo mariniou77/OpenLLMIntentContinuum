@@ -5,16 +5,15 @@ STATUS: {status}
 
 RULE: {what_to_do}
 
-DEPLOYMENTS:
+CURRENT STATE:
 {deployments_table}
 {bottleneck_hint}
 LIMITS: {constraints}
 {history_section}
-IMPORTANT: Target the deployment with HIGHEST CPU usage in the table. Use "horizontal_scaling" to change replicas or "vertical_scaling" to change CPU/memory.
+Pick the deployment that needs adjustment. Use the exact deployment name in JSON.
 
 EXAMPLES:
 {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
 {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
 
-Respond with ONLY a JSON object. Target the busiest deployment.
 JSON:

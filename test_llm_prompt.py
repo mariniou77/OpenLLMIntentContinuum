@@ -28,13 +28,11 @@ VALID_DEPLOYMENTS = {
     "microservice4-deployment",
 }
 
-# Simulated deployment states for testing
-FAKE_DEPLOYMENTS_TABLE = """| Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |
-|----------------------------|----------|---------|----------|---------|----------|
-| microservice1-deployment   | 1        | 300m    | 250m     | 312Mi   | 200Mi    |
-| microservice2-deployment   | 1        | 300m    | 80m      | 312Mi   | 100Mi    |
-| microservice3-deployment   | 1        | 500m    | 450m     | 512Mi   | 400Mi    |
-| microservice4-deployment   | 1        | 300m    | 60m      | 312Mi   | 80Mi     |"""
+# Simulated deployment states for testing (explicit labeled format)
+FAKE_DEPLOYMENTS = """microservice1-deployment: replicas=1, cpu_usage=250m, cpu_limit=300m, memory_usage=200Mi, memory_limit=312Mi
+microservice2-deployment: replicas=1, cpu_usage=80m, cpu_limit=300m, memory_usage=100Mi, memory_limit=312Mi
+microservice3-deployment: replicas=1, cpu_usage=450m, cpu_limit=500m, memory_usage=400Mi, memory_limit=512Mi
+microservice4-deployment: replicas=1, cpu_usage=60m, cpu_limit=300m, memory_usage=80Mi, memory_limit=312Mi"""
 
 # Load the prompt template
 def load_prompt_template():
@@ -50,18 +48,17 @@ STATUS: {status}
 
 RULE: {what_to_do}
 
-DEPLOYMENTS:
+CURRENT STATE:
 {deployments_table}
 {bottleneck_hint}
 LIMITS: {constraints}
 {history_section}
-IMPORTANT: Target the deployment with HIGHEST CPU usage in the table. Use "horizontal_scaling" to change replicas or "vertical_scaling" to change CPU/memory.
+Pick the deployment that needs adjustment. Use the exact deployment name in JSON.
 
 EXAMPLES:
 {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
 {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
 
-Respond with ONLY a JSON object. Target the busiest deployment.
 JSON:"""
 
 
@@ -195,10 +192,10 @@ SCENARIOS = [
         "upper": 3.0,
         "status": "TOO SLOW - must speed up",
         "rule": "INCREASE replicas (e.g., 1->2) OR INCREASE cpu_limit (e.g., 300m->500m)",
-        "table": FAKE_DEPLOYMENTS_TABLE,
-        "bottleneck_hint": "BOTTLENECK: microservice3-deployment (CPU 450m/500m) - target this one",
-        "expect_action": ["horizontal_scaling", "vertical_scaling"],  # Both valid
-        "expect_target": "microservice3-deployment",  # Should target the bottleneck
+        "table": FAKE_DEPLOYMENTS,
+        "bottleneck_hint": "BOTTLENECK: microservice3-deployment (cpu_usage=450m, cpu_limit=500m) - target this one",
+        "expect_action": ["horizontal_scaling", "vertical_scaling"],
+        "expect_target": "microservice3-deployment",
     },
     {
         "name": "LOWER violation (too fast, some with 3 replicas)",
@@ -207,12 +204,10 @@ SCENARIOS = [
         "upper": 3.0,
         "status": "TOO FAST - must slow down to save resources",
         "rule": "DECREASE replicas (e.g., 2->1, min=1) OR DECREASE cpu_limit (e.g., 500m->300m, min=100m)",
-        "table": """| Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |
-|----------------------------|----------|---------|----------|---------|----------|
-| microservice1-deployment   | 3        | 500m    | 100m     | 512Mi   | 150Mi    |
-| microservice2-deployment   | 1        | 300m    | 30m      | 312Mi   | 50Mi     |
-| microservice3-deployment   | 3        | 600m    | 120m     | 612Mi   | 200Mi    |
-| microservice4-deployment   | 1        | 300m    | 20m      | 312Mi   | 40Mi     |""",
+        "table": """microservice1-deployment: replicas=3, cpu_usage=100m, cpu_limit=500m, memory_usage=150Mi, memory_limit=512Mi
+microservice2-deployment: replicas=1, cpu_usage=30m, cpu_limit=300m, memory_usage=50Mi, memory_limit=312Mi
+microservice3-deployment: replicas=3, cpu_usage=120m, cpu_limit=600m, memory_usage=200Mi, memory_limit=612Mi
+microservice4-deployment: replicas=1, cpu_usage=20m, cpu_limit=300m, memory_usage=40Mi, memory_limit=312Mi""",
         "bottleneck_hint": "OVER-PROVISIONED: microservice1-deployment has 3 replicas - target this one",
         "expect_action": ["horizontal_scaling", "vertical_scaling"],
         "expect_target": ["microservice1-deployment", "microservice3-deployment"],
@@ -224,11 +219,11 @@ SCENARIOS = [
         "upper": 3.0,
         "status": "TOO SLOW - must speed up",
         "rule": "INCREASE replicas (e.g., 1->2) OR INCREASE cpu_limit (e.g., 300m->500m)",
-        "table": FAKE_DEPLOYMENTS_TABLE,
-        "bottleneck_hint": "BOTTLENECK: microservice3-deployment (CPU 450m/500m) - target this one",
+        "table": FAKE_DEPLOYMENTS,
+        "bottleneck_hint": "BOTTLENECK: microservice3-deployment (cpu_usage=450m, cpu_limit=500m) - target this one",
         "history": "\nHISTORY (avoid these - they WORSENED):\n- microservice1-deployment: FAILED\nTRY INSTEAD:\n- microservice3-deployment (only 1 replica - good candidate)\n",
         "expect_action": ["horizontal_scaling", "vertical_scaling"],
-        "expect_target": ["microservice3-deployment", "microservice2-deployment", "microservice4-deployment"],  # Anything except ms1
+        "expect_target": ["microservice3-deployment", "microservice2-deployment", "microservice4-deployment"],
         "avoid_target": "microservice1-deployment",
     },
     {
@@ -238,14 +233,12 @@ SCENARIOS = [
         "upper": 3.0,
         "status": "TOO SLOW - must speed up",
         "rule": "INCREASE replicas (e.g., 1->2) OR INCREASE cpu_limit (e.g., 300m->500m)",
-        "table": """| Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |
-|----------------------------|----------|---------|----------|---------|----------|
-| microservice1-deployment   | 5        | 300m    | 290m     | 312Mi   | 300Mi    |
-| microservice2-deployment   | 5        | 300m    | 280m     | 312Mi   | 290Mi    |
-| microservice3-deployment   | 5        | 500m    | 490m     | 512Mi   | 500Mi    |
-| microservice4-deployment   | 5        | 300m    | 270m     | 312Mi   | 280Mi    |""",
-        "bottleneck_hint": "BOTTLENECK: microservice3-deployment (CPU 490m/500m) - target this one",
-        "expect_action": ["vertical_scaling"],  # horizontal won't help at max replicas
+        "table": """microservice1-deployment: replicas=5, cpu_usage=290m, cpu_limit=300m, memory_usage=300Mi, memory_limit=312Mi
+microservice2-deployment: replicas=5, cpu_usage=280m, cpu_limit=300m, memory_usage=290Mi, memory_limit=312Mi
+microservice3-deployment: replicas=5, cpu_usage=490m, cpu_limit=500m, memory_usage=500Mi, memory_limit=512Mi
+microservice4-deployment: replicas=5, cpu_usage=270m, cpu_limit=300m, memory_usage=280Mi, memory_limit=312Mi""",
+        "bottleneck_hint": "BOTTLENECK: microservice3-deployment (cpu_usage=490m, cpu_limit=500m) - target this one",
+        "expect_action": ["vertical_scaling"],
         "expect_target": ["microservice3-deployment", "microservice1-deployment"],
     },
 ]

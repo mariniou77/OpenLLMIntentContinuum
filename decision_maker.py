@@ -94,18 +94,17 @@ STATUS: {status}
 
 RULE: {what_to_do}
 
-DEPLOYMENTS:
+CURRENT STATE:
 {deployments_table}
 {bottleneck_hint}
 LIMITS: {constraints}
 {history_section}
-IMPORTANT: Target the deployment with HIGHEST CPU usage in the table. Use "horizontal_scaling" to change replicas or "vertical_scaling" to change CPU/memory.
+Pick the deployment that needs adjustment. Use the exact deployment name in JSON.
 
 EXAMPLES:
 {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
 {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
 
-Respond with ONLY a JSON object. Target the busiest deployment.
 JSON:
 """
 
@@ -119,10 +118,15 @@ JSON:
 
     def _format_system_state(self, cluster_data: dict, network_data: dict, monitoring_data: dict) -> str:
         """
-        Format system state as a deployments table for the prompt.
+        Format system state as a clear, labeled list for the prompt.
         
-        Returns a table format like:
-        | Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |
+        Uses full deployment names and explicit metric labels.
+        No abbreviations — small LLMs understand explicit labels better.
+        Field names match the JSON output format (cpu_limit, memory_limit)
+        so the model learns the vocabulary from the input.
+        
+        Returns format like:
+        microservice1-deployment: replicas=2, cpu_usage=19m, cpu_limit=300m, memory_usage=50Mi, memory_limit=312Mi
         """
         lines = []
         
@@ -132,24 +136,57 @@ JSON:
         if not deployments:
             deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
         
-        if deployments:
-            lines.append("| Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |")
-            lines.append("|----------------------------|----------|---------|----------|---------|----------|")
+        for d in deployments:
+            name = d.get("name", "unknown")
+            # Only include deployments that are in config
+            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
+                continue
             
-            for d in deployments:
-                name = d.get("name", "unknown")
-                # Only include deployments that are in config
-                if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
-                    continue
-                    
-                replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
-                cpu_limit = d.get("cpu_limit") or "N/A"
-                memory_limit = d.get("memory_limit") or "N/A"
-                cpu_usage = d.get("cpu_usage") or "N/A"
-                memory_usage = d.get("memory_usage") or "N/A"
-                
-                padded_name = name.ljust(26)
-                lines.append(f"| {padded_name} | {str(replicas).ljust(8)} | {str(cpu_limit).ljust(7)} | {str(cpu_usage).ljust(8)} | {str(memory_limit).ljust(7)} | {str(memory_usage).ljust(8)} |")
+            replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
+            cpu_limit = d.get("cpu_limit") or "unknown"
+            cpu_usage = d.get("cpu_usage") or "unknown"
+            memory_limit = d.get("memory_limit") or "unknown"
+            memory_usage = d.get("memory_usage") or "unknown"
+            
+            lines.append(
+                f"{name}: replicas={replicas}, "
+                f"cpu_usage={cpu_usage}, cpu_limit={cpu_limit}, "
+                f"memory_usage={memory_usage}, memory_limit={memory_limit}"
+            )
+        
+        return '\n'.join(lines) if lines else "No deployment data available"
+    
+    @staticmethod
+    def _expand_name(name: str) -> str:
+        """
+        Expand short deployment names back to full Kubernetes names.
+        
+        Handles: ms1, ms2, ms3, ms4, microservice1, etc.
+        Returns the input unchanged if it's already a full name.
+        """
+        import re
+        name = str(name).strip().lower()
+        
+        # Already a full name
+        if name.endswith("-deployment") and "microservice" in name:
+            return name
+        
+        # ms1 -> microservice1-deployment
+        match = re.match(r'^ms(\d+)$', name)
+        if match:
+            return f"microservice{match.group(1)}-deployment"
+        
+        # microservice1 -> microservice1-deployment
+        match = re.match(r'^microservice(\d+)$', name)
+        if match:
+            return f"microservice{match.group(1)}-deployment"
+        
+        # microservice-1 -> microservice1-deployment
+        match = re.match(r'^microservice-(\d+)$', name)
+        if match:
+            return f"microservice{match.group(1)}-deployment"
+        
+        return name
         
         return '\n'.join(lines) if lines else "No deployment data available"
     
@@ -322,7 +359,7 @@ JSON:
             busiest = max(valid_deps, key=cpu_usage_ratio)
             ratio = cpu_usage_ratio(busiest)
             if ratio > 0.5:
-                return f"BOTTLENECK: {busiest['name']} (CPU {busiest.get('cpu_usage', '?')}/{busiest.get('cpu_limit', '?')}) - target this one"
+                return f"BOTTLENECK: {busiest['name']} (cpu_usage={busiest.get('cpu_usage', '?')}, cpu_limit={busiest.get('cpu_limit', '?')}) - target this one"
             else:
                 return ""
         else:
@@ -333,7 +370,7 @@ JSON:
             biggest = max(valid_deps, key=replica_count)
             reps = replica_count(biggest)
             if reps > 1:
-                return f"OVER-PROVISIONED: {biggest['name']} has {reps} replicas - target this one"
+                return f"OVER-PROVISIONED: {biggest['name']} has replicas={reps} - target this one"
             else:
                 return ""
     
@@ -671,6 +708,7 @@ JSON:"""
         if normalized_action == "horizontal_scaling":
             dep_name = (params.get("deployment_name") or params.get("deployment") 
                        or params.get("name") or params.get("pod") or "")
+            dep_name = self._expand_name(dep_name)
             
             replicas = params.get("replicas")
             if replicas is None:
@@ -700,6 +738,7 @@ JSON:"""
         elif normalized_action == "vertical_scaling":
             dep_name = (params.get("deployment_name") or params.get("deployment") 
                        or params.get("name") or "")
+            dep_name = self._expand_name(dep_name)
             cpu = params.get("cpu_limit") or params.get("cpu") or params.get("cpu_limits") or "500m"
             mem = (params.get("memory_limit") or params.get("memory") 
                   or params.get("mem_limit") or params.get("memory_limits") or "512Mi")
@@ -726,6 +765,7 @@ JSON:"""
         elif normalized_action == "service_placement":
             dep_name = (params.get("deployment_name") or params.get("deployment") 
                        or params.get("name") or "")
+            dep_name = self._expand_name(dep_name)
             target = (params.get("target_node") or params.get("node") 
                      or params.get("target") or "")
             
