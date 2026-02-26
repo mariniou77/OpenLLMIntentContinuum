@@ -52,16 +52,16 @@ RULE: {what_to_do}
 
 DEPLOYMENTS:
 {deployments_table}
-
+{bottleneck_hint}
 LIMITS: {constraints}
 {history_section}
-EXAMPLES:
-- Too slow with 1 replica: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
-- Too slow, need more CPU: {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
-- Too fast with 3 replicas: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
-- Too fast, reduce CPU: {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"300m","memory_limit":"312Mi"}}}}
+IMPORTANT: Target the deployment with HIGHEST CPU usage in the table. Use "horizontal_scaling" to change replicas or "vertical_scaling" to change CPU/memory.
 
-Pick ONE deployment from the table above. Respond with ONLY a JSON object, nothing else.
+EXAMPLES:
+{{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
+{{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
+
+Respond with ONLY a JSON object. Target the busiest deployment.
 JSON:"""
 
 
@@ -74,6 +74,7 @@ def build_test_prompt(template, scenario):
         status=scenario["status"],
         what_to_do=scenario["rule"],
         deployments_table=scenario["table"],
+        bottleneck_hint=scenario.get("bottleneck_hint", ""),
         constraints="Replicas: 1-5 | CPU: 100m-1000m | Memory: 128Mi-1024Mi",
         history_section=scenario.get("history", ""),
     )
@@ -128,6 +129,24 @@ def validate_response(response_text):
     action = parsed.get("action", "")
     params = parsed.get("parameters", {})
 
+    # Normalize common LLM action name variants
+    action_normalization = {
+        "horizontal_scaling": "horizontal_scaling",
+        "vertical_scaling": "vertical_scaling",
+        "increase_replicas": "horizontal_scaling",
+        "decrease_replicas": "horizontal_scaling",
+        "scale_up": "horizontal_scaling",
+        "scale_down": "horizontal_scaling",
+        "increase_cpu": "vertical_scaling",
+        "decrease_cpu": "vertical_scaling",
+        "service_placement": "service_placement",
+        "flow_scheduling": "flow_scheduling",
+    }
+    
+    normalized_action = action_normalization.get(action, action)
+    parsed["action"] = normalized_action
+    action = normalized_action
+
     # Check action type
     valid_actions = {"horizontal_scaling", "vertical_scaling", "service_placement", "flow_scheduling"}
     if action not in valid_actions:
@@ -171,8 +190,9 @@ SCENARIOS = [
         "status": "TOO SLOW - must speed up",
         "rule": "INCREASE replicas (e.g., 1->2) OR INCREASE cpu_limit (e.g., 300m->500m)",
         "table": FAKE_DEPLOYMENTS_TABLE,
-        "expect_action": "horizontal_scaling",
-        "expect_direction": "up",
+        "bottleneck_hint": "BOTTLENECK: microservice3-deployment (CPU 450m/500m) - target this one",
+        "expect_action": ["horizontal_scaling", "vertical_scaling"],  # Both valid
+        "expect_target": "microservice3-deployment",  # Should target the bottleneck
     },
     {
         "name": "LOWER violation (too fast, some with 3 replicas)",
@@ -187,8 +207,9 @@ SCENARIOS = [
 | microservice2-deployment   | 1        | 300m    | 30m      | 312Mi   | 50Mi     |
 | microservice3-deployment   | 3        | 600m    | 120m     | 612Mi   | 200Mi    |
 | microservice4-deployment   | 1        | 300m    | 20m      | 312Mi   | 40Mi     |""",
-        "expect_action": "horizontal_scaling",
-        "expect_direction": "down",
+        "bottleneck_hint": "OVER-PROVISIONED: microservice1-deployment has 3 replicas - target this one",
+        "expect_action": ["horizontal_scaling", "vertical_scaling"],
+        "expect_target": ["microservice1-deployment", "microservice3-deployment"],
     },
     {
         "name": "UPPER with history (ms1 failed, should try ms3)",
@@ -198,9 +219,11 @@ SCENARIOS = [
         "status": "TOO SLOW - must speed up",
         "rule": "INCREASE replicas (e.g., 1->2) OR INCREASE cpu_limit (e.g., 300m->500m)",
         "table": FAKE_DEPLOYMENTS_TABLE,
+        "bottleneck_hint": "BOTTLENECK: microservice3-deployment (CPU 450m/500m) - target this one",
         "history": "\nHISTORY (avoid these - they WORSENED):\n- microservice1-deployment: FAILED\nTRY INSTEAD:\n- microservice3-deployment (only 1 replica - good candidate)\n",
-        "expect_action": "horizontal_scaling",
-        "expect_direction": "up",
+        "expect_action": ["horizontal_scaling", "vertical_scaling"],
+        "expect_target": ["microservice3-deployment", "microservice2-deployment", "microservice4-deployment"],  # Anything except ms1
+        "avoid_target": "microservice1-deployment",
     },
     {
         "name": "UPPER - need vertical scaling (already at max replicas)",
@@ -215,8 +238,9 @@ SCENARIOS = [
 | microservice2-deployment   | 5        | 300m    | 280m     | 312Mi   | 290Mi    |
 | microservice3-deployment   | 5        | 500m    | 490m     | 512Mi   | 500Mi    |
 | microservice4-deployment   | 5        | 300m    | 270m     | 312Mi   | 280Mi    |""",
-        "expect_action": "vertical_scaling",
-        "expect_direction": "up",
+        "bottleneck_hint": "BOTTLENECK: microservice3-deployment (CPU 490m/500m) - target this one",
+        "expect_action": ["vertical_scaling"],  # horizontal won't help at max replicas
+        "expect_target": ["microservice3-deployment", "microservice1-deployment"],
     },
 ]
 
@@ -246,6 +270,7 @@ def main():
     total = 0
     valid = 0
     correct_action = 0
+    correct_target = 0
     latencies = []
 
     print(f"\n{'='*70}")
@@ -268,12 +293,29 @@ def main():
                 action = parsed.get("action", "")
                 dep = parsed.get("parameters", {}).get("deployment_name", "")
                 
-                # Check if action matches expected type
-                action_correct = (action == scenario.get("expect_action", ""))
-                if action_correct:
+                # Check if action matches expected type(s)
+                expect_actions = scenario.get("expect_action", [])
+                if isinstance(expect_actions, str):
+                    expect_actions = [expect_actions]
+                action_ok = action in expect_actions
+                if action_ok:
                     correct_action += 1
                 
-                icon = "✅" if action_correct else "⚠️ "
+                # Check if target deployment is correct
+                expect_targets = scenario.get("expect_target", [])
+                if isinstance(expect_targets, str):
+                    expect_targets = [expect_targets]
+                avoid_target = scenario.get("avoid_target", "")
+                
+                target_ok = True
+                if expect_targets and dep not in expect_targets:
+                    target_ok = False
+                if avoid_target and dep == avoid_target:
+                    target_ok = False
+                if target_ok and (expect_targets or avoid_target):
+                    correct_target += 1
+                
+                icon = "✅" if (action_ok and target_ok) else ("⚠️ " if action_ok else "🎯")
                 
                 detail = ""
                 if action == "horizontal_scaling":
@@ -281,8 +323,14 @@ def main():
                 elif action == "vertical_scaling":
                     detail = f"cpu={parsed['parameters'].get('cpu_limit')}"
                 
+                target_note = ""
+                if not target_ok:
+                    target_note = f" ← wrong target (expected: {expect_targets})"
+                if avoid_target and dep == avoid_target:
+                    target_note = f" ← should have avoided {avoid_target}"
+                
                 print(f"{icon} {scenario['name']}{run_label}")
-                print(f"   → {action} on {dep} ({detail}) [{latency:.1f}s]")
+                print(f"   → {action} on {dep} ({detail}) [{latency:.1f}s]{target_note}")
             else:
                 print(f"❌ {scenario['name']}{run_label}")
                 print(f"   → Error: {error} [{latency:.1f}s]")
@@ -295,20 +343,21 @@ def main():
     print(f"{'='*70}")
     print(f"SUMMARY")
     print(f"{'='*70}")
-    print(f"  Model:           {args.model}")
-    print(f"  Total tests:     {total}")
-    print(f"  Valid JSON:      {valid}/{total} ({100*valid/total:.0f}%)")
-    print(f"  Correct action:  {correct_action}/{total} ({100*correct_action/total:.0f}%)")
-    print(f"  Avg latency:     {sum(latencies)/len(latencies):.1f}s")
-    print(f"  Min/Max latency: {min(latencies):.1f}s / {max(latencies):.1f}s")
+    print(f"  Model:            {args.model}")
+    print(f"  Total tests:      {total}")
+    print(f"  Valid JSON:       {valid}/{total} ({100*valid/total:.0f}%)")
+    print(f"  Correct action:   {correct_action}/{total} ({100*correct_action/total:.0f}%)")
+    print(f"  Correct target:   {correct_target}/{total} ({100*correct_target/total:.0f}%)")
+    print(f"  Avg latency:      {sum(latencies)/len(latencies):.1f}s")
+    print(f"  Min/Max latency:  {min(latencies):.1f}s / {max(latencies):.1f}s")
     print(f"{'='*70}")
 
     if valid < total:
         print(f"\n⚠️  {total-valid} responses failed validation.")
         print("  Consider: ollama pull qwen2.5:3b  (or try phi3:3.8b or mistral:7b)")
     
-    if correct_action == total:
-        print("\n🎉 All responses were valid and picked the expected action type!")
+    if correct_action == total and correct_target == total:
+        print("\n🎉 All responses were valid with correct actions AND targets!")
 
 
 if __name__ == "__main__":

@@ -96,16 +96,16 @@ RULE: {what_to_do}
 
 DEPLOYMENTS:
 {deployments_table}
-
+{bottleneck_hint}
 LIMITS: {constraints}
 {history_section}
-EXAMPLES:
-- Too slow with 1 replica: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
-- Too slow, need more CPU: {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
-- Too fast with 3 replicas: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
-- Too fast, reduce CPU: {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"300m","memory_limit":"312Mi"}}}}
+IMPORTANT: Target the deployment with HIGHEST CPU usage in the table. Use "horizontal_scaling" to change replicas or "vertical_scaling" to change CPU/memory.
 
-Pick ONE deployment from the table above. Respond with ONLY a JSON object, nothing else.
+EXAMPLES:
+{{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
+{{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
+
+Respond with ONLY a JSON object. Target the busiest deployment.
 JSON:
 """
 
@@ -235,6 +235,9 @@ JSON:
         # Format deployments table
         deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
         
+        # Compute bottleneck hint to guide the LLM to the right deployment
+        bottleneck_hint = self._compute_bottleneck_hint(cluster_data, violation_type)
+        
         # Parse history for failed/successful deployments
         failed_deployments, successful_deployments = self._format_history_for_prompt(history, violation_type)
         
@@ -267,11 +270,72 @@ JSON:
             status=status,
             what_to_do=what_to_do,
             deployments_table=deployments_table,
+            bottleneck_hint=bottleneck_hint,
             constraints=constraints,
             history_section=history_section
         )
         
         return prompt
+    
+    def _compute_bottleneck_hint(self, cluster_data: dict, violation_type: str) -> str:
+        """
+        Identify the most likely bottleneck deployment and return a hint string.
+        
+        For UPPER violations: find the deployment with highest CPU usage ratio.
+        For LOWER violations: find the deployment with most replicas or lowest usage.
+        
+        This guides the small LLM toward the right target instead of picking randomly.
+        """
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        if not deployments:
+            return ""
+        
+        # Filter to valid deployments
+        valid_deps = []
+        for d in deployments:
+            name = d.get("name", "")
+            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
+                continue
+            valid_deps.append(d)
+        
+        if not valid_deps:
+            return ""
+        
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+            # Find deployment with highest CPU usage (the bottleneck)
+            def cpu_usage_ratio(d):
+                usage = d.get("cpu_usage", "0m")
+                limit = d.get("cpu_limit", "1000m")
+                try:
+                    u = int(str(usage).replace("m", "").strip())
+                except (ValueError, TypeError):
+                    u = 0
+                try:
+                    l = int(str(limit).replace("m", "").strip())
+                except (ValueError, TypeError):
+                    l = 1000
+                return u / max(l, 1)
+            
+            busiest = max(valid_deps, key=cpu_usage_ratio)
+            ratio = cpu_usage_ratio(busiest)
+            if ratio > 0.5:
+                return f"BOTTLENECK: {busiest['name']} (CPU {busiest.get('cpu_usage', '?')}/{busiest.get('cpu_limit', '?')}) - target this one"
+            else:
+                return ""
+        else:
+            # LOWER: find deployment with most replicas (can be scaled down)
+            def replica_count(d):
+                return d.get("replicas_ready", d.get("replicas_desired", 1))
+            
+            biggest = max(valid_deps, key=replica_count)
+            reps = replica_count(biggest)
+            if reps > 1:
+                return f"OVER-PROVISIONED: {biggest['name']} has {reps} replicas - target this one"
+            else:
+                return ""
     
     def _build_retry_prompt(self, previous_response: str, error_reason: str) -> str:
         """
@@ -550,10 +614,18 @@ JSON:"""
             "scale": "horizontal_scaling",
             "scale_up": "horizontal_scaling",
             "scale_down": "horizontal_scaling",
+            "increase_replicas": "horizontal_scaling",
+            "decrease_replicas": "horizontal_scaling",
+            "add_replicas": "horizontal_scaling",
+            "remove_replicas": "horizontal_scaling",
+            "replicas": "horizontal_scaling",
             "vertical_scaling": "vertical_scaling",
             "verticalscaling": "vertical_scaling",
             "resources": "vertical_scaling",
             "resize": "vertical_scaling",
+            "increase_cpu": "vertical_scaling",
+            "decrease_cpu": "vertical_scaling",
+            "cpu_scaling": "vertical_scaling",
             "service_placement": "service_placement",
             "serviceplacement": "service_placement",
             "placement": "service_placement",
