@@ -175,7 +175,7 @@ def start_locust_on_master(user, master, initial_users, spawn_rate, total_durati
 
 def change_locust_load(master, target_users, spawn_rate):
     """Change the number of Locust users via REST API on the master node."""
-    data = urllib.parse.urlencode({
+    payload = json.dumps({
         "user_count": target_users,
         "spawn_rate": spawn_rate,
     }).encode()
@@ -183,14 +183,26 @@ def change_locust_load(master, target_users, spawn_rate):
     try:
         req = urllib.request.Request(
             f"http://{master}:{LOCUST_WEB_PORT}/swarm",
-            data=data,
-            method="PATCH"
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
         )
-        urllib.request.urlopen(req, timeout=5)
+        response = urllib.request.urlopen(req, timeout=10)
         return True
     except Exception as e:
-        print(f"  ⚠️  Failed to change Locust load: {e}")
-        return False
+        # Try PUT as fallback
+        try:
+            req = urllib.request.Request(
+                f"http://{master}:{LOCUST_WEB_PORT}/swarm",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="PUT"
+            )
+            response = urllib.request.urlopen(req, timeout=10)
+            return True
+        except Exception as e2:
+            print(f"  ⚠️  Failed to change Locust load: POST={e}, PUT={e2}")
+            return False
 
 
 def stop_locust_on_master(user, master):
@@ -204,24 +216,39 @@ def stop_locust_on_master(user, master):
 def collect_locust_results(user, master, results_dir):
     """Copy Locust CSV results from master to local results directory."""
     print("  📥 Collecting Locust results from master...")
-    csv_files = ["locust_results_stats.csv", "locust_results_stats_history.csv",
-                 "locust_results_failures.csv", "locust_results_exceptions.csv"]
-
-    for f in csv_files:
-        result = subprocess.run(
-            ["scp", "-o", "StrictHostKeyChecking=no",
-             f"{user}@{master}:~/{f}", results_dir],
-            capture_output=True, timeout=30
-        )
-        if result.returncode == 0:
-            print(f"    ✅ {f}")
+    
+    # First, list what CSV files actually exist
+    result = ssh_cmd(user, master, "ls ~/locust_results*.csv 2>/dev/null || echo 'NO_FILES'", timeout=15)
+    if "NO_FILES" in result.stdout:
+        print("    ⚠️  No Locust CSV files found on master")
+        return
+    
+    files = result.stdout.strip().split("\n")
+    for remote_path in files:
+        remote_path = remote_path.strip()
+        if not remote_path:
+            continue
+        filename = os.path.basename(remote_path)
+        try:
+            subprocess.run(
+                ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                 f"{user}@{master}:{remote_path}", results_dir],
+                capture_output=True, timeout=60
+            )
+            print(f"    ✅ {filename}")
+        except Exception as e:
+            print(f"    ⚠️  Failed to copy {filename}: {e}")
 
     # Also grab the locust log
-    subprocess.run(
-        ["scp", "-o", "StrictHostKeyChecking=no",
-         f"{user}@{master}:~/locust.log", os.path.join(results_dir, "locust.log")],
-        capture_output=True, timeout=30
-    )
+    try:
+        subprocess.run(
+            ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+             f"{user}@{master}:~/locust.log", os.path.join(results_dir, "locust.log")],
+            capture_output=True, timeout=60
+        )
+        print("    ✅ locust.log")
+    except Exception:
+        pass
 
 
 def start_intent_loop(config_path, duration_minutes, results_dir, debug_llm=False):
