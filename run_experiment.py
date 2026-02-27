@@ -93,8 +93,8 @@ def reset_cluster(config_path: str):
 
         # Get actual container name from the deployment
         result = ssh_cmd(user, master,
-            f"kubectl get deployment {name} -o jsonpath='{{.spec.template.spec.containers[0].name}}'")
-        container_name = result.stdout.strip()
+            f'kubectl get deployment {name} -o jsonpath="{{.spec.template.spec.containers[0].name}}"')
+        container_name = result.stdout.strip().strip("'\"")
         if container_name:
             ssh_cmd(user, master,
                 f"kubectl set resources deployment {name} --limits=cpu={cpu},memory={mem} -c {container_name}")
@@ -124,13 +124,13 @@ def start_locust_on_master(user, master, initial_users, spawn_rate, total_durati
     ssh_cmd(user, master, "pkill -f 'locust' 2>/dev/null || true")
     time.sleep(2)
 
-    # Start Locust in background via SSH with nohup
-    # Use bash -c and disown to ensure SSH returns immediately
-    locust_cmd = (
-        f"bash -c '"
-        f"source ~/locust-env/bin/activate && "
-        f"cd ~ && "
-        f"nohup locust -f ~/locustfile.py "
+    # Write a startup script on the master, then execute it
+    # This avoids all quoting issues with nested SSH commands
+    startup_script = (
+        f"#!/bin/bash\n"
+        f"source ~/locust-env/bin/activate\n"
+        f"cd ~\n"
+        f"locust -f ~/locustfile.py "
         f"--host http://192.168.100.100:5001 "
         f"-u {initial_users} -r {spawn_rate} "
         f"--run-time {total_duration}s "
@@ -139,20 +139,23 @@ def start_locust_on_master(user, master, initial_users, spawn_rate, total_durati
         f"--autoquit 30 "
         f"--csv ~/locust_results "
         f"--csv-full-history "
-        f"> ~/locust.log 2>&1 & disown"
-        f"'"
+        f"> ~/locust.log 2>&1\n"
     )
 
-    # Use subprocess.Popen directly so we don't wait for SSH to finish
-    ssh_process = subprocess.Popen(
+    # Write the script to master
+    write_cmd = f"cat > ~/start_locust.sh << 'SCRIPT_EOF'\n{startup_script}SCRIPT_EOF"
+    ssh_cmd(user, master, write_cmd, timeout=10)
+    ssh_cmd(user, master, "chmod +x ~/start_locust.sh", timeout=10)
+
+    # Launch the script in background using nohup + ssh -f
+    subprocess.Popen(
         ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-         f"{user}@{master}", locust_cmd],
+         "-f", f"{user}@{master}",
+         "nohup ~/start_locust.sh &"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    # Give it a moment to launch, then detach
     time.sleep(3)
-    ssh_process.poll()  # Check if it finished (it should have)
 
     # Wait for Locust web API to become available
     locust_api = f"http://{master}:{LOCUST_WEB_PORT}/stats/requests"
