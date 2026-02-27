@@ -111,23 +111,41 @@ def start_locust(load_pattern, interval, spawn_rate, results_dir, locustfile="lo
     locust_cmd = [
         "python3", "-m", "locust",
         "-f", locustfile,
-        "--headless",
         "--host", "ssh://master",
         "-u", str(initial_users),
         "-r", str(spawn_rate),
         "--run-time", f"{total_duration}s",
         "--csv", csv_prefix,
         "--csv-full-history",
+        "--web-port", "8089",       # REST API for changing load
+        "--autostart",              # Start test immediately, keep web UI alive
+        "--autoquit", "10",         # Quit 10s after test finishes
     ]
+
+    # Log Locust output to file for debugging
+    locust_log = open(os.path.join(results_dir, "locust.log"), "w")
 
     locust_proc = subprocess.Popen(
         locust_cmd,
-        stdout=subprocess.PIPE,
+        stdout=locust_log,
         stderr=subprocess.STDOUT,
         text=True
     )
 
-    return locust_proc, total_duration
+    # Wait for Locust web API to become available
+    print("  ⏳ Waiting for Locust web API...")
+    import urllib.request
+    for attempt in range(30):
+        try:
+            urllib.request.urlopen("http://localhost:8089/stats/requests", timeout=2)
+            print("  ✅ Locust web API ready")
+            break
+        except Exception:
+            time.sleep(1)
+    else:
+        print("  ⚠️  Locust web API not available after 30s, load changes may fail")
+
+    return locust_proc, total_duration, locust_log
 
 
 def change_locust_load(target_users, spawn_rate):
@@ -321,7 +339,7 @@ def main():
     time.sleep(5)
 
     # Step 3: Start Locust
-    locust_proc, _ = start_locust(
+    locust_proc, _, locust_log = start_locust(
         load_pattern=load_pattern,
         interval=args.interval,
         spawn_rate=args.spawn_rate,
@@ -356,6 +374,7 @@ def main():
         print("  ✅ Intent Watch Loop stopped")
 
         intent_log.close()
+        locust_log.close()
 
         # Step 6: Summary
         collect_summary(results_dir, load_pattern, args.interval)

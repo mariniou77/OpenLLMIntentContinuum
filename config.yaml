@@ -4,7 +4,7 @@
 intent:
   upper_threshold: 3.0    # seconds - trigger scale UP if response time exceeds this
   lower_threshold: 1.0    # seconds - trigger scale DOWN if response time below this
-  ema_alpha: 0.02         # smoothing factor for Exponential Moving Average
+  ema_alpha: 0.1          # smoothing factor for Exponential Moving Average
   check_interval: 5       # seconds between checks
   wait_after_action: 60   # seconds to wait after taking an action
 

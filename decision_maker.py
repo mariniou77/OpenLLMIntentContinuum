@@ -267,7 +267,22 @@ JSON:
             what_to_do = "INCREASE replicas (e.g., 1->2) OR INCREASE cpu_limit (e.g., 300m->500m)"
         else:
             status = "TOO FAST - must slow down to save resources"
-            what_to_do = "DECREASE replicas (e.g., 2->1, min=1) OR DECREASE cpu_limit (e.g., 500m->300m, min=100m)"
+            
+            # Check if all deployments are already at 1 replica
+            deployments = cluster_data.get("deployments", {}).get("list", [])
+            if not deployments:
+                deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+            
+            all_at_min_replicas = all(
+                d.get("replicas_ready", d.get("replicas_desired", 1)) <= 1
+                for d in deployments
+                if d.get("name", "").lower() in self.valid_deployment_names
+            )
+            
+            if all_at_min_replicas:
+                what_to_do = "DECREASE cpu_limit (e.g., 500m->300m, min=100m) using vertical_scaling. All deployments already have 1 replica so do NOT use horizontal_scaling."
+            else:
+                what_to_do = "DECREASE replicas (e.g., 2->1, min=1) OR DECREASE cpu_limit (e.g., 500m->300m, min=100m)"
         
         # Format deployments table
         deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
@@ -989,50 +1004,67 @@ JSON:"""
         
         This safety net helps overcome limitations of smaller LLMs that may not 
         learn from feedback in the history.
+        
+        NOTE: Only WORSENED outcomes count as failures. NO_CHANGE outcomes are
+        not counted because with low EMA alpha, even successful actions may
+        appear as NO_CHANGE before EMA catches up.
         """
         if action['action'] == 'none':
             return action
         
-        # Count failures in history
-        failed_count = history.count("WORSENED") + history.count("NO_CHANGE")
+        # Count only genuine failures (WORSENED), not NO_CHANGE
+        # NO_CHANGE with low alpha may just mean EMA hasn't caught up yet
+        failed_count = history.count("WORSENED")
         
         # Track failures for the specific deployment
         same_deployment_failures = 0
         if action['action'] in ('horizontal_scaling', 'vertical_scaling'):
             dep_name = action['parameters'].get('deployment_name', '')
             if dep_name and dep_name in history:
-                same_deployment_failures = history.count(dep_name)
+                # Count only WORSENED lines that mention this deployment
+                for line in history.split('\n'):
+                    if dep_name in line and 'WORSENED' in line:
+                        same_deployment_failures += 1
         
-        # If we see 3+ failures with horizontal_scaling, try vertical_scaling
+        # If we see 3+ WORSENED failures with horizontal_scaling, try vertical_scaling
         if failed_count >= 3 and action['action'] == 'horizontal_scaling' and self.actions_enabled.get('vertical_scaling', False):
             dep_name = action['parameters'].get('deployment_name', '')
             if not dep_name:
                 return action
                 
-            logger.warning(f"Detected {failed_count} failed attempts. Switching to vertical_scaling.")
+            logger.warning(f"Detected {failed_count} WORSENED attempts. Switching to vertical_scaling.")
+            
+            # Get current limits for this deployment to make a proportional change
+            current_cpu = self._get_current_cpu_limit(dep_name, cluster_data)
             
             if violation_type == "LOWER_THRESHOLD_EXCEEDED":
+                # Reduce by ~30% but not below 100m
+                new_cpu = max(100, int(current_cpu * 0.7))
+                new_mem = max(128, new_cpu + 12)
                 return {
                     "action": "vertical_scaling",
                     "parameters": {
                         "deployment_name": dep_name,
-                        "cpu_limit": "100m",
-                        "memory_limit": "128Mi"
+                        "cpu_limit": f"{new_cpu}m",
+                        "memory_limit": f"{new_mem}Mi"
                     },
-                    "adjusted_reason": "Switched from repeated failed horizontal_scaling"
+                    "adjusted_reason": "Switched from repeated WORSENED horizontal_scaling"
                 }
             else:
+                # Increase by ~30% but not above 1000m
+                new_cpu = min(1000, int(current_cpu * 1.3))
+                new_mem = min(1024, new_cpu + 12)
                 return {
                     "action": "vertical_scaling",
                     "parameters": {
                         "deployment_name": dep_name,
-                        "cpu_limit": "1000m",
-                        "memory_limit": "1024Mi"
+                        "cpu_limit": f"{new_cpu}m",
+                        "memory_limit": f"{new_mem}Mi"
                     },
-                    "adjusted_reason": "Switched from repeated failed horizontal_scaling"
+                    "adjusted_reason": "Switched from repeated WORSENED horizontal_scaling"
                 }
         
-        # If same deployment failed 2+ times, try a different deployment
+        # If same deployment WORSENED 2+ times, try a different deployment
         if same_deployment_failures >= 2 and action['action'] == 'horizontal_scaling':
             try:
                 deployments = cluster_data.get('deployments', {}).get('list', [])
@@ -1061,17 +1093,32 @@ JSON:"""
                     else:
                         new_replicas = replicas + 1
                     
-                    logger.warning(f"Same deployment failed {same_deployment_failures} times. Trying {dep_name} instead.")
+                    logger.warning(f"Same deployment WORSENED {same_deployment_failures} times. Trying {dep_name} instead.")
                     return {
                         "action": "horizontal_scaling",
                         "parameters": {
                             "deployment_name": dep_name,
                             "replicas": new_replicas
                         },
-                        "adjusted_reason": f"Switched from {current_dep} due to repeated failures"
+                        "adjusted_reason": f"Switched from {current_dep} due to repeated WORSENED outcomes"
                     }
         
         return action
+    
+    def _get_current_cpu_limit(self, deployment_name: str, cluster_data: dict) -> int:
+        """Get current CPU limit in millicores for a deployment."""
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        for d in deployments:
+            if d.get("name", "").lower() == deployment_name.lower():
+                cpu_str = str(d.get("cpu_limit", "300m")).replace("m", "").strip()
+                try:
+                    return int(cpu_str)
+                except ValueError:
+                    return 300
+        return 300
     
     def is_healthy(self) -> bool:
         """Check if Ollama is responding."""
