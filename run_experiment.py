@@ -125,7 +125,9 @@ def start_locust_on_master(user, master, initial_users, spawn_rate, total_durati
     time.sleep(2)
 
     # Start Locust in background via SSH with nohup
+    # Use bash -c and disown to ensure SSH returns immediately
     locust_cmd = (
+        f"bash -c '"
         f"source ~/locust-env/bin/activate && "
         f"cd ~ && "
         f"nohup locust -f ~/locustfile.py "
@@ -137,10 +139,20 @@ def start_locust_on_master(user, master, initial_users, spawn_rate, total_durati
         f"--autoquit 30 "
         f"--csv ~/locust_results "
         f"--csv-full-history "
-        f"> ~/locust.log 2>&1 &"
+        f"> ~/locust.log 2>&1 & disown"
+        f"'"
     )
 
-    ssh_cmd(user, master, locust_cmd, timeout=10)
+    # Use subprocess.Popen directly so we don't wait for SSH to finish
+    ssh_process = subprocess.Popen(
+        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+         f"{user}@{master}", locust_cmd],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Give it a moment to launch, then detach
+    time.sleep(3)
+    ssh_process.poll()  # Check if it finished (it should have)
 
     # Wait for Locust web API to become available
     locust_api = f"http://{master}:{LOCUST_WEB_PORT}/stats/requests"
