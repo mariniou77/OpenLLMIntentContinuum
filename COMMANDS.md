@@ -457,6 +457,11 @@ nohup ~/sflow-rt/start.sh > sflow-rt.log 2>&1 &
 curl http://localhost:8008/version
 ```
 
+**6. "Activate Locust environment on Master"**
+```bash
+source ~/locust-env/bin/activate
+```
+
 **6. Tests fail with "State may not be fully reverted"**
 - This warning is usually harmless - it means node assignments changed during pod recreation
 - The actual resources/replicas are correctly reverted

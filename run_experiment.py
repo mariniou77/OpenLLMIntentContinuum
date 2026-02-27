@@ -4,10 +4,10 @@ IntentContinuum Experiment Runner
 
 Orchestrates the full experiment:
 1. Resets the cluster to initial state
-2. Starts Locust with a staged load pattern
-3. Starts main.py (Intent Watch Loop) in parallel
-4. Collects results from both
-5. Generates summary
+2. Starts Locust on the MASTER node via SSH (direct HTTP access to app)
+3. Starts main.py (Intent Watch Loop) locally on SDN controller
+4. Changes Locust load via REST API at each interval
+5. Collects results and generates summary
 
 Usage:
     python3 run_experiment.py                          # Default: computing experiment
@@ -24,6 +24,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +35,7 @@ from pathlib import Path
 DEFAULT_LOAD_PATTERN = [10, 20, 15, 10, 5, 20, 10]
 DEFAULT_INTERVAL = 120  # seconds between load changes
 DEFAULT_SPAWN_RATE = 1  # users per second
+LOCUST_WEB_PORT = 8089
 
 
 def parse_args():
@@ -48,14 +51,33 @@ def parse_args():
     return parser.parse_args()
 
 
+def get_master_info(config_path: str):
+    """Read master node connection info from config."""
+    import yaml
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+    master = config["endpoints"]["kubernetes_master"]
+    user = config["endpoints"]["kubernetes_user"]
+    return user, master
+
+
+def ssh_cmd(user, host, command, timeout=30):
+    """Run a command on a remote host via SSH."""
+    result = subprocess.run(
+        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+         f"{user}@{host}", command],
+        capture_output=True, text=True, timeout=timeout
+    )
+    return result
+
+
 def reset_cluster(config_path: str):
     """Reset all deployments to their initial state from config."""
     import yaml
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    master = config["endpoints"]["kubernetes_master"]
-    user = config["endpoints"]["kubernetes_user"]
+    user, master = get_master_info(config_path)
     deployments = config.get("kubernetes", {}).get("deployments", [])
 
     print("\n🔄 Resetting cluster to initial state...")
@@ -66,93 +88,78 @@ def reset_cluster(config_path: str):
         replicas = dep.get("min_replicas", 1)
 
         # Reset replicas
-        cmd = f"kubectl scale deployment {name} --replicas={replicas}"
-        subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", f"{user}@{master}", cmd],
-            capture_output=True, timeout=30
-        )
+        ssh_cmd(user, master, f"kubectl scale deployment {name} --replicas={replicas}")
         print(f"  ✅ {name}: replicas={replicas}")
 
-        # Reset resources
-        cmd = f"kubectl set resources deployment {name} --limits=cpu={cpu},memory={mem} -c {name.replace('-deployment', '')}"
-        subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", f"{user}@{master}", cmd],
-            capture_output=True, timeout=30
-        )
-        print(f"  ✅ {name}: cpu={cpu}, memory={mem}")
+        # Get actual container name from the deployment
+        result = ssh_cmd(user, master,
+            f"kubectl get deployment {name} -o jsonpath='{{.spec.template.spec.containers[0].name}}'")
+        container_name = result.stdout.strip()
+        if container_name:
+            ssh_cmd(user, master,
+                f"kubectl set resources deployment {name} --limits=cpu={cpu},memory={mem} -c {container_name}")
+            print(f"  ✅ {name}: cpu={cpu}, memory={mem} (container: {container_name})")
+        else:
+            print(f"  ⚠️  {name}: could not determine container name, skipping resource reset")
 
     # Wait for pods to stabilize
     print("  ⏳ Waiting 30s for pods to stabilize...")
     time.sleep(30)
 
     # Verify pods are running
-    cmd = "kubectl get pods --no-headers | grep -c Running"
-    result = subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=no", f"{user}@{master}", cmd],
-        capture_output=True, text=True, timeout=30
-    )
+    result = ssh_cmd(user, master, "kubectl get pods --no-headers | grep -c Running")
     running = result.stdout.strip()
     print(f"  ✅ {running} pods running")
 
 
-def start_locust(load_pattern, interval, spawn_rate, results_dir, locustfile="locustfile.py"):
+def start_locust_on_master(user, master, initial_users, spawn_rate, total_duration):
     """
-    Start Locust in headless mode with staged load changes.
-
-    Locust runs as a background process. We use its command-line interface
-    for the initial user count and then change load via the REST API.
+    Start Locust on the master node via SSH.
+    Locust runs in the background with web UI enabled for REST API control.
+    The locustfile.py must already exist on the master at ~/locustfile.py.
     """
-    total_duration = len(load_pattern) * interval
-    initial_users = load_pattern[0]
-    csv_prefix = os.path.join(results_dir, "locust")
+    print(f"\n🦗 Starting Locust on master node ({master})...")
 
-    print(f"\n🦗 Starting Locust (initial={initial_users} users, duration={total_duration}s)...")
+    # Kill any existing Locust process
+    ssh_cmd(user, master, "pkill -f 'locust' 2>/dev/null || true")
+    time.sleep(2)
 
-    locust_cmd = [
-        "python3", "-m", "locust",
-        "-f", locustfile,
-        "--host", "ssh://master",
-        "-u", str(initial_users),
-        "-r", str(spawn_rate),
-        "--run-time", f"{total_duration}s",
-        "--csv", csv_prefix,
-        "--csv-full-history",
-        "--web-port", "8089",       # REST API for changing load
-        "--autostart",              # Start test immediately, keep web UI alive
-        "--autoquit", "10",         # Quit 10s after test finishes
-    ]
-
-    # Log Locust output to file for debugging
-    locust_log = open(os.path.join(results_dir, "locust.log"), "w")
-
-    locust_proc = subprocess.Popen(
-        locust_cmd,
-        stdout=locust_log,
-        stderr=subprocess.STDOUT,
-        text=True
+    # Start Locust in background via SSH with nohup
+    locust_cmd = (
+        f"source ~/locust-env/bin/activate && "
+        f"cd ~ && "
+        f"nohup locust -f ~/locustfile.py "
+        f"--host http://192.168.100.100:5001 "
+        f"-u {initial_users} -r {spawn_rate} "
+        f"--run-time {total_duration}s "
+        f"--web-port {LOCUST_WEB_PORT} "
+        f"--autostart "
+        f"--autoquit 30 "
+        f"--csv ~/locust_results "
+        f"--csv-full-history "
+        f"> ~/locust.log 2>&1 &"
     )
 
+    ssh_cmd(user, master, locust_cmd, timeout=10)
+
     # Wait for Locust web API to become available
-    print("  ⏳ Waiting for Locust web API...")
-    import urllib.request
+    locust_api = f"http://{master}:{LOCUST_WEB_PORT}/stats/requests"
+    print(f"  ⏳ Waiting for Locust web API at {locust_api}...")
     for attempt in range(30):
         try:
-            urllib.request.urlopen("http://localhost:8089/stats/requests", timeout=2)
-            print("  ✅ Locust web API ready")
-            break
+            response = urllib.request.urlopen(locust_api, timeout=3)
+            data = json.loads(response.read())
+            print(f"  ✅ Locust web API ready (state: {data.get('state', 'unknown')})")
+            return True
         except Exception:
             time.sleep(1)
-    else:
-        print("  ⚠️  Locust web API not available after 30s, load changes may fail")
 
-    return locust_proc, total_duration, locust_log
+    print("  ❌ Locust web API not available after 30s")
+    return False
 
 
-def change_locust_load(target_users, spawn_rate):
-    """Change the number of Locust users via REST API."""
-    import urllib.request
-    import urllib.parse
-
+def change_locust_load(master, target_users, spawn_rate):
+    """Change the number of Locust users via REST API on the master node."""
     data = urllib.parse.urlencode({
         "user_count": target_users,
         "spawn_rate": spawn_rate,
@@ -160,7 +167,7 @@ def change_locust_load(target_users, spawn_rate):
 
     try:
         req = urllib.request.Request(
-            "http://localhost:8089/swarm",
+            f"http://{master}:{LOCUST_WEB_PORT}/swarm",
             data=data,
             method="PATCH"
         )
@@ -171,8 +178,39 @@ def change_locust_load(target_users, spawn_rate):
         return False
 
 
+def stop_locust_on_master(user, master):
+    """Stop Locust on the master node."""
+    print("  🦗 Stopping Locust on master...")
+    ssh_cmd(user, master, "pkill -f 'locust' 2>/dev/null || true")
+    time.sleep(2)
+    print("  ✅ Locust stopped")
+
+
+def collect_locust_results(user, master, results_dir):
+    """Copy Locust CSV results from master to local results directory."""
+    print("  📥 Collecting Locust results from master...")
+    csv_files = ["locust_results_stats.csv", "locust_results_stats_history.csv",
+                 "locust_results_failures.csv", "locust_results_exceptions.csv"]
+
+    for f in csv_files:
+        result = subprocess.run(
+            ["scp", "-o", "StrictHostKeyChecking=no",
+             f"{user}@{master}:~/{f}", results_dir],
+            capture_output=True, timeout=30
+        )
+        if result.returncode == 0:
+            print(f"    ✅ {f}")
+
+    # Also grab the locust log
+    subprocess.run(
+        ["scp", "-o", "StrictHostKeyChecking=no",
+         f"{user}@{master}:~/locust.log", os.path.join(results_dir, "locust.log")],
+        capture_output=True, timeout=30
+    )
+
+
 def start_intent_loop(config_path, duration_minutes, results_dir, debug_llm=False):
-    """Start main.py in background."""
+    """Start main.py in background on the SDN controller."""
     output_file = os.path.join(results_dir, "intent_results.json")
 
     cmd = [
@@ -187,9 +225,7 @@ def start_intent_loop(config_path, duration_minutes, results_dir, debug_llm=Fals
 
     print(f"\n🧠 Starting Intent Watch Loop (duration={duration_minutes}min)...")
 
-    # Redirect output to a log file
     log_file = open(os.path.join(results_dir, "intent_loop.log"), "w")
-
     intent_proc = subprocess.Popen(
         cmd,
         stdout=log_file,
@@ -199,29 +235,27 @@ def start_intent_loop(config_path, duration_minutes, results_dir, debug_llm=Fals
     return intent_proc, log_file
 
 
-def run_load_schedule(load_pattern, interval, spawn_rate):
-    """
-    Execute the staged load pattern by changing Locust user count at intervals.
-    The first stage is already set when Locust starts, so we start from stage 1.
-    """
+def run_load_schedule(master, load_pattern, interval, spawn_rate):
+    """Execute the staged load pattern by changing Locust user count at intervals."""
     print(f"\n📊 Load Schedule:")
     for i, users in enumerate(load_pattern):
         start = i * interval
         end = start + interval
         print(f"  [{start:>4}s - {end:>4}s] → {users} users")
 
-    # Wait for Locust to fully start
+    # Wait for Locust to fully ramp up initial users
     time.sleep(10)
 
     for i, users in enumerate(load_pattern):
         if i == 0:
-            # First stage already set at Locust startup
             print(f"\n⏱️  Stage 1/{len(load_pattern)}: {users} users (already active)")
-            remaining = interval - 10  # We already waited 10s
+            remaining = interval - 10
             time.sleep(max(0, remaining))
         else:
             print(f"\n⏱️  Stage {i+1}/{len(load_pattern)}: changing to {users} users")
-            change_locust_load(users, spawn_rate)
+            success = change_locust_load(master, users, spawn_rate)
+            if success:
+                print(f"  ✅ Load changed to {users} users")
             time.sleep(interval)
 
 
@@ -259,15 +293,14 @@ def collect_summary(results_dir, load_pattern, interval):
         print("  ⚠️  No intent results found")
 
     # Locust stats
-    locust_stats = os.path.join(results_dir, "locust_stats.csv")
+    locust_stats = os.path.join(results_dir, "locust_results_stats.csv")
     if os.path.exists(locust_stats):
-        print(f"\n  Locust stats saved to: {locust_stats}")
-    
-    locust_history = os.path.join(results_dir, "locust_stats_history.csv")
-    if os.path.exists(locust_history):
-        print(f"  Locust history saved to: {locust_history}")
+        print(f"\n  Locust stats: {locust_stats}")
 
-    # Intent loop log
+    locust_history = os.path.join(results_dir, "locust_results_stats_history.csv")
+    if os.path.exists(locust_history):
+        print(f"  Locust history: {locust_history}")
+
     log_file = os.path.join(results_dir, "intent_loop.log")
     if os.path.exists(log_file):
         print(f"  Intent loop log: {log_file}")
@@ -288,6 +321,9 @@ def main():
     total_duration_s = len(load_pattern) * args.interval
     total_duration_min = total_duration_s / 60
 
+    # Get master connection info
+    user, master = get_master_info(args.config)
+
     # Create experiment name and results directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     exp_name = args.name or f"experiment_{timestamp}"
@@ -303,6 +339,7 @@ def main():
         "spawn_rate": args.spawn_rate,
         "total_duration_seconds": total_duration_s,
         "config_file": args.config,
+        "master_node": master,
     }
     with open(os.path.join(results_dir, "experiment_config.json"), "w") as f:
         json.dump(exp_config, f, indent=2)
@@ -315,6 +352,8 @@ def main():
     print(f"  Interval: {args.interval}s between changes")
     print(f"  Spawn rate: {args.spawn_rate} user/s")
     print(f"  Total duration: {total_duration_s}s ({total_duration_min:.1f} min)")
+    print(f"  Master node: {user}@{master}")
+    print(f"  Locust: runs on master, controlled via REST API")
     print(f"  Results dir: {results_dir}/")
 
     if args.dry_run:
@@ -327,54 +366,58 @@ def main():
     else:
         print("\n⏭️  Skipping cluster reset")
 
-    # Step 2: Start Intent Watch Loop
+    # Step 2: Start Intent Watch Loop (on SDN controller)
     intent_proc, intent_log = start_intent_loop(
         config_path=args.config,
-        duration_minutes=int(total_duration_min) + 2,  # +2 min buffer
+        duration_minutes=int(total_duration_min) + 2,
         results_dir=results_dir,
         debug_llm=args.debug_llm,
     )
 
-    # Wait a moment for intent loop to initialize
+    # Wait for intent loop to initialize
     time.sleep(5)
 
-    # Step 3: Start Locust
-    locust_proc, _, locust_log = start_locust(
-        load_pattern=load_pattern,
-        interval=args.interval,
+    # Step 3: Start Locust on master node
+    locust_ok = start_locust_on_master(
+        user=user,
+        master=master,
+        initial_users=load_pattern[0],
         spawn_rate=args.spawn_rate,
-        results_dir=results_dir,
+        total_duration=total_duration_s,
     )
+
+    if not locust_ok:
+        print("❌ Failed to start Locust. Aborting experiment.")
+        intent_proc.send_signal(signal.SIGINT)
+        intent_proc.wait(timeout=15)
+        intent_log.close()
+        return
 
     # Step 4: Execute load schedule
     try:
-        run_load_schedule(load_pattern, args.interval, args.spawn_rate)
+        run_load_schedule(master, load_pattern, args.interval, args.spawn_rate)
     except KeyboardInterrupt:
         print("\n\n⚠️  Experiment interrupted by user")
     finally:
         # Step 5: Cleanup
         print("\n🛑 Stopping processes...")
 
-        # Stop Locust
-        if locust_proc.poll() is None:
-            locust_proc.send_signal(signal.SIGINT)
-            try:
-                locust_proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                locust_proc.kill()
-            print("  ✅ Locust stopped")
+        # Stop Locust on master
+        stop_locust_on_master(user, master)
 
-        # Wait for Intent Loop to finish (it has its own timer)
+        # Collect Locust results from master
+        collect_locust_results(user, master, results_dir)
+
+        # Wait for Intent Loop to finish
         print("  ⏳ Waiting for Intent Watch Loop to finish...")
         try:
-            intent_proc.wait(timeout=180)  # 3 min max wait
+            intent_proc.wait(timeout=180)
         except subprocess.TimeoutExpired:
             intent_proc.send_signal(signal.SIGINT)
             intent_proc.wait(timeout=15)
         print("  ✅ Intent Watch Loop stopped")
 
         intent_log.close()
-        locust_log.close()
 
         # Step 6: Summary
         collect_summary(results_dir, load_pattern, args.interval)
