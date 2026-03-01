@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────
 # These match config.yaml - adjust if your setup differs
-MASTER_HOST = os.environ.get("MASTER_HOST", "10.132.0.14")
+MASTER_HOST = os.environ.get("MASTER_HOST", "10.132.0.7")
 MASTER_USER = os.environ.get("MASTER_USER", "antonios-icontinuum")
 REMOTE_IMAGE = os.environ.get("REMOTE_IMAGE", "/home/antonios-icontinuum/test_converted.jpg")
 SDN_ENTRY_POINT = os.environ.get("SDN_ENTRY_POINT", "http://192.168.100.100:5001/resize")

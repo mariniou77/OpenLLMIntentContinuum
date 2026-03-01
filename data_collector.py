@@ -365,9 +365,9 @@ class DataCollector:
             "10.0.0.100": "master",
             "10.0.0.101": "worker1",
             "10.0.0.102": "worker2",
-            "10.132.0.14": "master",
-            "10.132.0.15": "worker1", 
-            "10.132.0.16": "worker2"
+            "10.132.0.7": "master",
+            "10.132.0.8": "worker1", 
+            "10.132.0.9": "worker2"
         }
         
         # Check if agent is a known IP
