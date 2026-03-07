@@ -1,19 +1,21 @@
-You are a Kubernetes resource manager. Pick ONE action to fix the problem.
-
 PROBLEM: EMA Response Time is {ema_rt}s (target: {lower_threshold}s-{upper_threshold}s)
-STATUS: {status}
-
-RULE: {what_to_do}
-
-CURRENT STATE:
-{deployments_table}
-{bottleneck_hint}
-LIMITS: {constraints}
 {history_section}
-Pick the deployment that needs adjustment. Use the exact deployment name in JSON.
+LIMITS: {constraints}
 
-EXAMPLES:
-{{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
-{{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
+STATE:
+{deployments_table}
+
+INSTRUCTIONS:
+1. Find the deployment with the highest CPU utilization percentage to be the target.
+2. Apply these rules to the target:
+   - IF RT > {upper_threshold}s AND CPU > 80%: action="vertical_scaling", set new cpu_limit to (current + 200m), keep current memory_limit.
+   - IF RT > {upper_threshold}s AND CPU <= 80%: action="horizontal_scaling", set new replicas to (current + 1).
+   - IF RT < {lower_threshold}s AND replicas > 1: action="horizontal_scaling", set new replicas to (current - 1).
+   - IF RT < {lower_threshold}s AND replicas == 1: action="vertical_scaling", set new cpu_limit to (current - 100m, min 100m), keep current memory_limit.
+
+ALLOWED JSON FORMATS:
+- {{"action": "vertical_scaling", "parameters": {{"deployment_name": "...", "cpu_limit": "...m", "memory_limit": "...Mi"}}}}
+- {{"action": "horizontal_scaling", "parameters": {{"deployment_name": "...", "replicas": 0}}}}
+- {{"action": "none", "parameters": {{}}}}
 
 JSON:

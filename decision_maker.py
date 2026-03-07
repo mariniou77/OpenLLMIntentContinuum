@@ -118,17 +118,16 @@ JSON:
 
     def _format_system_state(self, cluster_data: dict, network_data: dict, monitoring_data: dict) -> str:
         """
-        Format system state as a clear, labeled list for the prompt.
-        
-        Uses full deployment names and explicit metric labels.
-        No abbreviations — small LLMs understand explicit labels better.
-        Field names match the JSON output format (cpu_limit, memory_limit)
-        so the model learns the vocabulary from the input.
+        Format system state as a table for the prompt.
         
         Returns format like:
-        microservice1-deployment: replicas=2, cpu_usage=19m, cpu_limit=300m, memory_usage=50Mi, memory_limit=312Mi
+        | Deployment | Replicas | CPU Util | CPU Limit | Mem Limit |
+        |------------|----------|----------|-----------|-----------|
+        | ms1-dep    | 1        | 45%      | 300m      | 312Mi     |
         """
         lines = []
+        lines.append("| Deployment | Replicas | CPU Util | CPU Limit | Mem Limit |")
+        lines.append("|------------|----------|----------|-----------|-----------|")
         
         # Get deployments from cluster data
         deployments = cluster_data.get("deployments", {}).get("list", [])
@@ -144,17 +143,22 @@ JSON:
             
             replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
             cpu_limit = d.get("cpu_limit") or "unknown"
-            cpu_usage = d.get("cpu_usage") or "unknown"
+            cpu_usage = d.get("cpu_usage") or "0m"
             memory_limit = d.get("memory_limit") or "unknown"
-            memory_usage = d.get("memory_usage") or "unknown"
+            
+            # Calculate CPU utilization percentage
+            try:
+                usage_val = int(str(cpu_usage).replace("m", "").strip())
+                limit_val = int(str(cpu_limit).replace("m", "").strip())
+                cpu_pct = f"{int(usage_val / max(limit_val, 1) * 100)}%"
+            except (ValueError, TypeError):
+                cpu_pct = "N/A"
             
             lines.append(
-                f"{name}: replicas={replicas}, "
-                f"cpu_usage={cpu_usage}, cpu_limit={cpu_limit}, "
-                f"memory_usage={memory_usage}, memory_limit={memory_limit}"
+                f"| {name} | {replicas} | {cpu_pct} | {cpu_limit} | {memory_limit} |"
             )
         
-        return '\n'.join(lines) if lines else "No deployment data available"
+        return '\n'.join(lines) if len(lines) > 2 else "No deployment data available"
     
     @staticmethod
     def _expand_name(name: str) -> str:
@@ -259,70 +263,30 @@ JSON:
         history: str
     ) -> str:
         """
-        Build the prompt using the template file with few-shot examples.
-        """
-        # Determine the problem status and what to do
-        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
-            status = "TOO SLOW - must speed up"
-            what_to_do = "INCREASE replicas (e.g., 1->2) OR INCREASE cpu_limit (e.g., 300m->500m)"
-        else:
-            status = "TOO FAST - must slow down to save resources"
-            
-            # Check if all deployments are already at 1 replica
-            deployments = cluster_data.get("deployments", {}).get("list", [])
-            if not deployments:
-                deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
-            
-            all_at_min_replicas = all(
-                d.get("replicas_ready", d.get("replicas_desired", 1)) <= 1
-                for d in deployments
-                if d.get("name", "").lower() in self.valid_deployment_names
-            )
-            
-            if all_at_min_replicas:
-                what_to_do = "DECREASE cpu_limit (e.g., 500m->300m, min=100m) using vertical_scaling. All deployments already have 1 replica so do NOT use horizontal_scaling."
-            else:
-                what_to_do = "DECREASE replicas (e.g., 2->1, min=1) OR DECREASE cpu_limit (e.g., 500m->300m, min=100m)"
+        Build the prompt using the template file.
         
+        The template contains all decision rules so the LLM just needs to
+        follow instructions based on the data table provided.
+        """
         # Format deployments table
         deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
         
-        # Compute bottleneck hint to guide the LLM to the right deployment
-        bottleneck_hint = self._compute_bottleneck_hint(cluster_data, violation_type)
-        
-        # Parse history for failed/successful deployments
-        failed_deployments, successful_deployments = self._format_history_for_prompt(history, violation_type)
-        
-        # Build history section
-        history_section = ""
-        if violation_type == "UPPER_THRESHOLD_EXCEEDED" and failed_deployments:
-            history_section = "\nHISTORY (avoid these - they WORSENED):\n"
-            for dep in failed_deployments:
-                history_section += f"- {dep}: FAILED\n"
-            available = self._get_available_deployments(cluster_data, failed_deployments)
-            if available:
-                history_section += "TRY INSTEAD:\n" + '\n'.join(available) + "\n"
-        elif violation_type == "LOWER_THRESHOLD_EXCEEDED" and successful_deployments:
-            history_section = "\nHISTORY (these worked well):\n"
-            for dep in successful_deployments:
-                history_section += f"- {dep}: IMPROVED\n"
-        elif failed_deployments:
-            history_section = "\nHISTORY (avoid these):\n"
-            for dep in failed_deployments:
-                history_section += f"- {dep}: FAILED\n"
-        
         # Constraints
-        constraints = "Replicas: 1-5 | CPU: 100m-1000m | Memory: 128Mi-1024Mi"
+        constraints = "Max CPU 1000m, Max Replicas 5, Min CPU 100m, Min Replicas 1."
+        
+        # History section
+        history_section = ""
+        if history and history != "(none)":
+            history_section = f"HISTORY: {history}"
+        else:
+            history_section = "HISTORY: No previous actions."
         
         # Fill in the template
         prompt = self.prompt_template.format(
             ema_rt=f"{ema_rt:.2f}",
             lower_threshold=self.lower_threshold,
             upper_threshold=self.upper_threshold,
-            status=status,
-            what_to_do=what_to_do,
             deployments_table=deployments_table,
-            bottleneck_hint=bottleneck_hint,
             constraints=constraints,
             history_section=history_section
         )
@@ -418,21 +382,33 @@ JSON:"""
 
     def _query_ollama(self, prompt: str) -> Optional[str]:
         """
-        Send prompt to Ollama API and get response.
+        Send prompt to Ollama API using /api/chat with think:false.
+        
+        Uses the chat endpoint with system + user messages and disables
+        thinking mode for qwen3.x models to get direct JSON output.
         
         Args:
-            prompt: The complete prompt to send
+            prompt: The complete prompt to send as the user message
             
         Returns:
             LLM response text or None if failed
         """
-        url = f"{self.ollama_url}/api/generate"
+        url = f"{self.ollama_url}/api/chat"
         
         payload = {
             "model": self.model,
-            "prompt": prompt,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an automated Kubernetes controller. Output ONLY a single, valid, unformatted JSON object. Do not include markdown code blocks like ```json."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
             "stream": False,
-            "format": "json",
+            "think": False,
             "options": {
                 "temperature": self.temperature,
                 "num_predict": 256
@@ -453,7 +429,12 @@ JSON:"""
             response.raise_for_status()
             
             result = response.json()
-            llm_response = result.get("response", "")
+            llm_response = result.get("message", {}).get("content", "")
+            
+            # Log timing info
+            total_duration = result.get("total_duration", 0)
+            if total_duration:
+                logger.info(f"LLM response time: {total_duration / 1e9:.1f}s")
             
             if self.debug_llm:
                 logger.info("LLM DEBUG - RESPONSE:")
