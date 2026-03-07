@@ -41,9 +41,20 @@ class DataCollector:
         """
         self.config = config
         
+        # Build deployment defaults map from config
+        deployment_defaults = {}
+        for dep in config.get("kubernetes", {}).get("deployments", []):
+            dep_name = dep.get("name", "")
+            if dep_name:
+                deployment_defaults[dep_name] = {
+                    "cpu": dep.get("default_cpu", "300m"),
+                    "memory": dep.get("default_memory", "312Mi")
+                }
+        
         # Initialize utility clients
         self.k8s_client = KubernetesClient(
-            master_ip=config["endpoints"]["kubernetes_master"]
+            master_ip=config["endpoints"]["kubernetes_master"],
+            deployment_defaults=deployment_defaults
         )
         
         self.onos_client = ONOSClient(
@@ -53,7 +64,8 @@ class DataCollector:
         )
         
         self.sflow_client = SFlowRTClient(
-            base_url=config["endpoints"]["sflow_rt"]
+            base_url=config["endpoints"]["sflow_rt"],
+            sflow_config=config.get("sflow", {})
         )
         
         # Response time history storage
@@ -365,9 +377,9 @@ class DataCollector:
             "10.0.0.100": "master",
             "10.0.0.101": "worker1",
             "10.0.0.102": "worker2",
-            "10.132.0.14": "master",
-            "10.132.0.15": "worker1", 
-            "10.132.0.16": "worker2"
+            "10.132.0.7": "master",
+            "10.132.0.8": "worker1", 
+            "10.132.0.9": "worker2"
         }
         
         # Check if agent is a known IP

@@ -1,6 +1,7 @@
 # OpenLLMIntentContinuum - Command Reference Guide
 
 ## Table of Contents
+
 1. [Main System Commands](#1-main-system-commands)
 2. [Test Suite Commands](#2-test-suite-commands)
 3. [Individual Test Scripts](#3-individual-test-scripts)
@@ -107,6 +108,7 @@ python3 tests/test_horizontal_scaling_up.py
 ```
 
 **Configuration options** (edit at top of script):
+
 ```python
 DEPLOYMENT_NAME = "microservice1-deployment"  # Which deployment to scale
 TARGET_REPLICAS = 2                           # Target replica count
@@ -125,6 +127,7 @@ python3 tests/test_vertical_scaling_up.py
 ```
 
 **Configuration options** (edit at top of script):
+
 ```python
 DEPLOYMENT_NAME = "microservice1-deployment"  # Which deployment
 TARGET_CPU = "200m"                           # CPU limit (millicores)
@@ -144,6 +147,7 @@ python3 tests/test_service_placement_up.py
 ```
 
 **Configuration options** (edit at top of script):
+
 ```python
 DEPLOYMENT_NAME = "microservice3-deployment"  # Which deployment
 TARGET_NODE = "worker1"                       # Destination node
@@ -162,6 +166,7 @@ python3 tests/test_flow_scheduling_up.py
 ```
 
 **Configuration options** (edit at top of script):
+
 ```python
 SOURCE_SWITCH = "of:0000000000000001"         # Source switch ID
 DESTINATION_SWITCH = "of:0000000000000002"    # Destination switch ID
@@ -391,6 +396,26 @@ export OLLAMA_HOST=http://localhost:11434
 
 ## Quick Reference Card
 
+## 7. Locust Experiment
+
+To run the full experiment, open two SSH terminals to sdn-controller:
+
+### Terminal 1 — Locust
+
+```bash
+cd ~/OpenLLMIntentContinuum && source venv/bin/activate
+locust -f locustfile.py --headless --users 10 --spawn-rate 1 --run-time 900s --host ssh://master
+```
+
+### Terminal 2 — IntentContinuum
+
+```bash
+cd ~/OpenLLMIntentContinuum && source venv/bin/activate
+python3 main.py --time-window 15 --output experiment_full.json
+```
+
+Start Locust first, wait about 10 seconds for traffic to flow, then start main.py. Locust runs for 900 seconds (15 minutes) with 10 concurrent users. main.py monitors continuously until you stop it with Ctrl+C or until Locust stops.
+
 ### Most Common Commands
 
 | Task | Command |
@@ -424,18 +449,21 @@ export OLLAMA_HOST=http://localhost:11434
 ### Common Issues
 
 **1. "Deployment not found"**
+
 ```bash
 # Check actual deployment names
 ssh antonios-icontinuum@10.0.0.100 'sudo kubectl get deployments'
 ```
 
 **2. "ONOS connection failed"**
+
 ```bash
 # Check ONOS is running
 curl -u onos:rocks http://localhost:8181/onos/v1/devices
 ```
 
 **3. "LLM not responding"**
+
 ```bash
 # Check Ollama is running
 curl http://localhost:11434/api/tags
@@ -444,12 +472,14 @@ sudo systemctl restart ollama
 ```
 
 **4. "SSH connection failed"**
+
 ```bash
 # Test SSH to master node
 ssh -o StrictHostKeyChecking=no antonios-icontinuum@10.0.0.100 'echo OK'
 ```
 
 **5. "sflow-RT is not working"**
+
 ```bash
 # Start sflow-RT in the background
 nohup ~/sflow-rt/start.sh > sflow-rt.log 2>&1 & 
@@ -457,6 +487,13 @@ nohup ~/sflow-rt/start.sh > sflow-rt.log 2>&1 &
 curl http://localhost:8008/version
 ```
 
-**6. Tests fail with "State may not be fully reverted"**
+**6. "Activate Locust environment on Master"**
+
+```bash
+source venv/bin/activate
+```
+
+**7. Tests fail with "State may not be fully reverted"**
+
 - This warning is usually harmless - it means node assignments changed during pod recreation
 - The actual resources/replicas are correctly reverted

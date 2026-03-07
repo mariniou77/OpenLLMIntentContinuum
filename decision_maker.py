@@ -94,18 +94,17 @@ STATUS: {status}
 
 RULE: {what_to_do}
 
-DEPLOYMENTS:
+CURRENT STATE:
 {deployments_table}
 {bottleneck_hint}
 LIMITS: {constraints}
 {history_section}
-IMPORTANT: Target the deployment with HIGHEST CPU usage in the table. Use "horizontal_scaling" to change replicas or "vertical_scaling" to change CPU/memory.
+Pick the deployment that needs adjustment. Use the exact deployment name in JSON.
 
 EXAMPLES:
 {{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
 {{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
 
-Respond with ONLY a JSON object. Target the busiest deployment.
 JSON:
 """
 
@@ -119,37 +118,128 @@ JSON:
 
     def _format_system_state(self, cluster_data: dict, network_data: dict, monitoring_data: dict) -> str:
         """
-        Format system state as a deployments table for the prompt.
+        Format system state as a list for the prompt.
         
-        Returns a table format like:
-        | Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |
+        Combines:
+        - Kubernetes: deployment config (replicas, cpu_limit, memory_limit), pod-to-node mapping
+        - sFlow-RT: real-time pod CPU %, memory usage, network traffic
+        
+        Returns format like:
+        - microservice1-deployment (worker1): replicas=1, cpu=12.7%, cpu_limit=300m, mem=44Mi/312Mi, traffic_in=57KB/s
         """
         lines = []
         
-        # Get deployments from cluster data
+        # Get deployments from K8s (replicas, limits)
         deployments = cluster_data.get("deployments", {}).get("list", [])
-        
         if not deployments:
             deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
         
-        if deployments:
-            lines.append("| Name                       | Replicas | CPU Lim | CPU Used | Mem Lim | Mem Used |")
-            lines.append("|----------------------------|----------|---------|----------|---------|----------|")
+        # Get pods for node mapping
+        pods = cluster_data.get("pods", {}).get("list", [])
+        if not pods:
+            pods = cluster_data.get("data", {}).get("pods", {}).get("list", [])
+        
+        # Build deployment -> node mapping from K8s pods
+        dep_to_nodes = {}
+        for pod in pods:
+            pod_name = pod.get("name", "")
+            node = pod.get("node", "unknown")
+            # Skip pending pods (no node assigned)
+            if not node or node == "None":
+                continue
+            for dep in deployments:
+                dep_name = dep.get("name", "")
+                if dep_name and pod_name.startswith(dep_name):
+                    if dep_name not in dep_to_nodes:
+                        dep_to_nodes[dep_name] = []
+                    if node not in dep_to_nodes[dep_name]:
+                        dep_to_nodes[dep_name].append(node)
+        
+        # Get sFlow pod metrics (real-time CPU, memory, traffic)
+        sflow_pod_metrics = monitoring_data.get("pod_metrics", [])
+        
+        # Build deployment -> sFlow metrics mapping
+        dep_to_sflow = {}
+        for pm in sflow_pod_metrics:
+            dep_name = pm.get("deployment", "")
+            if dep_name:
+                if dep_name not in dep_to_sflow:
+                    dep_to_sflow[dep_name] = []
+                dep_to_sflow[dep_name].append(pm)
+        
+        for d in deployments:
+            name = d.get("name", "unknown")
+            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
+                continue
             
-            for d in deployments:
-                name = d.get("name", "unknown")
-                # Only include deployments that are in config
-                if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
-                    continue
-                    
-                replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
-                cpu_limit = d.get("cpu_limit") or "N/A"
-                memory_limit = d.get("memory_limit") or "N/A"
-                cpu_usage = d.get("cpu_usage") or "N/A"
-                memory_usage = d.get("memory_usage") or "N/A"
+            replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
+            cpu_limit = d.get("cpu_limit") or "unknown"
+            memory_limit = d.get("memory_limit") or "unknown"
+            
+            # Get node placement
+            nodes = dep_to_nodes.get(name, ["unknown"])
+            node_str = ", ".join(nodes)
+            
+            # Get sFlow metrics for this deployment
+            sflow_data = dep_to_sflow.get(name, [])
+            if sflow_data:
+                # Average across replicas
+                avg_cpu = sum(p["cpu_percent"] for p in sflow_data) / len(sflow_data)
+                avg_mem_used = sum(p["mem_used_bytes"] for p in sflow_data) / len(sflow_data)
+                avg_bytes_in = sum(p["bytes_in"] for p in sflow_data) / len(sflow_data)
                 
-                padded_name = name.ljust(26)
-                lines.append(f"| {padded_name} | {str(replicas).ljust(8)} | {str(cpu_limit).ljust(7)} | {str(cpu_usage).ljust(8)} | {str(memory_limit).ljust(7)} | {str(memory_usage).ljust(8)} |")
+                mem_used_mi = int(avg_mem_used / (1024 * 1024))
+                traffic_in_kb = int(avg_bytes_in / 1024)
+                
+                lines.append(
+                    f"- {name} ({node_str}): replicas={replicas}, "
+                    f"cpu={avg_cpu:.1f}%, cpu_limit={cpu_limit}, "
+                    f"mem={mem_used_mi}Mi/{memory_limit}, "
+                    f"traffic_in={traffic_in_kb}KB/s"
+                )
+            else:
+                # Fallback to kubectl top data if sFlow not available
+                cpu_usage = d.get("cpu_usage") or "0m"
+                memory_usage = d.get("memory_usage") or "0Mi"
+                lines.append(
+                    f"- {name} ({node_str}): replicas={replicas}, "
+                    f"cpu_usage={cpu_usage}, cpu_limit={cpu_limit}, "
+                    f"mem={memory_usage}/{memory_limit}"
+                )
+        
+        return '\n'.join(lines) if lines else "No deployment data available"
+    
+    @staticmethod
+    def _expand_name(name: str) -> str:
+        """
+        Expand short deployment names back to full Kubernetes names.
+        
+        Handles: ms1, ms2, ms3, ms4, microservice1, etc.
+        Returns the input unchanged if it's already a full name.
+        """
+        import re
+        name = str(name).strip().lower()
+        
+        # Already a full name
+        if name.endswith("-deployment") and "microservice" in name:
+            return name
+        
+        # ms1 -> microservice1-deployment
+        match = re.match(r'^ms(\d+)$', name)
+        if match:
+            return f"microservice{match.group(1)}-deployment"
+        
+        # microservice1 -> microservice1-deployment
+        match = re.match(r'^microservice(\d+)$', name)
+        if match:
+            return f"microservice{match.group(1)}-deployment"
+        
+        # microservice-1 -> microservice1-deployment
+        match = re.match(r'^microservice-(\d+)$', name)
+        if match:
+            return f"microservice{match.group(1)}-deployment"
+        
+        return name
         
         return '\n'.join(lines) if lines else "No deployment data available"
     
@@ -222,45 +312,28 @@ JSON:
         history: str
     ) -> str:
         """
-        Build the prompt using the template file with few-shot examples.
-        """
-        # Determine the problem status and what to do
-        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
-            status = "TOO SLOW - must speed up"
-            what_to_do = "INCREASE replicas (e.g., 1->2) OR INCREASE cpu_limit (e.g., 300m->500m)"
-        else:
-            status = "TOO FAST - must slow down to save resources"
-            what_to_do = "DECREASE replicas (e.g., 2->1, min=1) OR DECREASE cpu_limit (e.g., 500m->300m, min=100m)"
+        Build the prompt for LLM root cause analysis.
         
-        # Format deployments table
+        Provides the LLM with full system context and lets it reason
+        about the root cause and recommend an appropriate action.
+        """
+        # Status description
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+            status = f"TOO SLOW (above {self.upper_threshold}s). Response time needs to decrease."
+        else:
+            status = f"TOO FAST (below {self.lower_threshold}s). Resources are over-provisioned and being wasted."
+        
+        # Format deployments with node placement
         deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
         
-        # Compute bottleneck hint to guide the LLM to the right deployment
-        bottleneck_hint = self._compute_bottleneck_hint(cluster_data, violation_type)
+        # Format node-level metrics
+        node_metrics = self._format_node_metrics(monitoring_data)
         
-        # Parse history for failed/successful deployments
-        failed_deployments, successful_deployments = self._format_history_for_prompt(history, violation_type)
-        
-        # Build history section
-        history_section = ""
-        if violation_type == "UPPER_THRESHOLD_EXCEEDED" and failed_deployments:
-            history_section = "\nHISTORY (avoid these - they WORSENED):\n"
-            for dep in failed_deployments:
-                history_section += f"- {dep}: FAILED\n"
-            available = self._get_available_deployments(cluster_data, failed_deployments)
-            if available:
-                history_section += "TRY INSTEAD:\n" + '\n'.join(available) + "\n"
-        elif violation_type == "LOWER_THRESHOLD_EXCEEDED" and successful_deployments:
-            history_section = "\nHISTORY (these worked well):\n"
-            for dep in successful_deployments:
-                history_section += f"- {dep}: IMPROVED\n"
-        elif failed_deployments:
-            history_section = "\nHISTORY (avoid these):\n"
-            for dep in failed_deployments:
-                history_section += f"- {dep}: FAILED\n"
-        
-        # Constraints
-        constraints = "Replicas: 1-5 | CPU: 100m-1000m | Memory: 128Mi-1024Mi"
+        # History section
+        if history and history != "(none)":
+            history_section = f"PREVIOUS ACTIONS:\n{history}"
+        else:
+            history_section = "PREVIOUS ACTIONS: None yet."
         
         # Fill in the template
         prompt = self.prompt_template.format(
@@ -268,14 +341,49 @@ JSON:
             lower_threshold=self.lower_threshold,
             upper_threshold=self.upper_threshold,
             status=status,
-            what_to_do=what_to_do,
             deployments_table=deployments_table,
-            bottleneck_hint=bottleneck_hint,
-            constraints=constraints,
+            node_metrics=node_metrics,
             history_section=history_section
         )
         
         return prompt
+    
+    def _format_node_metrics(self, monitoring_data: dict) -> str:
+        """
+        Format node-level metrics for the prompt using sFlow-RT data.
+        
+        Args:
+            monitoring_data: Monitoring data dict from sFlow-RT
+            
+        Returns:
+            Formatted string like:
+            - master: CPU 12.8%, Memory 7.9%, Load 0.30
+            - worker1: CPU 7.1%, Memory 8.1%, Load 0.44, SDN bandwidth in: 173KB/s
+        """
+        node_metrics = monitoring_data.get("node_metrics", {})
+        sdn_bandwidth = monitoring_data.get("sdn_bandwidth", {})
+        
+        if not node_metrics:
+            return "- No node metrics available"
+        
+        lines = []
+        for name in sorted(node_metrics.keys()):
+            m = node_metrics[name]
+            parts = [
+                f"CPU {m.get('cpu', 0):.1f}%",
+                f"Memory {m.get('memory', 0):.1f}%",
+                f"Load {m.get('load', 0):.2f}"
+            ]
+            
+            # Add SDN bandwidth if available
+            bw = sdn_bandwidth.get(name, {})
+            if bw.get("bytes_in", 0) > 0:
+                bw_in_kb = int(bw["bytes_in"] / 1024)
+                parts.append(f"SDN in: {bw_in_kb}KB/s")
+            
+            lines.append(f"- {name}: {', '.join(parts)}")
+        
+        return '\n'.join(lines)
     
     def _compute_bottleneck_hint(self, cluster_data: dict, violation_type: str) -> str:
         """
@@ -322,7 +430,7 @@ JSON:
             busiest = max(valid_deps, key=cpu_usage_ratio)
             ratio = cpu_usage_ratio(busiest)
             if ratio > 0.5:
-                return f"BOTTLENECK: {busiest['name']} (CPU {busiest.get('cpu_usage', '?')}/{busiest.get('cpu_limit', '?')}) - target this one"
+                return f"BOTTLENECK: {busiest['name']} (cpu_usage={busiest.get('cpu_usage', '?')}, cpu_limit={busiest.get('cpu_limit', '?')}) - target this one"
             else:
                 return ""
         else:
@@ -333,7 +441,7 @@ JSON:
             biggest = max(valid_deps, key=replica_count)
             reps = replica_count(biggest)
             if reps > 1:
-                return f"OVER-PROVISIONED: {biggest['name']} has {reps} replicas - target this one"
+                return f"OVER-PROVISIONED: {biggest['name']} has replicas={reps} - target this one"
             else:
                 return ""
     
@@ -366,21 +474,33 @@ JSON:"""
 
     def _query_ollama(self, prompt: str) -> Optional[str]:
         """
-        Send prompt to Ollama API and get response.
+        Send prompt to Ollama API using /api/chat with think:false.
+        
+        Uses the chat endpoint with system + user messages and disables
+        thinking mode for qwen3.x models to get direct JSON output.
         
         Args:
-            prompt: The complete prompt to send
+            prompt: The complete prompt to send as the user message
             
         Returns:
             LLM response text or None if failed
         """
-        url = f"{self.ollama_url}/api/generate"
+        url = f"{self.ollama_url}/api/chat"
         
         payload = {
             "model": self.model,
-            "prompt": prompt,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a Kubernetes resource manager that analyzes system metrics to find and fix performance problems. When response time is too high, identify the bottleneck and increase its resources. When response time is too low, identify over-provisioned services and reduce their resources to save costs. Output ONLY a single valid JSON object. No markdown, no explanation."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
             "stream": False,
-            "format": "json",
+            "think": False,
             "options": {
                 "temperature": self.temperature,
                 "num_predict": 256
@@ -401,7 +521,12 @@ JSON:"""
             response.raise_for_status()
             
             result = response.json()
-            llm_response = result.get("response", "")
+            llm_response = result.get("message", {}).get("content", "")
+            
+            # Log timing info
+            total_duration = result.get("total_duration", 0)
+            if total_duration:
+                logger.info(f"LLM response time: {total_duration / 1e9:.1f}s")
             
             if self.debug_llm:
                 logger.info("LLM DEBUG - RESPONSE:")
@@ -448,7 +573,12 @@ JSON:"""
             if self.valid_deployment_names and dep_name.lower() not in self.valid_deployment_names:
                 return False, f"Invalid deployment_name '{dep_name}'. Must be one of: {sorted(self.valid_deployment_names)}"
         
-        # Validate horizontal_scaling parameters
+        # Get deployment-specific limits from config
+        dep_config = self._get_deployment_config(dep_name)
+        max_replicas = dep_config.get("max_replicas", 5)
+        min_replicas = dep_config.get("min_replicas", 1)
+        
+        # Validate horizontal_scaling parameters with clamping
         if action_type == "horizontal_scaling":
             replicas = params.get("replicas")
             if replicas is None:
@@ -457,28 +587,60 @@ JSON:"""
                 replicas = int(replicas)
             except (ValueError, TypeError):
                 return False, f"Invalid replicas value: {replicas}"
-            if replicas < 1 or replicas > 10:
-                return False, f"Replicas {replicas} out of range (1-10)"
+            # Clamp to configured limits
+            if replicas < min_replicas:
+                logger.info(f"Clamping replicas from {replicas} to min={min_replicas}")
+                replicas = min_replicas
+            if replicas > max_replicas:
+                logger.info(f"Clamping replicas from {replicas} to max={max_replicas}")
+                replicas = max_replicas
+            params["replicas"] = replicas
         
-        # Validate vertical_scaling parameters
+        # Validate vertical_scaling parameters with clamping
         if action_type == "vertical_scaling":
             cpu = params.get("cpu_limit", "")
             mem = params.get("memory_limit", "")
             if not cpu:
                 return False, "Missing cpu_limit"
-            # Auto-fill memory_limit if missing (common with small LLMs)
-            # Use a sensible default: ~1Mi per 1m CPU (e.g., 500m -> 512Mi)
+            
+            # Parse and clamp CPU limit (100m - 1000m)
+            try:
+                cpu_val = int(str(cpu).replace("m", "").strip())
+                if cpu_val < 100:
+                    logger.info(f"Clamping cpu_limit from {cpu_val}m to min=100m")
+                    cpu_val = 100
+                if cpu_val > 1000:
+                    logger.info(f"Clamping cpu_limit from {cpu_val}m to max=1000m")
+                    cpu_val = 1000
+                params["cpu_limit"] = f"{cpu_val}m"
+            except (ValueError, TypeError):
+                return False, f"Invalid cpu_limit value: {cpu}"
+            
+            # Auto-fill memory_limit if missing
             if not mem:
+                mem_val = max(128, (cpu_val // 100) * 100 + 12)
+                params["memory_limit"] = f"{mem_val}Mi"
+                logger.info(f"Auto-filled missing memory_limit: {params['memory_limit']} (based on cpu_limit={cpu_val}m)")
+            else:
+                # Clamp memory (128Mi - 1024Mi)
                 try:
-                    cpu_val = int(str(cpu).replace("m", "").strip())
-                    mem_val = max(128, (cpu_val // 100) * 100 + 12)  # e.g., 600m -> 612Mi
+                    mem_val = int(str(mem).replace("Mi", "").replace("Gi", "000").strip())
+                    if mem_val < 128:
+                        mem_val = 128
+                    if mem_val > 1024:
+                        mem_val = 1024
                     params["memory_limit"] = f"{mem_val}Mi"
-                    logger.info(f"Auto-filled missing memory_limit: {params['memory_limit']} (based on cpu_limit={cpu})")
                 except (ValueError, TypeError):
-                    params["memory_limit"] = "512Mi"
-                    logger.info(f"Auto-filled missing memory_limit: 512Mi (default)")
+                    pass  # Keep original if can't parse
         
         return True, ""
+    
+    def _get_deployment_config(self, dep_name: str) -> dict:
+        """Get deployment-specific config (limits etc) from config.yaml."""
+        for dep in self.config.get("kubernetes", {}).get("deployments", []):
+            if dep.get("name", "").lower() == dep_name.lower():
+                return dep
+        return {"min_replicas": 1, "max_replicas": 5}
     
     def _parse_response(self, response_text: str) -> dict:
         """
@@ -671,6 +833,7 @@ JSON:"""
         if normalized_action == "horizontal_scaling":
             dep_name = (params.get("deployment_name") or params.get("deployment") 
                        or params.get("name") or params.get("pod") or "")
+            dep_name = self._expand_name(dep_name)
             
             replicas = params.get("replicas")
             if replicas is None:
@@ -700,6 +863,7 @@ JSON:"""
         elif normalized_action == "vertical_scaling":
             dep_name = (params.get("deployment_name") or params.get("deployment") 
                        or params.get("name") or "")
+            dep_name = self._expand_name(dep_name)
             cpu = params.get("cpu_limit") or params.get("cpu") or params.get("cpu_limits") or "500m"
             mem = (params.get("memory_limit") or params.get("memory") 
                   or params.get("mem_limit") or params.get("memory_limits") or "512Mi")
@@ -726,6 +890,7 @@ JSON:"""
         elif normalized_action == "service_placement":
             dep_name = (params.get("deployment_name") or params.get("deployment") 
                        or params.get("name") or "")
+            dep_name = self._expand_name(dep_name)
             target = (params.get("target_node") or params.get("node") 
                      or params.get("target") or "")
             
@@ -949,50 +1114,67 @@ JSON:"""
         
         This safety net helps overcome limitations of smaller LLMs that may not 
         learn from feedback in the history.
+        
+        NOTE: Only WORSENED outcomes count as failures. NO_CHANGE outcomes are
+        not counted because with low EMA alpha, even successful actions may
+        appear as NO_CHANGE before EMA catches up.
         """
         if action['action'] == 'none':
             return action
         
-        # Count failures in history
-        failed_count = history.count("WORSENED") + history.count("NO_CHANGE")
+        # Count only genuine failures (WORSENED), not NO_CHANGE
+        # NO_CHANGE with low alpha may just mean EMA hasn't caught up yet
+        failed_count = history.count("WORSENED")
         
         # Track failures for the specific deployment
         same_deployment_failures = 0
         if action['action'] in ('horizontal_scaling', 'vertical_scaling'):
             dep_name = action['parameters'].get('deployment_name', '')
             if dep_name and dep_name in history:
-                same_deployment_failures = history.count(dep_name)
+                # Count only WORSENED lines that mention this deployment
+                for line in history.split('\n'):
+                    if dep_name in line and 'WORSENED' in line:
+                        same_deployment_failures += 1
         
-        # If we see 3+ failures with horizontal_scaling, try vertical_scaling
+        # If we see 3+ WORSENED failures with horizontal_scaling, try vertical_scaling
         if failed_count >= 3 and action['action'] == 'horizontal_scaling' and self.actions_enabled.get('vertical_scaling', False):
             dep_name = action['parameters'].get('deployment_name', '')
             if not dep_name:
                 return action
                 
-            logger.warning(f"Detected {failed_count} failed attempts. Switching to vertical_scaling.")
+            logger.warning(f"Detected {failed_count} WORSENED attempts. Switching to vertical_scaling.")
+            
+            # Get current limits for this deployment to make a proportional change
+            current_cpu = self._get_current_cpu_limit(dep_name, cluster_data)
             
             if violation_type == "LOWER_THRESHOLD_EXCEEDED":
+                # Reduce by ~30% but not below 100m
+                new_cpu = max(100, int(current_cpu * 0.7))
+                new_mem = max(128, new_cpu + 12)
                 return {
                     "action": "vertical_scaling",
                     "parameters": {
                         "deployment_name": dep_name,
-                        "cpu_limit": "100m",
-                        "memory_limit": "128Mi"
+                        "cpu_limit": f"{new_cpu}m",
+                        "memory_limit": f"{new_mem}Mi"
                     },
-                    "adjusted_reason": "Switched from repeated failed horizontal_scaling"
+                    "adjusted_reason": "Switched from repeated WORSENED horizontal_scaling"
                 }
             else:
+                # Increase by ~30% but not above 1000m
+                new_cpu = min(1000, int(current_cpu * 1.3))
+                new_mem = min(1024, new_cpu + 12)
                 return {
                     "action": "vertical_scaling",
                     "parameters": {
                         "deployment_name": dep_name,
-                        "cpu_limit": "1000m",
-                        "memory_limit": "1024Mi"
+                        "cpu_limit": f"{new_cpu}m",
+                        "memory_limit": f"{new_mem}Mi"
                     },
-                    "adjusted_reason": "Switched from repeated failed horizontal_scaling"
+                    "adjusted_reason": "Switched from repeated WORSENED horizontal_scaling"
                 }
         
-        # If same deployment failed 2+ times, try a different deployment
+        # If same deployment WORSENED 2+ times, try a different deployment
         if same_deployment_failures >= 2 and action['action'] == 'horizontal_scaling':
             try:
                 deployments = cluster_data.get('deployments', {}).get('list', [])
@@ -1021,17 +1203,32 @@ JSON:"""
                     else:
                         new_replicas = replicas + 1
                     
-                    logger.warning(f"Same deployment failed {same_deployment_failures} times. Trying {dep_name} instead.")
+                    logger.warning(f"Same deployment WORSENED {same_deployment_failures} times. Trying {dep_name} instead.")
                     return {
                         "action": "horizontal_scaling",
                         "parameters": {
                             "deployment_name": dep_name,
                             "replicas": new_replicas
                         },
-                        "adjusted_reason": f"Switched from {current_dep} due to repeated failures"
+                        "adjusted_reason": f"Switched from {current_dep} due to repeated WORSENED outcomes"
                     }
         
         return action
+    
+    def _get_current_cpu_limit(self, deployment_name: str, cluster_data: dict) -> int:
+        """Get current CPU limit in millicores for a deployment."""
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        for d in deployments:
+            if d.get("name", "").lower() == deployment_name.lower():
+                cpu_str = str(d.get("cpu_limit", "300m")).replace("m", "").strip()
+                try:
+                    return int(cpu_str)
+                except ValueError:
+                    return 300
+        return 300
     
     def is_healthy(self) -> bool:
         """Check if Ollama is responding."""

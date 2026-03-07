@@ -1,20 +1,30 @@
-You are a Kubernetes resource manager. Pick ONE action to fix the problem.
+You manage a Kubernetes microservice application deployed across edge and cloud nodes.
 
-PROBLEM: EMA Response Time is {ema_rt}s (target: {lower_threshold}s-{upper_threshold}s)
-STATUS: {status}
-
-RULE: {what_to_do}
-
-DEPLOYMENTS:
-{deployments_table}
-{bottleneck_hint}
-LIMITS: {constraints}
+INTENT: Keep average response time between {lower_threshold}s and {upper_threshold}s.
+CURRENT: EMA Response Time = {ema_rt}s — {status}
 {history_section}
-IMPORTANT: Target the deployment with HIGHEST CPU usage in the table. Use "horizontal_scaling" to change replicas or "vertical_scaling" to change CPU/memory.
 
-EXAMPLES:
-{{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
-{{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
+CLUSTER STATE:
+{deployments_table}
 
-Respond with ONLY a JSON object. Target the busiest deployment.
+NODE RESOURCES:
+{node_metrics}
+
+AVAILABLE ACTIONS:
+- vertical_scaling: Change CPU/memory limits for a deployment
+- horizontal_scaling: Change replica count for a deployment
+
+CONSTRAINTS: CPU range 100m-1000m, Replicas range 1-5.
+
+Analyze the root cause of the violation. Consider:
+- Which microservice is the bottleneck? (highest CPU usage relative to its limit)
+- Is the problem compute-bound (high CPU) or load-bound (too many requests)?
+- Are resources over-provisioned (wasting CPU) or under-provisioned (starving)?
+- What did previous actions achieve? Should we try something different?
+
+Respond with ONLY a JSON object:
+{{"action": "vertical_scaling", "parameters": {{"deployment_name": "...", "cpu_limit": "...m", "memory_limit": "...Mi"}}}}
+{{"action": "horizontal_scaling", "parameters": {{"deployment_name": "...", "replicas": N}}}}
+{{"action": "none", "parameters": {{}}}}
+
 JSON:
