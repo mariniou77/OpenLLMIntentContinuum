@@ -1,21 +1,30 @@
-PROBLEM: EMA Response Time is {ema_rt}s (target: {lower_threshold}s-{upper_threshold}s)
-{history_section}
-LIMITS: {constraints}
+You manage a Kubernetes microservice application deployed across edge and cloud nodes.
 
-STATE:
+INTENT: Keep average response time between {lower_threshold}s and {upper_threshold}s.
+CURRENT: EMA Response Time = {ema_rt}s — {status}
+{history_section}
+
+CLUSTER STATE:
 {deployments_table}
 
-INSTRUCTIONS:
-1. Find the deployment with the highest cpu_usage relative to its cpu_limit.
-2. Apply these rules to that target deployment:
-   - IF EMA RT > {upper_threshold}s AND cpu_usage > 80% of cpu_limit: action="vertical_scaling", set cpu_limit to current cpu_limit + 200m (max 1000m), keep current mem_limit.
-   - IF EMA RT > {upper_threshold}s AND cpu_usage <= 80% of cpu_limit: action="horizontal_scaling", set replicas to current replicas + 1 (max 5).
-   - IF EMA RT < {lower_threshold}s AND replicas > 1: action="horizontal_scaling", set replicas to current replicas - 1.
-   - IF EMA RT < {lower_threshold}s AND replicas == 1: action="vertical_scaling", set cpu_limit to current cpu_limit - 100m (min 100m), keep current mem_limit.
+NODE RESOURCES:
+{node_metrics}
 
-ALLOWED JSON FORMATS:
-- {{"action": "vertical_scaling", "parameters": {{"deployment_name": "...", "cpu_limit": "...m", "memory_limit": "...Mi"}}}}
-- {{"action": "horizontal_scaling", "parameters": {{"deployment_name": "...", "replicas": 0}}}}
-- {{"action": "none", "parameters": {{}}}}
+AVAILABLE ACTIONS:
+- vertical_scaling: Change CPU/memory limits for a deployment
+- horizontal_scaling: Change replica count for a deployment
+
+CONSTRAINTS: CPU range 100m-1000m, Replicas range 1-5.
+
+Analyze the root cause of the violation. Consider:
+- Which microservice is the bottleneck? (highest CPU usage relative to its limit)
+- Is the problem compute-bound (high CPU) or load-bound (too many requests)?
+- Are resources over-provisioned (wasting CPU) or under-provisioned (starving)?
+- Analyze the effectiveness of previous actions and recommend whether to repeat, adjust, or try a different action.
+
+Respond with ONLY a JSON object:
+{{"action": "vertical_scaling", "parameters": {{"deployment_name": "...", "cpu_limit": "...m", "memory_limit": "...Mi"}}}}
+{{"action": "horizontal_scaling", "parameters": {{"deployment_name": "...", "replicas": N}}}}
+{{"action": "none", "parameters": {{}}}}
 
 JSON:

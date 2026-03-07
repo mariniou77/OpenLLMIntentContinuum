@@ -276,35 +276,93 @@ JSON:
         history: str
     ) -> str:
         """
-        Build the prompt using the template file.
+        Build the prompt for LLM root cause analysis.
         
-        The template contains all decision rules so the LLM just needs to
-        follow instructions based on the data table provided.
+        Provides the LLM with full system context and lets it reason
+        about the root cause and recommend an appropriate action.
         """
-        # Format deployments table
+        # Status description
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+            status = f"TOO SLOW (above {self.upper_threshold}s). Response time needs to decrease."
+        else:
+            status = f"TOO FAST (below {self.lower_threshold}s). Resources are over-provisioned and being wasted."
+        
+        # Format deployments with node placement
         deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
         
-        # Constraints
-        constraints = "Max CPU 1000m, Max Replicas 5, Min CPU 100m, Min Replicas 1."
+        # Format node-level metrics
+        node_metrics = self._format_node_metrics(monitoring_data)
         
         # History section
-        history_section = ""
         if history and history != "(none)":
-            history_section = f"HISTORY: {history}"
+            history_section = f"PREVIOUS ACTIONS:\n{history}"
         else:
-            history_section = "HISTORY: No previous actions."
+            history_section = "PREVIOUS ACTIONS: None yet."
         
         # Fill in the template
         prompt = self.prompt_template.format(
             ema_rt=f"{ema_rt:.2f}",
             lower_threshold=self.lower_threshold,
             upper_threshold=self.upper_threshold,
+            status=status,
             deployments_table=deployments_table,
-            constraints=constraints,
+            node_metrics=node_metrics,
             history_section=history_section
         )
         
         return prompt
+    
+    def _format_node_metrics(self, monitoring_data: dict) -> str:
+        """
+        Format node-level CPU and memory metrics for the prompt.
+        
+        Args:
+            monitoring_data: Monitoring data dict from data_collector
+            
+        Returns:
+            Formatted string like:
+            - master: CPU 5%, Memory 45%
+            - worker1: CPU 25%, Memory 30%
+        """
+        cpu_data = monitoring_data.get("cpu_utilization", [])
+        memory_data = monitoring_data.get("memory_utilization", [])
+        
+        # Map known IPs to node names
+        ip_to_name = {
+            "10.132.0.6": "sdn-controller",
+            "10.132.0.7": "master",
+            "10.132.0.8": "worker1",
+            "10.132.0.9": "worker2"
+        }
+        
+        node_metrics = {}
+        
+        for item in cpu_data:
+            agent = item.get("agent") or ""
+            name = ip_to_name.get(agent, f"node-{agent.split('.')[-1]}" if '.' in str(agent) else str(agent))
+            # Only include cluster nodes
+            if name in ("master", "worker1", "worker2"):
+                if name not in node_metrics:
+                    node_metrics[name] = {"cpu": 0, "memory": 0}
+                node_metrics[name]["cpu"] = item.get("cpu_percent", 0) or 0
+        
+        for item in memory_data:
+            agent = item.get("agent") or ""
+            name = ip_to_name.get(agent, f"node-{agent.split('.')[-1]}" if '.' in str(agent) else str(agent))
+            if name in ("master", "worker1", "worker2"):
+                if name not in node_metrics:
+                    node_metrics[name] = {"cpu": 0, "memory": 0}
+                node_metrics[name]["memory"] = item.get("memory_percent", 0) or 0
+        
+        if not node_metrics:
+            return "- No node metrics available"
+        
+        lines = []
+        for name in sorted(node_metrics.keys()):
+            m = node_metrics[name]
+            lines.append(f"- {name}: CPU {m['cpu']:.0f}%, Memory {m['memory']:.0f}%")
+        
+        return '\n'.join(lines)
     
     def _compute_bottleneck_hint(self, cluster_data: dict, violation_type: str) -> str:
         """
@@ -413,7 +471,7 @@ JSON:"""
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are an automated Kubernetes controller. Output ONLY a single, valid, unformatted JSON object. Do not include markdown code blocks like ```json."
+                    "content": "You are a Kubernetes resource manager that analyzes system metrics to find and fix performance problems. When response time is too high, identify the bottleneck and increase its resources. When response time is too low, identify over-provisioned services and reduce their resources to save costs. Output ONLY a single valid JSON object. No markdown, no explanation."
                 },
                 {
                     "role": "user",
