@@ -2,7 +2,7 @@
 
 # Intent thresholds
 intent:
-  upper_threshold: 2.0    # seconds - trigger scale UP if response time exceeds this
+  upper_threshold: 3.0    # seconds - trigger scale UP if response time exceeds this
   lower_threshold: 1.0    # seconds - trigger scale DOWN if response time below this
   ema_alpha: 0.1          # smoothing factor for Exponential Moving Average
   check_interval: 5       # seconds between checks
@@ -74,3 +74,18 @@ kubernetes:
       max_replicas: 3
       default_cpu: "300m"
       default_memory: "312Mi"
+
+# sFlow-RT monitoring configuration
+sflow:
+  # Node IPs for host-level metrics (CPU, memory, load)
+  nodes:
+    master: "10.132.0.7"
+    worker1: "10.132.0.8"
+    worker2: "10.132.0.9"
+  # SDN overlay IPs for network bandwidth metrics
+  sdn_overlay:
+    master: "192.168.100.100"
+    worker1: "192.168.100.101"
+    worker2: "192.168.100.102"
+  # Pod CIDR prefix to identify pod sFlow agents from /agents/json
+  pod_cidr: "10.42."

@@ -64,7 +64,8 @@ class DataCollector:
         )
         
         self.sflow_client = SFlowRTClient(
-            base_url=config["endpoints"]["sflow_rt"]
+            base_url=config["endpoints"]["sflow_rt"],
+            sflow_config=config.get("sflow", {})
         )
         
         # Response time history storage

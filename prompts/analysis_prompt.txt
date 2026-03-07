@@ -20,7 +20,7 @@ Analyze the root cause of the violation. Consider:
 - Which microservice is the bottleneck? (highest CPU usage relative to its limit)
 - Is the problem compute-bound (high CPU) or load-bound (too many requests)?
 - Are resources over-provisioned (wasting CPU) or under-provisioned (starving)?
-- Analyze the effectiveness of previous actions and recommend whether to repeat, adjust, or try a different action.
+- What did previous actions achieve? Should we try something different?
 
 Respond with ONLY a JSON object:
 {{"action": "vertical_scaling", "parameters": {{"deployment_name": "...", "cpu_limit": "...m", "memory_limit": "...Mi"}}}}

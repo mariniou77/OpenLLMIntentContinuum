@@ -118,58 +118,94 @@ JSON:
 
     def _format_system_state(self, cluster_data: dict, network_data: dict, monitoring_data: dict) -> str:
         """
-        Format system state as a list for the prompt, including node placement.
+        Format system state as a list for the prompt.
+        
+        Combines:
+        - Kubernetes: deployment config (replicas, cpu_limit, memory_limit), pod-to-node mapping
+        - sFlow-RT: real-time pod CPU %, memory usage, network traffic
         
         Returns format like:
-        - microservice1-deployment (worker1): replicas=1, cpu_usage=45m, cpu_limit=300m, mem_limit=312Mi
-        - microservice3-deployment (worker2): replicas=1, cpu_usage=504m, cpu_limit=600m, mem_limit=512Mi
+        - microservice1-deployment (worker1): replicas=1, cpu=12.7%, cpu_limit=300m, mem=44Mi/312Mi, traffic_in=57KB/s
         """
         lines = []
         
-        # Get deployments from cluster data
+        # Get deployments from K8s (replicas, limits)
         deployments = cluster_data.get("deployments", {}).get("list", [])
         if not deployments:
             deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
         
-        # Get pods to map deployments to nodes
+        # Get pods for node mapping
         pods = cluster_data.get("pods", {}).get("list", [])
         if not pods:
             pods = cluster_data.get("data", {}).get("pods", {}).get("list", [])
         
-        # Build deployment -> node mapping from pods
+        # Build deployment -> node mapping from K8s pods
         dep_to_nodes = {}
         for pod in pods:
             pod_name = pod.get("name", "")
             node = pod.get("node", "unknown")
+            # Skip pending pods (no node assigned)
+            if not node or node == "None":
+                continue
             for dep in deployments:
                 dep_name = dep.get("name", "")
-                if dep_name and dep_name.replace("-deployment", "") in pod_name:
+                if dep_name and pod_name.startswith(dep_name):
                     if dep_name not in dep_to_nodes:
                         dep_to_nodes[dep_name] = []
-                    if node and node not in dep_to_nodes[dep_name]:
+                    if node not in dep_to_nodes[dep_name]:
                         dep_to_nodes[dep_name].append(node)
+        
+        # Get sFlow pod metrics (real-time CPU, memory, traffic)
+        sflow_pod_metrics = monitoring_data.get("pod_metrics", [])
+        
+        # Build deployment -> sFlow metrics mapping
+        dep_to_sflow = {}
+        for pm in sflow_pod_metrics:
+            dep_name = pm.get("deployment", "")
+            if dep_name:
+                if dep_name not in dep_to_sflow:
+                    dep_to_sflow[dep_name] = []
+                dep_to_sflow[dep_name].append(pm)
         
         for d in deployments:
             name = d.get("name", "unknown")
-            # Only include deployments that are in config
             if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
                 continue
             
             replicas = d.get("replicas_ready", d.get("replicas_desired", 0))
             cpu_limit = d.get("cpu_limit") or "unknown"
-            cpu_usage = d.get("cpu_usage") or "0m"
             memory_limit = d.get("memory_limit") or "unknown"
-            memory_usage = d.get("memory_usage") or "0Mi"
             
             # Get node placement
             nodes = dep_to_nodes.get(name, ["unknown"])
             node_str = ", ".join(nodes)
             
-            lines.append(
-                f"- {name} ({node_str}): replicas={replicas}, "
-                f"cpu_usage={cpu_usage}, cpu_limit={cpu_limit}, "
-                f"mem_usage={memory_usage}, mem_limit={memory_limit}"
-            )
+            # Get sFlow metrics for this deployment
+            sflow_data = dep_to_sflow.get(name, [])
+            if sflow_data:
+                # Average across replicas
+                avg_cpu = sum(p["cpu_percent"] for p in sflow_data) / len(sflow_data)
+                avg_mem_used = sum(p["mem_used_bytes"] for p in sflow_data) / len(sflow_data)
+                avg_bytes_in = sum(p["bytes_in"] for p in sflow_data) / len(sflow_data)
+                
+                mem_used_mi = int(avg_mem_used / (1024 * 1024))
+                traffic_in_kb = int(avg_bytes_in / 1024)
+                
+                lines.append(
+                    f"- {name} ({node_str}): replicas={replicas}, "
+                    f"cpu={avg_cpu:.1f}%, cpu_limit={cpu_limit}, "
+                    f"mem={mem_used_mi}Mi/{memory_limit}, "
+                    f"traffic_in={traffic_in_kb}KB/s"
+                )
+            else:
+                # Fallback to kubectl top data if sFlow not available
+                cpu_usage = d.get("cpu_usage") or "0m"
+                memory_usage = d.get("memory_usage") or "0Mi"
+                lines.append(
+                    f"- {name} ({node_str}): replicas={replicas}, "
+                    f"cpu_usage={cpu_usage}, cpu_limit={cpu_limit}, "
+                    f"mem={memory_usage}/{memory_limit}"
+                )
         
         return '\n'.join(lines) if lines else "No deployment data available"
     
@@ -314,45 +350,18 @@ JSON:
     
     def _format_node_metrics(self, monitoring_data: dict) -> str:
         """
-        Format node-level CPU and memory metrics for the prompt.
+        Format node-level metrics for the prompt using sFlow-RT data.
         
         Args:
-            monitoring_data: Monitoring data dict from data_collector
+            monitoring_data: Monitoring data dict from sFlow-RT
             
         Returns:
             Formatted string like:
-            - master: CPU 5%, Memory 45%
-            - worker1: CPU 25%, Memory 30%
+            - master: CPU 12.8%, Memory 7.9%, Load 0.30
+            - worker1: CPU 7.1%, Memory 8.1%, Load 0.44, SDN bandwidth in: 173KB/s
         """
-        cpu_data = monitoring_data.get("cpu_utilization", [])
-        memory_data = monitoring_data.get("memory_utilization", [])
-        
-        # Map known IPs to node names
-        ip_to_name = {
-            "10.132.0.6": "sdn-controller",
-            "10.132.0.7": "master",
-            "10.132.0.8": "worker1",
-            "10.132.0.9": "worker2"
-        }
-        
-        node_metrics = {}
-        
-        for item in cpu_data:
-            agent = item.get("agent") or ""
-            name = ip_to_name.get(agent, f"node-{agent.split('.')[-1]}" if '.' in str(agent) else str(agent))
-            # Only include cluster nodes
-            if name in ("master", "worker1", "worker2"):
-                if name not in node_metrics:
-                    node_metrics[name] = {"cpu": 0, "memory": 0}
-                node_metrics[name]["cpu"] = item.get("cpu_percent", 0) or 0
-        
-        for item in memory_data:
-            agent = item.get("agent") or ""
-            name = ip_to_name.get(agent, f"node-{agent.split('.')[-1]}" if '.' in str(agent) else str(agent))
-            if name in ("master", "worker1", "worker2"):
-                if name not in node_metrics:
-                    node_metrics[name] = {"cpu": 0, "memory": 0}
-                node_metrics[name]["memory"] = item.get("memory_percent", 0) or 0
+        node_metrics = monitoring_data.get("node_metrics", {})
+        sdn_bandwidth = monitoring_data.get("sdn_bandwidth", {})
         
         if not node_metrics:
             return "- No node metrics available"
@@ -360,7 +369,19 @@ JSON:
         lines = []
         for name in sorted(node_metrics.keys()):
             m = node_metrics[name]
-            lines.append(f"- {name}: CPU {m['cpu']:.0f}%, Memory {m['memory']:.0f}%")
+            parts = [
+                f"CPU {m.get('cpu', 0):.1f}%",
+                f"Memory {m.get('memory', 0):.1f}%",
+                f"Load {m.get('load', 0):.2f}"
+            ]
+            
+            # Add SDN bandwidth if available
+            bw = sdn_bandwidth.get(name, {})
+            if bw.get("bytes_in", 0) > 0:
+                bw_in_kb = int(bw["bytes_in"] / 1024)
+                parts.append(f"SDN in: {bw_in_kb}KB/s")
+            
+            lines.append(f"- {name}: {', '.join(parts)}")
         
         return '\n'.join(lines)
     
