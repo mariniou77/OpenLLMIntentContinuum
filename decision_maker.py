@@ -118,22 +118,36 @@ JSON:
 
     def _format_system_state(self, cluster_data: dict, network_data: dict, monitoring_data: dict) -> str:
         """
-        Format system state as a table for the prompt.
+        Format system state as a list for the prompt, including node placement.
         
         Returns format like:
-        | Deployment | Replicas | CPU Util | CPU Limit | Mem Limit |
-        |------------|----------|----------|-----------|-----------|
-        | ms1-dep    | 1        | 45%      | 300m      | 312Mi     |
+        - microservice1-deployment (worker1): replicas=1, cpu_usage=45m, cpu_limit=300m, mem_limit=312Mi
+        - microservice3-deployment (worker2): replicas=1, cpu_usage=504m, cpu_limit=600m, mem_limit=512Mi
         """
         lines = []
-        lines.append("| Deployment | Replicas | CPU Util | CPU Limit | Mem Limit |")
-        lines.append("|------------|----------|----------|-----------|-----------|")
         
         # Get deployments from cluster data
         deployments = cluster_data.get("deployments", {}).get("list", [])
-        
         if not deployments:
             deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        # Get pods to map deployments to nodes
+        pods = cluster_data.get("pods", {}).get("list", [])
+        if not pods:
+            pods = cluster_data.get("data", {}).get("pods", {}).get("list", [])
+        
+        # Build deployment -> node mapping from pods
+        dep_to_nodes = {}
+        for pod in pods:
+            pod_name = pod.get("name", "")
+            node = pod.get("node", "unknown")
+            for dep in deployments:
+                dep_name = dep.get("name", "")
+                if dep_name and dep_name.replace("-deployment", "") in pod_name:
+                    if dep_name not in dep_to_nodes:
+                        dep_to_nodes[dep_name] = []
+                    if node and node not in dep_to_nodes[dep_name]:
+                        dep_to_nodes[dep_name].append(node)
         
         for d in deployments:
             name = d.get("name", "unknown")
@@ -145,20 +159,19 @@ JSON:
             cpu_limit = d.get("cpu_limit") or "unknown"
             cpu_usage = d.get("cpu_usage") or "0m"
             memory_limit = d.get("memory_limit") or "unknown"
+            memory_usage = d.get("memory_usage") or "0Mi"
             
-            # Calculate CPU utilization percentage
-            try:
-                usage_val = int(str(cpu_usage).replace("m", "").strip())
-                limit_val = int(str(cpu_limit).replace("m", "").strip())
-                cpu_pct = f"{int(usage_val / max(limit_val, 1) * 100)}%"
-            except (ValueError, TypeError):
-                cpu_pct = "N/A"
+            # Get node placement
+            nodes = dep_to_nodes.get(name, ["unknown"])
+            node_str = ", ".join(nodes)
             
             lines.append(
-                f"| {name} | {replicas} | {cpu_pct} | {cpu_limit} | {memory_limit} |"
+                f"- {name} ({node_str}): replicas={replicas}, "
+                f"cpu_usage={cpu_usage}, cpu_limit={cpu_limit}, "
+                f"mem_usage={memory_usage}, mem_limit={memory_limit}"
             )
         
-        return '\n'.join(lines) if len(lines) > 2 else "No deployment data available"
+        return '\n'.join(lines) if lines else "No deployment data available"
     
     @staticmethod
     def _expand_name(name: str) -> str:
@@ -481,7 +494,12 @@ JSON:"""
             if self.valid_deployment_names and dep_name.lower() not in self.valid_deployment_names:
                 return False, f"Invalid deployment_name '{dep_name}'. Must be one of: {sorted(self.valid_deployment_names)}"
         
-        # Validate horizontal_scaling parameters
+        # Get deployment-specific limits from config
+        dep_config = self._get_deployment_config(dep_name)
+        max_replicas = dep_config.get("max_replicas", 5)
+        min_replicas = dep_config.get("min_replicas", 1)
+        
+        # Validate horizontal_scaling parameters with clamping
         if action_type == "horizontal_scaling":
             replicas = params.get("replicas")
             if replicas is None:
@@ -490,28 +508,60 @@ JSON:"""
                 replicas = int(replicas)
             except (ValueError, TypeError):
                 return False, f"Invalid replicas value: {replicas}"
-            if replicas < 1 or replicas > 10:
-                return False, f"Replicas {replicas} out of range (1-10)"
+            # Clamp to configured limits
+            if replicas < min_replicas:
+                logger.info(f"Clamping replicas from {replicas} to min={min_replicas}")
+                replicas = min_replicas
+            if replicas > max_replicas:
+                logger.info(f"Clamping replicas from {replicas} to max={max_replicas}")
+                replicas = max_replicas
+            params["replicas"] = replicas
         
-        # Validate vertical_scaling parameters
+        # Validate vertical_scaling parameters with clamping
         if action_type == "vertical_scaling":
             cpu = params.get("cpu_limit", "")
             mem = params.get("memory_limit", "")
             if not cpu:
                 return False, "Missing cpu_limit"
-            # Auto-fill memory_limit if missing (common with small LLMs)
-            # Use a sensible default: ~1Mi per 1m CPU (e.g., 500m -> 512Mi)
+            
+            # Parse and clamp CPU limit (100m - 1000m)
+            try:
+                cpu_val = int(str(cpu).replace("m", "").strip())
+                if cpu_val < 100:
+                    logger.info(f"Clamping cpu_limit from {cpu_val}m to min=100m")
+                    cpu_val = 100
+                if cpu_val > 1000:
+                    logger.info(f"Clamping cpu_limit from {cpu_val}m to max=1000m")
+                    cpu_val = 1000
+                params["cpu_limit"] = f"{cpu_val}m"
+            except (ValueError, TypeError):
+                return False, f"Invalid cpu_limit value: {cpu}"
+            
+            # Auto-fill memory_limit if missing
             if not mem:
+                mem_val = max(128, (cpu_val // 100) * 100 + 12)
+                params["memory_limit"] = f"{mem_val}Mi"
+                logger.info(f"Auto-filled missing memory_limit: {params['memory_limit']} (based on cpu_limit={cpu_val}m)")
+            else:
+                # Clamp memory (128Mi - 1024Mi)
                 try:
-                    cpu_val = int(str(cpu).replace("m", "").strip())
-                    mem_val = max(128, (cpu_val // 100) * 100 + 12)  # e.g., 600m -> 612Mi
+                    mem_val = int(str(mem).replace("Mi", "").replace("Gi", "000").strip())
+                    if mem_val < 128:
+                        mem_val = 128
+                    if mem_val > 1024:
+                        mem_val = 1024
                     params["memory_limit"] = f"{mem_val}Mi"
-                    logger.info(f"Auto-filled missing memory_limit: {params['memory_limit']} (based on cpu_limit={cpu})")
                 except (ValueError, TypeError):
-                    params["memory_limit"] = "512Mi"
-                    logger.info(f"Auto-filled missing memory_limit: 512Mi (default)")
+                    pass  # Keep original if can't parse
         
         return True, ""
+    
+    def _get_deployment_config(self, dep_name: str) -> dict:
+        """Get deployment-specific config (limits etc) from config.yaml."""
+        for dep in self.config.get("kubernetes", {}).get("deployments", []):
+            if dep.get("name", "").lower() == dep_name.lower():
+                return dep
+        return {"min_replicas": 1, "max_replicas": 5}
     
     def _parse_response(self, response_text: str) -> dict:
         """

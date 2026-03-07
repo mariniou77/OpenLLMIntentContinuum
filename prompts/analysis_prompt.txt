@@ -6,12 +6,12 @@ STATE:
 {deployments_table}
 
 INSTRUCTIONS:
-1. Find the deployment with the highest CPU utilization percentage to be the target.
-2. Apply these rules to the target:
-   - IF RT > {upper_threshold}s AND CPU > 80%: action="vertical_scaling", set new cpu_limit to (current + 200m), keep current memory_limit.
-   - IF RT > {upper_threshold}s AND CPU <= 80%: action="horizontal_scaling", set new replicas to (current + 1).
-   - IF RT < {lower_threshold}s AND replicas > 1: action="horizontal_scaling", set new replicas to (current - 1).
-   - IF RT < {lower_threshold}s AND replicas == 1: action="vertical_scaling", set new cpu_limit to (current - 100m, min 100m), keep current memory_limit.
+1. Find the deployment with the highest cpu_usage relative to its cpu_limit.
+2. Apply these rules to that target deployment:
+   - IF EMA RT > {upper_threshold}s AND cpu_usage > 80% of cpu_limit: action="vertical_scaling", set cpu_limit to current cpu_limit + 200m (max 1000m), keep current mem_limit.
+   - IF EMA RT > {upper_threshold}s AND cpu_usage <= 80% of cpu_limit: action="horizontal_scaling", set replicas to current replicas + 1 (max 5).
+   - IF EMA RT < {lower_threshold}s AND replicas > 1: action="horizontal_scaling", set replicas to current replicas - 1.
+   - IF EMA RT < {lower_threshold}s AND replicas == 1: action="vertical_scaling", set cpu_limit to current cpu_limit - 100m (min 100m), keep current mem_limit.
 
 ALLOWED JSON FORMATS:
 - {{"action": "vertical_scaling", "parameters": {{"deployment_name": "...", "cpu_limit": "...m", "memory_limit": "...Mi"}}}}

@@ -341,22 +341,50 @@ class KubernetesClient:
         """
         deployments = self.get_deployments(namespace)
         pod_metrics = self.get_pod_metrics(namespace)
+        pods = self.get_pods(namespace)
+        
+        # Build pod -> node mapping
+        pod_nodes = {}
+        for pod in pods:
+            pod_nodes[pod.get("name", "")] = pod.get("node", "unknown")
         
         for dep in deployments:
             dep_name = dep.get("name", "")
-            # Find matching pod metrics (pod names contain deployment name)
+            # Find matching pod metrics
+            # Pod names are like "microservice1-deployment-76d476998c-4w662"
+            # so we match on the deployment name prefix
             matching_pods = []
             for pod_name, metrics in pod_metrics.items():
-                # Pod names are like "microservice1-deployment-xxxx-yyyy"
-                if dep_name.replace("-deployment", "") in pod_name:
+                if pod_name.startswith(dep_name):
                     matching_pods.append(metrics)
             
-            # Aggregate CPU usage across replicas (show average or first pod)
+            # Aggregate CPU/memory usage across replicas
             if matching_pods:
-                dep["cpu_usage"] = matching_pods[0].get("cpu_usage", "N/A")
-                dep["memory_usage"] = matching_pods[0].get("memory_usage", "N/A")
+                # Sum CPU usage across all replicas for total
+                total_cpu = 0
+                total_mem = 0
+                for pm in matching_pods:
+                    try:
+                        cpu_str = str(pm.get("cpu_usage", "0m")).replace("m", "").strip()
+                        total_cpu += int(cpu_str)
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        mem_str = str(pm.get("memory_usage", "0Mi")).replace("Mi", "").strip()
+                        total_mem += int(mem_str)
+                    except (ValueError, TypeError):
+                        pass
+                
+                # For single replica, show as-is. For multiple, show per-replica average
+                num_pods = len(matching_pods)
+                if num_pods > 1:
+                    dep["cpu_usage"] = f"{total_cpu // num_pods}m"
+                    dep["memory_usage"] = f"{total_mem // num_pods}Mi"
+                else:
+                    dep["cpu_usage"] = matching_pods[0].get("cpu_usage", "0m")
+                    dep["memory_usage"] = matching_pods[0].get("memory_usage", "0Mi")
             else:
-                dep["cpu_usage"] = "N/A"
-                dep["memory_usage"] = "N/A"
+                dep["cpu_usage"] = "0m"
+                dep["memory_usage"] = "0Mi"
         
         return deployments
