@@ -41,9 +41,20 @@ class DataCollector:
         """
         self.config = config
         
+        # Build deployment defaults map from config
+        deployment_defaults = {}
+        for dep in config.get("kubernetes", {}).get("deployments", []):
+            dep_name = dep.get("name", "")
+            if dep_name:
+                deployment_defaults[dep_name] = {
+                    "cpu": dep.get("default_cpu", "300m"),
+                    "memory": dep.get("default_memory", "312Mi")
+                }
+        
         # Initialize utility clients
         self.k8s_client = KubernetesClient(
-            master_ip=config["endpoints"]["kubernetes_master"]
+            master_ip=config["endpoints"]["kubernetes_master"],
+            deployment_defaults=deployment_defaults
         )
         
         self.onos_client = ONOSClient(

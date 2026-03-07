@@ -18,16 +18,21 @@ logger = logging.getLogger(__name__)
 class KubernetesClient:
     """Client for interacting with Kubernetes via SSH to master node."""
     
-    def __init__(self, master_ip: str, username: str = "antonios-icontinuum"):
+    def __init__(self, master_ip: str, username: str = "antonios-icontinuum", deployment_defaults: dict = None):
         """
         Initialize Kubernetes client.
         
         Args:
             master_ip: IP address of the Kubernetes master node
             username: SSH username for the master node
+            deployment_defaults: Optional dict mapping deployment names to default
+                                 cpu/memory limits from config.yaml. Used when K8s
+                                 returns None for limits (not set).
+                                 Format: {"microservice1-deployment": {"cpu": "300m", "memory": "312Mi"}, ...}
         """
         self.master_ip = master_ip
         self.username = username
+        self.deployment_defaults = deployment_defaults or {}
     
     def _run_kubectl(self, command: str) -> str:
         """
@@ -162,6 +167,9 @@ class KubernetesClient:
                     cpu_limit = limits.get("cpu")
                     memory_limit = limits.get("memory")
                 
+                # Normalize CPU limit: K8s may store "1" for 1000m, "0.5" for 500m, etc.
+                cpu_limit = self._normalize_cpu_value(cpu_limit)
+                
                 deployment = {
                     "name": item.get("metadata", {}).get("name"),
                     "replicas_desired": item.get("spec", {}).get("replicas", 0),
@@ -175,6 +183,38 @@ class KubernetesClient:
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse deployments JSON: {e}")
             return []
+    
+    @staticmethod
+    def _normalize_cpu_value(cpu_val) -> str:
+        """
+        Normalize Kubernetes CPU values to millicores format.
+        
+        K8s API returns CPU in various formats:
+        - "500m" (already millicores)
+        - "1" (1 core = 1000m)
+        - "0.5" (0.5 cores = 500m)
+        - "2" (2 cores = 2000m)
+        - None (not set)
+        
+        Returns:
+            CPU value in millicores format (e.g., "500m") or None if not set
+        """
+        if cpu_val is None:
+            return None
+        
+        cpu_str = str(cpu_val).strip()
+        
+        # Already in millicores format
+        if cpu_str.endswith("m"):
+            return cpu_str
+        
+        # Plain number: could be cores (e.g., "1" = 1000m, "0.5" = 500m)
+        try:
+            cores = float(cpu_str)
+            millicores = int(cores * 1000)
+            return f"{millicores}m"
+        except (ValueError, TypeError):
+            return cpu_str
     
     def scale_deployment(self, deployment_name: str, replicas: int, namespace: str = "default") -> dict:
         """
@@ -332,6 +372,7 @@ class KubernetesClient:
         Get deployments with their resource limits AND current usage.
         
         This combines deployment spec (limits) with kubectl top (current usage).
+        Missing limits are filled from deployment_defaults (config.yaml).
         
         Args:
             namespace: Kubernetes namespace
@@ -350,6 +391,18 @@ class KubernetesClient:
         
         for dep in deployments:
             dep_name = dep.get("name", "")
+            
+            # Fill missing limits from config defaults
+            defaults = self.deployment_defaults.get(dep_name, {})
+            if not dep.get("cpu_limit"):
+                default_cpu = defaults.get("cpu", "300m")
+                dep["cpu_limit"] = default_cpu
+                logger.debug(f"Using default cpu_limit={default_cpu} for {dep_name}")
+            if not dep.get("memory_limit"):
+                default_mem = defaults.get("memory", "312Mi")
+                dep["memory_limit"] = default_mem
+                logger.debug(f"Using default memory_limit={default_mem} for {dep_name}")
+            
             # Find matching pod metrics
             # Pod names are like "microservice1-deployment-76d476998c-4w662"
             # so we match on the deployment name prefix
