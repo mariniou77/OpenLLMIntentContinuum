@@ -5,14 +5,19 @@ Locust Load Generator for IntentContinuum Experiments
 Runs on the SDN controller and sends requests via SSH to the master node,
 where they travel through the SDN network to the application microservices.
 
-This matches the same request mechanism used by the Intent Watch Loop.
+Supports two modes:
+1. Flat load: --users N (constant N users for the whole run)
+2. Staged load: Uses LoadTestShape to vary users over time, matching
+   the IntentContinuum paper's pattern [10, 20, 15, 10, 5, 20, 10]
 
 Usage:
-    # Headless mode with staged load (recommended for experiments):
-    python3 -m locust -f locustfile.py --headless --host ssh://master \
-        --run-time 900s --csv results/experiment1
+    # Flat load:
+    locust -f locustfile.py --headless --users 10 --spawn-rate 1 \
+        --run-time 900s --host ssh://master --csv=results
 
-    # Or use the run_experiment.py wrapper which handles everything.
+    # Staged load (automatic, just set run-time):
+    LOCUST_STAGED=1 locust -f locustfile.py --headless \
+        --run-time 900s --host ssh://master --csv=results
 """
 
 import os
@@ -21,12 +26,11 @@ import time
 import uuid
 import logging
 
-from locust import User, task, between, events
+from locust import User, task, between, events, LoadTestShape
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────
-# These match config.yaml - adjust if your setup differs
 MASTER_HOST = os.environ.get("MASTER_HOST", "10.132.0.7")
 MASTER_USER = os.environ.get("MASTER_USER", "antonios-icontinuum")
 REMOTE_IMAGE = os.environ.get("REMOTE_IMAGE", "/home/antonios-icontinuum/test_converted.jpg")
@@ -35,6 +39,22 @@ WEBHOOKS = os.environ.get("WEBHOOKS", "http://microservice2-service:5002/bw,http
 DB_URL = os.environ.get("DB_URL", "http://db-service:5006/track_time")
 LOGS_URL = os.environ.get("LOGS_URL", "http://db-service:5006/log")
 REQUEST_TIMEOUT = 60  # seconds
+
+# ── Staged Load Configuration ─────────────────────────────────────────────
+# Each tuple: (duration_seconds, num_users, spawn_rate)
+# Pattern from IntentContinuum paper: [10, 20, 15, 10, 5, 20, 10] users
+# with 120s intervals
+LOAD_STAGES = [
+    (120, 10, 1),   # 0-120s:   10 users (ramp up)
+    (120, 20, 1),   # 120-240s: 20 users (peak)
+    (120, 15, 1),   # 240-360s: 15 users (decrease)
+    (120, 10, 1),   # 360-480s: 10 users (normal)
+    (120, 5, 1),    # 480-600s: 5 users  (low)
+    (120, 20, 1),   # 600-720s: 20 users (peak again)
+    (120, 10, 1),   # 720-840s: 10 users (settle)
+]
+
+USE_STAGED = os.environ.get("LOCUST_STAGED", "0") == "1"
 
 
 class ImageProcessingUser(User):
@@ -84,14 +104,13 @@ class ImageProcessingUser(User):
                 timeout=REQUEST_TIMEOUT + 30
             )
             
-            elapsed_ms = (time.time() - start_time) * 1000  # Locust expects ms
+            elapsed_ms = (time.time() - start_time) * 1000
             
             if result.returncode == 0:
                 try:
                     response_time_s = float(result.stdout.strip())
                     response_time_ms = response_time_s * 1000
                     
-                    # Report success to Locust
                     events.request.fire(
                         request_type="POST",
                         name="/resize",
@@ -139,3 +158,31 @@ class ImageProcessingUser(User):
                 exception=e,
                 context={}
             )
+
+
+class StagesShape(LoadTestShape):
+    """
+    Staged load pattern matching the IntentContinuum paper.
+    
+    Varies user count over time: [10, 20, 15, 10, 5, 20, 10]
+    with 120-second intervals between changes.
+    
+    Only active when LOCUST_STAGED=1 environment variable is set.
+    """
+    
+    stages = LOAD_STAGES
+    
+    def tick(self):
+        if not USE_STAGED:
+            return None  # Fall back to --users flag
+        
+        run_time = self.get_run_time()
+        
+        elapsed = 0
+        for duration, users, spawn_rate in self.stages:
+            if run_time < elapsed + duration:
+                return (users, spawn_rate)
+            elapsed += duration
+        
+        # Past all stages — stop
+        return None
