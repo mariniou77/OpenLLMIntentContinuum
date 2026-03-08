@@ -331,10 +331,14 @@ JSON:
         history: str
     ) -> str:
         """
-        Build the prompt for LLM root cause analysis.
+        Build the prompt with structured direction and pre-computed action targets.
         
-        Provides the LLM with full system context and lets it reason
-        about the root cause and recommend an appropriate action.
+        The LLM receives:
+        - Rich monitoring data (sFlow + K8s)
+        - Clear direction (INCREASE or DECREASE resources)
+        - Pre-computed list of valid actions to choose from
+        
+        The LLM picks which target and action from the list.
         """
         # Status description
         if violation_type == "UPPER_THRESHOLD_EXCEEDED":
@@ -342,7 +346,7 @@ JSON:
         else:
             status = f"TOO FAST (below {self.lower_threshold}s). Resources are over-provisioned and being wasted."
         
-        # Format deployments with node placement
+        # Format deployments with node placement and sFlow metrics
         deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
         
         # Format node-level metrics
@@ -354,6 +358,11 @@ JSON:
         else:
             history_section = "PREVIOUS ACTIONS: None yet."
         
+        # Pre-compute direction and available targets
+        direction, available_targets = self._compute_available_actions(
+            violation_type, cluster_data
+        )
+        
         # Fill in the template
         prompt = self.prompt_template.format(
             ema_rt=f"{ema_rt:.2f}",
@@ -362,10 +371,97 @@ JSON:
             status=status,
             deployments_table=deployments_table,
             node_metrics=node_metrics,
-            history_section=history_section
+            history_section=history_section,
+            direction=direction,
+            available_targets=available_targets,
         )
         
         return prompt
+    
+    def _compute_available_actions(self, violation_type: str, cluster_data: dict) -> tuple:
+        """
+        Pre-compute the direction and list of valid actions for the LLM.
+        
+        This removes ambiguity — the LLM picks from a list of concrete
+        JSON actions instead of constructing its own.
+        
+        Returns:
+            (direction_text, available_targets_text)
+        """
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        # Filter to valid deployments
+        valid_deps = []
+        for d in deployments:
+            name = d.get("name", "")
+            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
+                continue
+            valid_deps.append(d)
+        
+        targets = []
+        
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+            direction = "INCREASE resources to reduce response time. Pick one action:"
+            
+            for d in valid_deps:
+                name = d.get("name", "")
+                cpu_str = str(d.get("cpu_limit", "300m")).replace("m", "").strip()
+                try:
+                    cpu_val = int(cpu_str)
+                except (ValueError, TypeError):
+                    cpu_val = 300
+                
+                replicas = d.get("replicas_ready", d.get("replicas_desired", 1))
+                dep_config = self._get_deployment_config(name)
+                max_replicas = dep_config.get("max_replicas", 5)
+                
+                # Option A: vertical scaling (if not at max CPU)
+                if cpu_val < 1000:
+                    new_cpu = min(cpu_val + 200, 1000)
+                    mem_limit = d.get("memory_limit", "512Mi")
+                    targets.append(
+                        f'- Increase CPU for {name}: {{"action":"vertical_scaling","parameters":{{"deployment_name":"{name}","cpu_limit":"{new_cpu}m","memory_limit":"{mem_limit}"}}}}'
+                    )
+                
+                # Option B: horizontal scaling (if not at max replicas)
+                if replicas < max_replicas:
+                    targets.append(
+                        f'- Add replica for {name}: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"{name}","replicas":{replicas + 1}}}}}'
+                    )
+        
+        else:  # LOWER_THRESHOLD_EXCEEDED
+            direction = "DECREASE resources to save costs. Pick one action:"
+            
+            for d in valid_deps:
+                name = d.get("name", "")
+                cpu_str = str(d.get("cpu_limit", "300m")).replace("m", "").strip()
+                try:
+                    cpu_val = int(cpu_str)
+                except (ValueError, TypeError):
+                    cpu_val = 300
+                
+                replicas = d.get("replicas_ready", d.get("replicas_desired", 1))
+                
+                # Option A: reduce replicas (if more than 1)
+                if replicas > 1:
+                    targets.append(
+                        f'- Remove replica from {name}: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"{name}","replicas":{replicas - 1}}}}}'
+                    )
+                
+                # Option B: reduce CPU (if above minimum)
+                if cpu_val > 100:
+                    new_cpu = max(cpu_val - 100, 100)
+                    mem_limit = d.get("memory_limit", "312Mi")
+                    targets.append(
+                        f'- Reduce CPU for {name}: {{"action":"vertical_scaling","parameters":{{"deployment_name":"{name}","cpu_limit":"{new_cpu}m","memory_limit":"{mem_limit}"}}}}'
+                    )
+        
+        if not targets:
+            targets.append('- No valid actions available: {"action":"none","parameters":{}}')
+        
+        return direction, "AVAILABLE ACTIONS:\n" + "\n".join(targets)
     
     def _format_node_metrics(self, monitoring_data: dict) -> str:
         """

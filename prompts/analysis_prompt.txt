@@ -2,6 +2,7 @@ You manage a Kubernetes microservice application deployed across edge and cloud 
 
 INTENT: Keep average response time between {lower_threshold}s and {upper_threshold}s.
 CURRENT: EMA Response Time = {ema_rt}s — {status}
+
 {history_section}
 
 CLUSTER STATE:
@@ -10,21 +11,14 @@ CLUSTER STATE:
 NODE RESOURCES:
 {node_metrics}
 
-AVAILABLE ACTIONS:
-- vertical_scaling: Change CPU/memory limits for a deployment
-- horizontal_scaling: Change replica count for a deployment
+DIRECTION: {direction}
+
+{available_targets}
 
 CONSTRAINTS: CPU range 100m-1000m, Replicas range 1-5.
 
-Analyze the root cause of the violation. Consider:
-- Which microservice is the bottleneck? (highest CPU usage relative to its limit)
-- Is the problem compute-bound (high CPU) or load-bound (too many requests)?
-- Are resources over-provisioned (wasting CPU) or under-provisioned (starving)?
-- What did previous actions achieve? Should we try something different?
-
-Respond with ONLY a JSON object:
+Pick ONE target from the list above and respond with ONLY a JSON object:
 {{"action": "vertical_scaling", "parameters": {{"deployment_name": "...", "cpu_limit": "...m", "memory_limit": "...Mi"}}}}
 {{"action": "horizontal_scaling", "parameters": {{"deployment_name": "...", "replicas": N}}}}
-{{"action": "none", "parameters": {{}}}}
 
 JSON:
