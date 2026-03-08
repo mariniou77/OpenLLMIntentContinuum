@@ -74,6 +74,9 @@ class DecisionMaker:
         
         # Track consecutive parse failures for diagnostics
         self._consecutive_failures = 0
+        
+        # Store last cluster data for no-change detection
+        self._last_cluster_data = {}
     
     def _load_prompt_template(self) -> str:
         """Load the prompt template from file."""
@@ -180,6 +183,22 @@ JSON:
             nodes = dep_to_nodes.get(name, ["unknown"])
             node_str = ", ".join(nodes)
             
+            # Check if at limits for warnings
+            warnings = []
+            try:
+                cpu_limit_val = int(str(cpu_limit).replace("m", "").strip())
+                if cpu_limit_val >= 1000:
+                    warnings.append("CPU AT MAX")
+            except (ValueError, TypeError):
+                pass
+            
+            dep_config = self._get_deployment_config(name)
+            max_reps = dep_config.get("max_replicas", 5)
+            if replicas >= max_reps:
+                warnings.append("REPLICAS AT MAX")
+            
+            warning_str = f" ⚠ {', '.join(warnings)}" if warnings else ""
+            
             # Get sFlow metrics for this deployment
             sflow_data = dep_to_sflow.get(name, [])
             if sflow_data:
@@ -195,7 +214,7 @@ JSON:
                     f"- {name} ({node_str}): replicas={replicas}, "
                     f"cpu={avg_cpu:.1f}%, cpu_limit={cpu_limit}, "
                     f"mem={mem_used_mi}Mi/{memory_limit}, "
-                    f"traffic_in={traffic_in_kb}KB/s"
+                    f"traffic_in={traffic_in_kb}KB/s{warning_str}"
                 )
             else:
                 # Fallback to kubectl top data if sFlow not available
@@ -204,7 +223,7 @@ JSON:
                 lines.append(
                     f"- {name} ({node_str}): replicas={replicas}, "
                     f"cpu_usage={cpu_usage}, cpu_limit={cpu_limit}, "
-                    f"mem={memory_usage}/{memory_limit}"
+                    f"mem={memory_usage}/{memory_limit}{warning_str}"
                 )
         
         return '\n'.join(lines) if lines else "No deployment data available"
@@ -543,9 +562,10 @@ JSON:"""
             logger.error(f"Ollama API error: {e}")
             return None
     
-    def _validate_action(self, action: dict) -> tuple:
+    def _validate_action(self, action: dict, cluster_data: dict = None) -> tuple:
         """
         Validate a parsed action against known constraints.
+        Rejects actions that would set the same values as currently applied.
         
         Returns:
             (is_valid: bool, error_reason: str)
@@ -578,6 +598,9 @@ JSON:"""
         max_replicas = dep_config.get("max_replicas", 5)
         min_replicas = dep_config.get("min_replicas", 1)
         
+        # Get current state for no-change detection
+        current_state = self._get_current_deployment_state(dep_name, cluster_data)
+        
         # Validate horizontal_scaling parameters with clamping
         if action_type == "horizontal_scaling":
             replicas = params.get("replicas")
@@ -595,6 +618,11 @@ JSON:"""
                 logger.info(f"Clamping replicas from {replicas} to max={max_replicas}")
                 replicas = max_replicas
             params["replicas"] = replicas
+            
+            # No-change detection
+            current_replicas = current_state.get("replicas", 0)
+            if replicas == current_replicas:
+                return False, f"No change: {dep_name} already has {replicas} replicas. Try a different deployment or action type."
         
         # Validate vertical_scaling parameters with clamping
         if action_type == "vertical_scaling":
@@ -632,8 +660,36 @@ JSON:"""
                     params["memory_limit"] = f"{mem_val}Mi"
                 except (ValueError, TypeError):
                     pass  # Keep original if can't parse
+            
+            # No-change detection
+            current_cpu = current_state.get("cpu_limit_m", 0)
+            if cpu_val == current_cpu:
+                return False, f"No change: {dep_name} already has cpu_limit={cpu_val}m. Try horizontal_scaling or a different deployment."
         
         return True, ""
+    
+    def _get_current_deployment_state(self, dep_name: str, cluster_data: dict = None) -> dict:
+        """Get current replicas and cpu_limit for a deployment from cluster data."""
+        if not cluster_data:
+            cluster_data = self._last_cluster_data or {}
+        
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        for d in deployments:
+            if d.get("name", "").lower() == dep_name.lower():
+                cpu_str = str(d.get("cpu_limit", "0m")).replace("m", "").strip()
+                try:
+                    cpu_m = int(cpu_str)
+                except (ValueError, TypeError):
+                    cpu_m = 0
+                return {
+                    "replicas": d.get("replicas_ready", d.get("replicas_desired", 0)),
+                    "cpu_limit_m": cpu_m,
+                    "memory_limit": d.get("memory_limit", "")
+                }
+        return {"replicas": 0, "cpu_limit_m": 0, "memory_limit": ""}
     
     def _get_deployment_config(self, dep_name: str) -> dict:
         """Get deployment-specific config (limits etc) from config.yaml."""
@@ -1040,6 +1096,9 @@ JSON:"""
         network_data = network_data or {}
         monitoring_data = monitoring_data or {}
         
+        # Store for no-change detection
+        self._last_cluster_data = cluster_data
+        
         # Build the initial prompt
         prompt = self.build_prompt(
             violation_type=violation_type,
@@ -1077,7 +1136,7 @@ JSON:"""
             action = self._parse_response(response_text)
             
             # Validate the parsed action
-            is_valid, error_reason = self._validate_action(action)
+            is_valid, error_reason = self._validate_action(action, cluster_data)
             
             if is_valid:
                 self._consecutive_failures = 0
