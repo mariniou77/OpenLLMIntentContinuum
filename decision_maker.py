@@ -42,16 +42,16 @@ class DecisionMaker:
     """
     
     def __init__(self, config: dict):
-        """
-        Initialize Decision Maker with configuration.
-        
-        Args:
-            config: Configuration dictionary containing LLM settings
-        """
         self.config = config
         self.ollama_url = config["endpoints"]["ollama"]
         self.model = config["llm"]["model"]
-        self.temperature = config["llm"]["temperature"]
+        
+        # New Qwen-specific inference parameters
+        self.temperature = config["llm"].get("temperature", 0.6)
+        self.top_p = config["llm"].get("top_p", 0.95)
+        self.presence_penalty = config["llm"].get("presence_penalty", 0.0)
+        self.repeat_penalty = config["llm"].get("repeat_penalty", 1.05)
+        
         self.debug_llm = config.get("debug_llm", False)
         
         # Load prompt template
@@ -64,7 +64,7 @@ class DecisionMaker:
         # Enabled actions
         self.actions_enabled = config.get("actions", {})
         
-        # Build valid deployment names set from config (used for validation)
+        # Build valid deployment names set from config
         self.valid_deployment_names = set()
         k8s_config = config.get("kubernetes", {})
         for dep in k8s_config.get("deployments", []):
@@ -72,10 +72,7 @@ class DecisionMaker:
             if dep_name:
                 self.valid_deployment_names.add(dep_name.lower())
         
-        # Track consecutive parse failures for diagnostics
         self._consecutive_failures = 0
-        
-        # Store last cluster data for no-change detection
         self._last_cluster_data = {}
     
     def _load_prompt_template(self) -> str:
@@ -89,26 +86,23 @@ class DecisionMaker:
             return self._get_default_prompt_template()
     
     def _get_default_prompt_template(self) -> str:
-        """Return embedded default template if file not found."""
         return """You are a Kubernetes resource manager. Pick ONE action to fix the problem.
 
 PROBLEM: EMA Response Time is {ema_rt}s (target: {lower_threshold}s-{upper_threshold}s)
 STATUS: {status}
 
-RULE: {what_to_do}
+RULE: {direction}
 
 CURRENT STATE:
 {deployments_table}
 {bottleneck_hint}
-LIMITS: {constraints}
+
+{available_targets}
+
 {history_section}
-Pick the deployment that needs adjustment. Use the exact deployment name in JSON.
 
-EXAMPLES:
-{{"action":"vertical_scaling","parameters":{{"deployment_name":"microservice3-deployment","cpu_limit":"600m","memory_limit":"612Mi"}}}}
-{{"action":"horizontal_scaling","parameters":{{"deployment_name":"microservice1-deployment","replicas":2}}}}
-
-JSON:
+Pick the deployment that needs adjustment. You MUST output exactly ONE action using this XML format:
+<function=ACTION_NAME><parameter=KEY>VALUE</parameter></function>
 """
 
     def _get_enabled_actions_description(self) -> str:
@@ -323,12 +317,10 @@ JSON:
     def build_prompt(
         self,
         violation_type: str,
-        current_rt: float,
         ema_rt: float,
         cluster_data: dict,
         network_data: dict,
         monitoring_data: dict,
-        history: str
     ) -> str:
         """
         Build the prompt with structured direction and pre-computed action targets.
@@ -352,12 +344,6 @@ JSON:
         # Format node-level metrics
         node_metrics = self._format_node_metrics(monitoring_data)
         
-        # History section
-        if history and history != "(none)":
-            history_section = f"PREVIOUS ACTIONS:\n{history}"
-        else:
-            history_section = "PREVIOUS ACTIONS: None yet."
-        
         # Pre-compute direction and available targets
         direction, available_targets = self._compute_available_actions(
             violation_type, cluster_data
@@ -371,7 +357,6 @@ JSON:
             status=status,
             deployments_table=deployments_table,
             node_metrics=node_metrics,
-            history_section=history_section,
             direction=direction,
             available_targets=available_targets,
         )
@@ -379,87 +364,46 @@ JSON:
         return prompt
     
     def _compute_available_actions(self, violation_type: str, cluster_data: dict) -> tuple:
-        """
-        Pre-compute the direction and list of valid actions for the LLM.
-        
-        This removes ambiguity — the LLM picks from a list of concrete
-        JSON actions instead of constructing its own.
-        
-        Returns:
-            (direction_text, available_targets_text)
-        """
         deployments = cluster_data.get("deployments", {}).get("list", [])
         if not deployments:
             deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
         
-        # Filter to valid deployments
-        valid_deps = []
-        for d in deployments:
-            name = d.get("name", "")
-            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
-                continue
-            valid_deps.append(d)
-        
+        valid_deps = [d for d in deployments if not self.valid_deployment_names or d.get("name", "").lower() in self.valid_deployment_names]
         targets = []
         
         if violation_type == "UPPER_THRESHOLD_EXCEEDED":
-            direction = "INCREASE resources to reduce response time. Pick one action:"
-            
+            direction = "INCREASE resources to reduce response time. Pick one action from the list below:"
             for d in valid_deps:
                 name = d.get("name", "")
-                cpu_str = str(d.get("cpu_limit", "300m")).replace("m", "").strip()
-                try:
-                    cpu_val = int(cpu_str)
-                except (ValueError, TypeError):
-                    cpu_val = 300
-                
+                cpu_val = int(str(d.get("cpu_limit", "300m")).replace("m", "").strip()) if str(d.get("cpu_limit", "300m")).replace("m", "").strip().isdigit() else 300
                 replicas = d.get("replicas_ready", d.get("replicas_desired", 1))
-                dep_config = self._get_deployment_config(name)
-                max_replicas = dep_config.get("max_replicas", 5)
+                max_replicas = self._get_deployment_config(name).get("max_replicas", 5)
                 
-                # Option A: vertical scaling (if not at max CPU)
                 if cpu_val < 1000:
                     new_cpu = min(cpu_val + 200, 1000)
                     mem_limit = d.get("memory_limit", "512Mi")
-                    targets.append(
-                        f'- Increase CPU for {name}: {{"action":"vertical_scaling","parameters":{{"deployment_name":"{name}","cpu_limit":"{new_cpu}m","memory_limit":"{mem_limit}"}}}}'
-                    )
+                    targets.append(f'- Increase CPU: <function=vertical_scaling><parameter=deployment_name>{name}</parameter><parameter=cpu_limit>{new_cpu}m</parameter><parameter=memory_limit>{mem_limit}</parameter></function>')
                 
-                # Option B: horizontal scaling (if not at max replicas)
                 if replicas < max_replicas:
-                    targets.append(
-                        f'- Add replica for {name}: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"{name}","replicas":{replicas + 1}}}}}'
-                    )
+                    targets.append(f'- Add replica: <function=horizontal_scaling><parameter=deployment_name>{name}</parameter><parameter=replicas>{replicas + 1}</parameter></function>')
         
-        else:  # LOWER_THRESHOLD_EXCEEDED
-            direction = "DECREASE resources to save costs. Pick one action:"
-            
+        else:
+            direction = "DECREASE resources to save costs. Pick one action from the list below:"
             for d in valid_deps:
                 name = d.get("name", "")
-                cpu_str = str(d.get("cpu_limit", "300m")).replace("m", "").strip()
-                try:
-                    cpu_val = int(cpu_str)
-                except (ValueError, TypeError):
-                    cpu_val = 300
-                
+                cpu_val = int(str(d.get("cpu_limit", "300m")).replace("m", "").strip()) if str(d.get("cpu_limit", "300m")).replace("m", "").strip().isdigit() else 300
                 replicas = d.get("replicas_ready", d.get("replicas_desired", 1))
                 
-                # Option A: reduce replicas (if more than 1)
                 if replicas > 1:
-                    targets.append(
-                        f'- Remove replica from {name}: {{"action":"horizontal_scaling","parameters":{{"deployment_name":"{name}","replicas":{replicas - 1}}}}}'
-                    )
+                    targets.append(f'- Remove replica: <function=horizontal_scaling><parameter=deployment_name>{name}</parameter><parameter=replicas>{replicas - 1}</parameter></function>')
                 
-                # Option B: reduce CPU (if above minimum)
                 if cpu_val > 100:
                     new_cpu = max(cpu_val - 100, 100)
                     mem_limit = d.get("memory_limit", "312Mi")
-                    targets.append(
-                        f'- Reduce CPU for {name}: {{"action":"vertical_scaling","parameters":{{"deployment_name":"{name}","cpu_limit":"{new_cpu}m","memory_limit":"{mem_limit}"}}}}'
-                    )
+                    targets.append(f'- Reduce CPU: <function=vertical_scaling><parameter=deployment_name>{name}</parameter><parameter=cpu_limit>{new_cpu}m</parameter><parameter=memory_limit>{mem_limit}</parameter></function>')
         
         if not targets:
-            targets.append('- No valid actions available: {"action":"none","parameters":{}}')
+            targets.append('<function=none></function>')
         
         return direction, "AVAILABLE ACTIONS:\n" + "\n".join(targets)
     
@@ -561,31 +505,15 @@ JSON:
                 return ""
     
     def _build_retry_prompt(self, previous_response: str, error_reason: str) -> str:
-        """
-        Build a short corrective prompt for retry attempts.
-        
-        Small LLMs often fix their output when given specific feedback
-        about what was wrong.
-        
-        Args:
-            previous_response: The LLM's previous (failed) response
-            error_reason: What was wrong with it
-            
-        Returns:
-            Short corrective prompt
-        """
         valid_names = sorted(self.valid_deployment_names)
-        names_str = ", ".join(valid_names) if valid_names else "microservice1-deployment, microservice3-deployment"
-        
+        names_str = ", ".join(valid_names) if valid_names else "microservice1-deployment"
         return f"""Your previous response was invalid: {error_reason}
 
 Valid deployment names: {names_str}
 
-Respond with ONLY a JSON object like one of these:
-{{"action":"horizontal_scaling","parameters":{{"deployment_name":"{valid_names[0] if valid_names else 'microservice1-deployment'}","replicas":2}}}}
-{{"action":"vertical_scaling","parameters":{{"deployment_name":"{valid_names[0] if valid_names else 'microservice1-deployment'}","cpu_limit":"500m","memory_limit":"512Mi"}}}}
-
-JSON:"""
+Respond with ONLY the XML tags like one of these examples:
+<function=horizontal_scaling><parameter=deployment_name>{valid_names[0] if valid_names else 'microservice1-deployment'}</parameter><parameter=replicas>2</parameter></function>
+<function=vertical_scaling><parameter=deployment_name>{valid_names[0] if valid_names else 'microservice1-deployment'}</parameter><parameter=cpu_limit>500m</parameter><parameter=memory_limit>512Mi</parameter></function>"""
 
     def _build_tool_definitions(self, violation_type: str, cluster_data: dict) -> list:
         """
@@ -701,35 +629,16 @@ JSON:"""
         return tools
     
     def _build_system_prompt(self) -> str:
-        """
-        Build a rich, descriptive system prompt that explains the role,
-        the architecture, and the decision-making philosophy.
-        
-        Uses full natural language — no abbreviations — because Qwen3.5
-        has 262K token context and understands verbose instructions better
-        than compressed formats.
-        """
-        return """You are an intelligent Kubernetes resource manager responsible for maintaining application performance in a distributed edge-to-cloud computing environment.
+        return """You are an intelligent Kubernetes resource manager responsible for maintaining application performance.
+Your goal is to keep the application's average response time within a defined range.
 
-Your job is to monitor a microservice application that processes images through a chain of four services:
-- microservice1-deployment handles image resizing and is the entry point for all requests
-- microservice2-deployment converts images to grayscale for further processing  
-- microservice3-deployment runs object detection using a machine learning model (this is the most computationally intensive service)
-- microservice4-deployment sends notifications based on detected objects
+When you decide on an action, you must output your decision strictly in this exact XML format and nothing else. Do not use JSON.
+Example for scaling up:
+<function=horizontal_scaling><parameter=deployment_name>microservice1-deployment</parameter><parameter=replicas>2</parameter></function>
+Example for vertical scaling:
+<function=vertical_scaling><parameter=deployment_name>microservice3-deployment</parameter><parameter=cpu_limit>600m</parameter><parameter=memory_limit>612Mi</parameter></function>
 
-These services are deployed across a Kubernetes cluster with a master node and worker nodes, connected through a Software-Defined Network (SDN).
-
-Your goal is to keep the application's average response time within a defined range by using the tools available to you. When response time is too high, you should identify which service is the bottleneck (the one using the most CPU relative to its limit) and increase its resources. When response time is too low, it means resources are being wasted and you should reduce resources for the service that is most over-provisioned.
-
-Key principles for your decisions:
-- The service with the highest CPU usage percentage relative to its CPU limit is usually the bottleneck
-- microservice3-deployment (object detection) is typically the most resource-hungry service because it runs a machine learning model
-- Adding replicas helps when a service is handling too many concurrent requests
-- Increasing CPU limit helps when a service needs more processing power per request
-- When scaling down, target the service with the lowest CPU usage or the most replicas
-- Consider the node resources: if a node is heavily loaded, scaling services on that node may not help
-
-You must call exactly one tool. Analyze the metrics provided and choose the most impactful action."""
+Do not add any reasoning or extra text before or after the XML tags. Just output the XML."""
     
     def _query_ollama_with_tools(self, user_prompt: str, tools: list) -> Optional[dict]:
         """
