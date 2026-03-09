@@ -14,7 +14,6 @@ Analyze the current performance violation and select exactly ONE action to retur
 
 ### CLUSTER STATE
 {deployments_table}
-{bottleneck_hint}
 
 ### REQUIRED FORMAT
 You must respond ONLY with one of the following XML tags. Do not provide reasoning. Do not add text before or after the tag.
