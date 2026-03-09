@@ -587,18 +587,289 @@ Respond with ONLY a JSON object like one of these:
 
 JSON:"""
 
-    def _query_ollama(self, prompt: str) -> Optional[str]:
+    def _build_tool_definitions(self, violation_type: str, cluster_data: dict) -> list:
         """
-        Send prompt to Ollama API using /api/chat with think:false.
+        Build Ollama-compatible tool definitions based on current cluster state.
         
-        Uses the chat endpoint with system + user messages and disables
-        thinking mode for qwen3.x models to get direct JSON output.
+        For UPPER violations: only INCREASE tools (raise CPU, add replicas)
+        For LOWER violations: only DECREASE tools (lower CPU, remove replicas)
+        
+        Returns:
+            List of tool definition dicts for the Ollama /api/chat tools parameter
+        """
+        deployments = cluster_data.get("deployments", {}).get("list", [])
+        if not deployments:
+            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
+        
+        tools = []
+        
+        for d in deployments:
+            name = d.get("name", "")
+            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
+                continue
+            
+            cpu_str = str(d.get("cpu_limit", "300m")).replace("m", "").strip()
+            try:
+                cpu_val = int(cpu_str)
+            except (ValueError, TypeError):
+                cpu_val = 300
+            
+            replicas = d.get("replicas_ready", d.get("replicas_desired", 1))
+            dep_config = self._get_deployment_config(name)
+            max_replicas = dep_config.get("max_replicas", 5)
+            
+            if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+                # Vertical scaling up (if not at max)
+                if cpu_val < 1000:
+                    new_cpu = min(cpu_val + 200, 1000)
+                    mem_limit = d.get("memory_limit", "512Mi")
+                    tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": "increase_cpu",
+                            "description": f"Increase CPU limit for {name} from {cpu_val}m to {new_cpu}m. Use this when {name} has high CPU usage relative to its limit and is slowing down request processing.",
+                            "parameters": {
+                                "type": "object",
+                                "required": ["deployment_name", "cpu_limit", "memory_limit"],
+                                "properties": {
+                                    "deployment_name": {"type": "string", "enum": [name], "description": f"The deployment to scale. Must be {name}."},
+                                    "cpu_limit": {"type": "string", "enum": [f"{new_cpu}m"], "description": f"New CPU limit. Must be {new_cpu}m."},
+                                    "memory_limit": {"type": "string", "enum": [mem_limit], "description": f"Memory limit. Must be {mem_limit}."}
+                                }
+                            }
+                        }
+                    })
+                
+                # Horizontal scaling up (if not at max)
+                if replicas < max_replicas:
+                    tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": "add_replica",
+                            "description": f"Add one replica to {name}, going from {replicas} to {replicas + 1} replicas. Use this when the deployment needs to handle more concurrent requests and adding parallelism would reduce queuing delays.",
+                            "parameters": {
+                                "type": "object",
+                                "required": ["deployment_name", "replicas"],
+                                "properties": {
+                                    "deployment_name": {"type": "string", "enum": [name], "description": f"The deployment to scale. Must be {name}."},
+                                    "replicas": {"type": "integer", "enum": [replicas + 1], "description": f"New replica count. Must be {replicas + 1}."}
+                                }
+                            }
+                        }
+                    })
+            
+            else:  # LOWER_THRESHOLD_EXCEEDED
+                # Scale down replicas (if more than 1)
+                if replicas > 1:
+                    tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": "remove_replica",
+                            "description": f"Remove one replica from {name}, going from {replicas} to {replicas - 1} replicas. Use this when the deployment has more replicas than needed and resources are being wasted.",
+                            "parameters": {
+                                "type": "object",
+                                "required": ["deployment_name", "replicas"],
+                                "properties": {
+                                    "deployment_name": {"type": "string", "enum": [name], "description": f"The deployment to scale. Must be {name}."},
+                                    "replicas": {"type": "integer", "enum": [replicas - 1], "description": f"New replica count. Must be {replicas - 1}."}
+                                }
+                            }
+                        }
+                    })
+                
+                # Reduce CPU (if above minimum)
+                if cpu_val > 100:
+                    new_cpu = max(cpu_val - 100, 100)
+                    mem_limit = d.get("memory_limit", "312Mi")
+                    tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": "reduce_cpu",
+                            "description": f"Reduce CPU limit for {name} from {cpu_val}m to {new_cpu}m. Use this when {name} has low CPU usage relative to its limit and is wasting resources.",
+                            "parameters": {
+                                "type": "object",
+                                "required": ["deployment_name", "cpu_limit", "memory_limit"],
+                                "properties": {
+                                    "deployment_name": {"type": "string", "enum": [name], "description": f"The deployment to scale. Must be {name}."},
+                                    "cpu_limit": {"type": "string", "enum": [f"{new_cpu}m"], "description": f"New CPU limit. Must be {new_cpu}m."},
+                                    "memory_limit": {"type": "string", "enum": [mem_limit], "description": f"Memory limit. Must be {mem_limit}."}
+                                }
+                            }
+                        }
+                    })
+        
+        return tools
+    
+    def _build_system_prompt(self) -> str:
+        """
+        Build a rich, descriptive system prompt that explains the role,
+        the architecture, and the decision-making philosophy.
+        
+        Uses full natural language — no abbreviations — because Qwen3.5
+        has 262K token context and understands verbose instructions better
+        than compressed formats.
+        """
+        return """You are an intelligent Kubernetes resource manager responsible for maintaining application performance in a distributed edge-to-cloud computing environment.
+
+Your job is to monitor a microservice application that processes images through a chain of four services:
+- microservice1-deployment handles image resizing and is the entry point for all requests
+- microservice2-deployment converts images to grayscale for further processing  
+- microservice3-deployment runs object detection using a machine learning model (this is the most computationally intensive service)
+- microservice4-deployment sends notifications based on detected objects
+
+These services are deployed across a Kubernetes cluster with a master node and worker nodes, connected through a Software-Defined Network (SDN).
+
+Your goal is to keep the application's average response time within a defined range by using the tools available to you. When response time is too high, you should identify which service is the bottleneck (the one using the most CPU relative to its limit) and increase its resources. When response time is too low, it means resources are being wasted and you should reduce resources for the service that is most over-provisioned.
+
+Key principles for your decisions:
+- The service with the highest CPU usage percentage relative to its CPU limit is usually the bottleneck
+- microservice3-deployment (object detection) is typically the most resource-hungry service because it runs a machine learning model
+- Adding replicas helps when a service is handling too many concurrent requests
+- Increasing CPU limit helps when a service needs more processing power per request
+- When scaling down, target the service with the lowest CPU usage or the most replicas
+- Consider the node resources: if a node is heavily loaded, scaling services on that node may not help
+
+You must call exactly one tool. Analyze the metrics provided and choose the most impactful action."""
+    
+    def _query_ollama_with_tools(self, user_prompt: str, tools: list) -> Optional[dict]:
+        """
+        Send prompt to Ollama API using /api/chat with native tool calling.
+        
+        Instead of asking the model to generate JSON text, we define tools
+        and let the model make a structured tool call. This leverages the
+        model's trained tool-calling capabilities (BFCL-V4 score: 43.6).
         
         Args:
-            prompt: The complete prompt to send as the user message
+            user_prompt: The user message describing the current situation
+            tools: List of tool definitions for Ollama
             
         Returns:
-            LLM response text or None if failed
+            Dict with tool call info, or None if failed
+        """
+        url = f"{self.ollama_url}/api/chat"
+        
+        system_prompt = self._build_system_prompt()
+        
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt
+                }
+            ],
+            "stream": False,
+            "think": False,
+            "tools": tools,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": 512
+            }
+        }
+        
+        # Debug logging
+        if self.debug_llm:
+            logger.info("=" * 60)
+            logger.info("LLM DEBUG - SYSTEM PROMPT:")
+            logger.info("=" * 60)
+            logger.info(f"\n{system_prompt[:500]}...")
+            logger.info("=" * 60)
+            logger.info("LLM DEBUG - USER PROMPT:")
+            logger.info("=" * 60)
+            logger.info(f"\n{user_prompt}")
+            logger.info("=" * 60)
+            logger.info(f"LLM DEBUG - TOOLS ({len(tools)} defined):")
+            for t in tools:
+                fname = t["function"]["name"]
+                fdesc = t["function"]["description"][:80]
+                logger.info(f"  - {fname}: {fdesc}...")
+            logger.info("=" * 60)
+        
+        try:
+            logger.info(f"Querying Ollama ({self.model}) with {len(tools)} tools...")
+            response = requests.post(url, json=payload, timeout=300)
+            response.raise_for_status()
+            
+            result = response.json()
+            message = result.get("message", {})
+            
+            # Log timing info
+            total_duration = result.get("total_duration", 0)
+            if total_duration:
+                logger.info(f"LLM response time: {total_duration / 1e9:.1f}s")
+            
+            # Check for tool calls (native Ollama tool calling response)
+            tool_calls = message.get("tool_calls", [])
+            text_content = message.get("content", "")
+            
+            if self.debug_llm:
+                logger.info("LLM DEBUG - RESPONSE:")
+                logger.info("=" * 60)
+                if tool_calls:
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        logger.info(f"  Tool call: {fn.get('name', '?')}({fn.get('arguments', {})})")
+                if text_content:
+                    logger.info(f"  Text: {text_content[:200]}")
+                logger.info("=" * 60)
+            
+            if tool_calls:
+                return {"tool_calls": tool_calls, "content": text_content}
+            elif text_content:
+                # Model responded with text instead of tool call - try to parse as JSON
+                logger.warning("Model returned text instead of tool call, attempting JSON parse")
+                return {"content": text_content, "tool_calls": []}
+            else:
+                logger.warning("Empty response from model")
+                return None
+            
+        except requests.exceptions.Timeout:
+            logger.error("Ollama request timed out")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Ollama API error: {e}")
+            return None
+    
+    def _tool_call_to_action(self, tool_call: dict) -> dict:
+        """
+        Convert an Ollama tool call response to our internal action format.
+        
+        Maps tool names:
+            increase_cpu / reduce_cpu -> vertical_scaling
+            add_replica / remove_replica -> horizontal_scaling
+        """
+        fn = tool_call.get("function", {})
+        fn_name = fn.get("name", "")
+        args = fn.get("arguments", {})
+        
+        if fn_name in ("increase_cpu", "reduce_cpu"):
+            return {
+                "action": "vertical_scaling",
+                "parameters": {
+                    "deployment_name": args.get("deployment_name", ""),
+                    "cpu_limit": args.get("cpu_limit", ""),
+                    "memory_limit": args.get("memory_limit", "")
+                }
+            }
+        elif fn_name in ("add_replica", "remove_replica"):
+            return {
+                "action": "horizontal_scaling",
+                "parameters": {
+                    "deployment_name": args.get("deployment_name", ""),
+                    "replicas": args.get("replicas", 1)
+                }
+            }
+        else:
+            logger.warning(f"Unknown tool call: {fn_name}")
+            return {"action": "none", "parameters": {}}
+
+    def _query_ollama(self, prompt: str) -> Optional[str]:
+        """
+        Legacy text-based query method. Kept for retry fallback.
         """
         url = f"{self.ollama_url}/api/chat"
         
@@ -607,7 +878,7 @@ JSON:"""
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a Kubernetes resource manager that analyzes system metrics to find and fix performance problems. When response time is too high, identify the bottleneck and increase its resources. When response time is too low, identify over-provisioned services and reduce their resources to save costs. Output ONLY a single valid JSON object. No markdown, no explanation."
+                    "content": self._build_system_prompt()
                 },
                 {
                     "role": "user",
@@ -625,7 +896,7 @@ JSON:"""
         # Debug logging
         if self.debug_llm:
             logger.info("=" * 60)
-            logger.info("LLM DEBUG - PROMPT:")
+            logger.info("LLM DEBUG - PROMPT (text fallback):")
             logger.info("=" * 60)
             logger.info(f"\n{prompt}")
             logger.info("=" * 60)
@@ -638,7 +909,6 @@ JSON:"""
             result = response.json()
             llm_response = result.get("message", {}).get("content", "")
             
-            # Log timing info
             total_duration = result.get("total_duration", 0)
             if total_duration:
                 logger.info(f"LLM response time: {total_duration / 1e9:.1f}s")
@@ -1208,49 +1478,59 @@ JSON:"""
         
         logger.debug(f"Prompt length: {len(prompt)} characters")
         
-        # === RETRY LOOP ===
-        last_response_text = None
-        last_error = ""
+        # Build tool definitions based on violation type and current state
+        tools = self._build_tool_definitions(violation_type, cluster_data)
+        logger.info(f"Built {len(tools)} tool definitions for {violation_type}")
         
+        # === PRIMARY PATH: Tool calling ===
+        last_error = ""
         for attempt in range(1, MAX_LLM_RETRIES + 1):
             if attempt == 1:
                 current_prompt = prompt
             else:
-                # Use corrective micro-prompt on retry
                 logger.warning(f"Retry {attempt}/{MAX_LLM_RETRIES}: {last_error}")
-                current_prompt = self._build_retry_prompt(last_response_text or "", last_error)
+                current_prompt = prompt + f"\n\nIMPORTANT: Your previous attempt failed. Reason: {last_error}. Please call one of the available tools now."
             
-            # Query the LLM
-            response_text = self._query_ollama(current_prompt)
-            last_response_text = response_text
+            result = self._query_ollama_with_tools(current_prompt, tools)
             
-            if not response_text:
+            if not result:
                 last_error = "No response from LLM"
                 continue
             
-            # Parse the response
-            action = self._parse_response(response_text)
+            # Check for tool calls
+            tool_calls = result.get("tool_calls", [])
             
-            # Validate the parsed action
-            is_valid, error_reason = self._validate_action(action, cluster_data)
-            
-            if is_valid:
-                self._consecutive_failures = 0
-                logger.info(f"Valid action on attempt {attempt}: {action['action']}")
+            if tool_calls:
+                # Convert tool call to our action format
+                action = self._tool_call_to_action(tool_calls[0])
                 
-                # Apply safety net for repeated failures
-                action = self._check_and_adjust_repeated_action(
-                    action, history, violation_type, cluster_data
-                )
+                # Validate
+                is_valid, error_reason = self._validate_action(action, cluster_data)
                 
-                logger.info(f"Final recommended action: {action['action']}")
-                if action['action'] != 'none':
+                if is_valid:
+                    self._consecutive_failures = 0
+                    logger.info(f"Valid tool call on attempt {attempt}: {action['action']}")
                     logger.info(f"Parameters: {action['parameters']}")
-                
-                return action
+                    return action
+                else:
+                    last_error = error_reason
+                    logger.warning(f"Attempt {attempt}: tool call invalid - {error_reason}")
             else:
-                last_error = error_reason
-                logger.warning(f"Attempt {attempt}: invalid action - {error_reason}")
+                # Model returned text instead of tool call - try JSON parse fallback
+                text_content = result.get("content", "")
+                if text_content:
+                    action = self._parse_response(text_content)
+                    is_valid, error_reason = self._validate_action(action, cluster_data)
+                    if is_valid:
+                        self._consecutive_failures = 0
+                        logger.info(f"Valid text response on attempt {attempt}: {action['action']}")
+                        logger.info(f"Parameters: {action['parameters']}")
+                        return action
+                    else:
+                        last_error = f"Text fallback also invalid: {error_reason}"
+                        logger.warning(f"Attempt {attempt}: {last_error}")
+                else:
+                    last_error = "No tool call and no text in response"
         
         # All retries exhausted
         self._consecutive_failures += 1

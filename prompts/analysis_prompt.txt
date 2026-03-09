@@ -1,24 +1,21 @@
-You manage a Kubernetes microservice application deployed across edge and cloud nodes.
+The application's performance needs your attention.
 
-INTENT: Keep average response time between {lower_threshold}s and {upper_threshold}s.
-CURRENT: EMA Response Time = {ema_rt}s — {status}
+The intent for this application is to maintain an average response time between {lower_threshold} seconds and {upper_threshold} seconds. The current Exponential Moving Average (EMA) of the response time is {ema_rt} seconds, which means the application is currently {status}
 
 {history_section}
 
-CLUSTER STATE:
+Here is the current state of all microservice deployments in the Kubernetes cluster:
+
 {deployments_table}
 
-NODE RESOURCES:
+Here are the resource utilization levels for each node in the cluster:
+
 {node_metrics}
 
-DIRECTION: {direction}
+Based on the metrics above, {direction}
 
-{available_targets}
+The available tools you can use are listed in the function definitions. Each tool targets a specific deployment with pre-calculated new values. You should choose the tool that targets the deployment which is most likely causing the performance issue.
 
-CONSTRAINTS: CPU range 100m-1000m, Replicas range 1-5.
+When the response time is too high, look for the deployment with the highest CPU utilization percentage relative to its limit — that is your bottleneck. When the response time is too low, look for the deployment with the most replicas or the lowest CPU utilization — those resources are being wasted.
 
-Pick ONE target from the list above and respond with ONLY a JSON object:
-{{"action": "vertical_scaling", "parameters": {{"deployment_name": "...", "cpu_limit": "...m", "memory_limit": "...Mi"}}}}
-{{"action": "horizontal_scaling", "parameters": {{"deployment_name": "...", "replicas": N}}}}
-
-JSON:
+Please call exactly one tool now.
