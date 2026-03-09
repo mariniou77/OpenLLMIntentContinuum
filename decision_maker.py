@@ -1,17 +1,15 @@
 """
-Decision Maker Module (Improved for Small LLMs like Qwen3.5:2b)
+Decision Maker Module (Optimized for Small MoE LLMs)
 
 This module integrates with a local LLM via Ollama to analyze
 system state and recommend actions when SLO violations occur.
 
-Key optimizations for MoE / Small LLMs:
-- Uses native XML tool-calling syntax instead of generic JSON.
-- Removes history and bottleneck hints to test true reasoning and reduce context dilution.
-- Bypasses Ollama's automatic tool wrappers to avoid schema confusion.
-- Validation + retry loop (up to 3 attempts with corrective micro-prompts).
+Key optimizations for Qwen3.5:2b:
+- Uses a Multiple-Choice Question (MCQ) format to bypass generation loops.
+- `think: False` and `temperature: 0.0` for deterministic, lightning-fast inference (< 12s).
+- Pre-calculates exact scaling bounds to prevent LLM hallucinations.
 """
 
-import json
 import logging
 import re
 import requests
@@ -29,8 +27,8 @@ class DecisionMaker:
         self.ollama_url = config["endpoints"]["ollama"]
         self.model = config["llm"]["model"]
         
-        # Qwen-specific inference parameters for precise coding/tool tasks
-        self.temperature = config["llm"].get("temperature", 0.6)
+        # Core sampling parameters for precise MCQ
+        self.temperature = 0.0
         self.top_p = config["llm"].get("top_p", 0.95)
         self.presence_penalty = config["llm"].get("presence_penalty", 0.0)
         self.repeat_penalty = config["llm"].get("repeat_penalty", 1.05)
@@ -54,6 +52,7 @@ class DecisionMaker:
         
         self._consecutive_failures = 0
         self._last_cluster_data = {}
+        self._current_action_mapping = {}
         
         # Load prompt template (must happen after thresholds are initialized)
         self.prompt_template = self._load_prompt_template()
@@ -86,36 +85,21 @@ Analyze the current performance violation and select exactly ONE action to retur
 ### CLUSTER STATE
 {deployments_table}
 
-### REQUIRED FORMAT
-You must respond ONLY with one of the following XML tags. Do not provide reasoning. Do not add text before or after the tag.
-
+### AVAILABLE ACTIONS
+Which action is best to fix the issue?
 {available_targets}
 
+Please show your choice by outputting ONLY the single choice letter (e.g., A, B, C).
 ### FINAL DECISION:
 """
 
     def _build_system_prompt(self) -> str:
-        return """You are an intelligent Kubernetes resource manager responsible for maintaining application performance.
-Your goal is to keep the application's average response time within a defined range.
-
-When you decide on an action, you must output your decision strictly in this exact XML format and nothing else. Do not use JSON.
-Example for scaling up:
-<function=horizontal_scaling><parameter=deployment_name>microservice1-deployment</parameter><parameter=replicas>2</parameter></function>
-Example for vertical scaling:
-<function=vertical_scaling><parameter=deployment_name>microservice3-deployment</parameter><parameter=cpu_limit>600m</parameter><parameter=memory_limit>612Mi</parameter></function>
-
-Do not add any reasoning or extra text before or after the XML tags. Just output the XML."""
+        return """You are an intelligent Kubernetes resource manager. Analyze the cluster state and choose the best action to fix the performance violation. You must output ONLY the single letter corresponding to your choice (e.g., A, B, C). Do not output any internal thoughts, reasoning, or XML."""
 
     def _build_retry_prompt(self, previous_response: str, error_reason: str) -> str:
-        valid_names = sorted(self.valid_deployment_names)
-        names_str = ", ".join(valid_names) if valid_names else "microservice1-deployment"
         return f"""Your previous response was invalid: {error_reason}
 
-Valid deployment names: {names_str}
-
-Respond with ONLY the XML tags like one of these examples:
-<function=horizontal_scaling><parameter=deployment_name>{valid_names[0] if valid_names else 'microservice1-deployment'}</parameter><parameter=replicas>2</parameter></function>
-<function=vertical_scaling><parameter=deployment_name>{valid_names[0] if valid_names else 'microservice1-deployment'}</parameter><parameter=cpu_limit>500m</parameter><parameter=memory_limit>512Mi</parameter></function>"""
+You MUST output ONLY a single valid letter from the options provided (e.g., A, B, or C). Do not write any other words."""
 
     def _format_system_state(self, cluster_data: dict, network_data: dict, monitoring_data: dict) -> str:
         lines = []
@@ -203,62 +187,89 @@ Respond with ONLY the XML tags like one of these examples:
         
         return '\n'.join(lines) if lines else "No deployment data available"
 
-    @staticmethod
-    def _expand_name(name: str) -> str:
-        name = str(name).strip().lower()
-        if name.endswith("-deployment") and "microservice" in name:
-            return name
-        match = re.match(r'^ms(\d+)$', name)
-        if match: return f"microservice{match.group(1)}-deployment"
-        match = re.match(r'^microservice(\d+)$', name)
-        if match: return f"microservice{match.group(1)}-deployment"
-        match = re.match(r'^microservice-(\d+)$', name)
-        if match: return f"microservice{match.group(1)}-deployment"
-        return name
+    def _get_deployment_config(self, dep_name: str) -> dict:
+        for dep in self.config.get("kubernetes", {}).get("deployments", []):
+            if dep.get("name", "").lower() == dep_name.lower():
+                return dep
+        return {"min_replicas": 1, "max_replicas": 5}
 
     def _compute_available_actions(self, violation_type: str, cluster_data: dict) -> tuple:
+        """Generates dynamic Multiple-Choice options based on valid actions."""
         deployments = cluster_data.get("deployments", {}).get("list", [])
         if not deployments:
             deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
         
         valid_deps = [d for d in deployments if not self.valid_deployment_names or d.get("name", "").lower() in self.valid_deployment_names]
-        targets = []
+        
+        mcq_options = []
+        action_mapping = {}  
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        opt_idx = 0
         
         if violation_type == "UPPER_THRESHOLD_EXCEEDED":
-            direction = "INCREASE resources to reduce response time. Pick one action from the list below:"
+            direction = "INCREASE resources to reduce response time."
             for d in valid_deps:
                 name = d.get("name", "")
                 cpu_val = int(str(d.get("cpu_limit", "300m")).replace("m", "").strip()) if str(d.get("cpu_limit", "300m")).replace("m", "").strip().isdigit() else 300
                 replicas = d.get("replicas_ready", d.get("replicas_desired", 1))
                 max_replicas = self._get_deployment_config(name).get("max_replicas", 5)
                 
-                if cpu_val < 1000:
+                # Option: Vertical Scale Up
+                if cpu_val < 1000 and self.actions_enabled.get("vertical_scaling", False):
                     new_cpu = min(cpu_val + 200, 1000)
                     mem_limit = d.get("memory_limit", "512Mi")
-                    targets.append(f'- <function=vertical_scaling><parameter=deployment_name>{name}</parameter><parameter=cpu_limit>{new_cpu}m</parameter><parameter=memory_limit>{mem_limit}</parameter></function>')
+                    letter = alphabet[opt_idx]
+                    mcq_options.append(f"{letter}) Increase CPU limit of {name} to {new_cpu}m")
+                    action_mapping[letter] = {
+                        "action": "vertical_scaling", 
+                        "parameters": {"deployment_name": name, "cpu_limit": f"{new_cpu}m", "memory_limit": mem_limit}
+                    }
+                    opt_idx += 1
                 
-                if replicas < max_replicas:
-                    targets.append(f'- <function=horizontal_scaling><parameter=deployment_name>{name}</parameter><parameter=replicas>{replicas + 1}</parameter></function>')
-        
+                # Option: Horizontal Scale Up
+                if replicas < max_replicas and self.actions_enabled.get("horizontal_scaling", False):
+                    letter = alphabet[opt_idx]
+                    mcq_options.append(f"{letter}) Scale up {name} to {replicas + 1} replicas")
+                    action_mapping[letter] = {
+                        "action": "horizontal_scaling", 
+                        "parameters": {"deployment_name": name, "replicas": replicas + 1}
+                    }
+                    opt_idx += 1
         else:
-            direction = "DECREASE resources to save costs. Pick one action from the list below:"
+            direction = "DECREASE resources to save costs."
             for d in valid_deps:
                 name = d.get("name", "")
                 cpu_val = int(str(d.get("cpu_limit", "300m")).replace("m", "").strip()) if str(d.get("cpu_limit", "300m")).replace("m", "").strip().isdigit() else 300
                 replicas = d.get("replicas_ready", d.get("replicas_desired", 1))
                 
-                if replicas > 1:
-                    targets.append(f'- <function=horizontal_scaling><parameter=deployment_name>{name}</parameter><parameter=replicas>{replicas - 1}</parameter></function>')
+                # Option: Horizontal Scale Down
+                if replicas > 1 and self.actions_enabled.get("horizontal_scaling", False):
+                    letter = alphabet[opt_idx]
+                    mcq_options.append(f"{letter}) Scale down {name} to {replicas - 1} replicas")
+                    action_mapping[letter] = {
+                        "action": "horizontal_scaling", 
+                        "parameters": {"deployment_name": name, "replicas": replicas - 1}
+                    }
+                    opt_idx += 1
                 
-                if cpu_val > 100:
+                # Option: Vertical Scale Down
+                if cpu_val > 100 and self.actions_enabled.get("vertical_scaling", False):
                     new_cpu = max(cpu_val - 100, 100)
                     mem_limit = d.get("memory_limit", "312Mi")
-                    targets.append(f'- <function=vertical_scaling><parameter=deployment_name>{name}</parameter><parameter=cpu_limit>{new_cpu}m</parameter><parameter=memory_limit>{mem_limit}</parameter></function>')
+                    letter = alphabet[opt_idx]
+                    mcq_options.append(f"{letter}) Reduce CPU limit of {name} to {new_cpu}m")
+                    action_mapping[letter] = {
+                        "action": "vertical_scaling", 
+                        "parameters": {"deployment_name": name, "cpu_limit": f"{new_cpu}m", "memory_limit": mem_limit}
+                    }
+                    opt_idx += 1
         
-        if not targets:
-            targets.append('<function=none></function>')
+        if not mcq_options:
+            mcq_options.append("A) No action available")
+            action_mapping["A"] = {"action": "none", "parameters": {}}
         
-        return direction, "AVAILABLE ACTIONS:\n" + "\n".join(targets)
+        self._current_action_mapping = action_mapping # Store mapping for parsing phase
+        return direction, "\n".join(mcq_options)
 
     def build_prompt(
         self,
@@ -277,7 +288,6 @@ Respond with ONLY the XML tags like one of these examples:
         deployments_table = self._format_system_state(cluster_data, network_data, monitoring_data)
         direction, available_targets = self._compute_available_actions(violation_type, cluster_data)
         
-        # Note: bottleneck_hint and history have been explicitly removed to test LLM reasoning
         prompt = self.prompt_template.format(
             ema_rt=f"{ema_rt:.2f}",
             lower_threshold=self.lower_threshold,
@@ -290,7 +300,7 @@ Respond with ONLY the XML tags like one of these examples:
         return prompt
 
     def _query_llm(self, user_prompt: str) -> Optional[str]:
-        """Query LLM directly for XML without Ollama's forced JSON tool wrappers."""
+        """Query LLM directly for the single MCQ letter."""
         url = f"{self.ollama_url}/api/chat"
         payload = {
             "model": self.model,
@@ -299,12 +309,13 @@ Respond with ONLY the XML tags like one of these examples:
                 {"role": "user", "content": user_prompt}
             ],
             "stream": False,
+            "think": False, # CRITICAL: Disables MoE endless thinking loops
             "options": {
-                "temperature": self.temperature,
+                "temperature": 0.0, # CRITICAL: Forces deterministic, immediate letter output
                 "top_p": self.top_p,
                 "presence_penalty": self.presence_penalty,
                 "repeat_penalty": self.repeat_penalty,
-                "num_predict": 512
+                "num_predict": 8  # Only needs enough room for a single letter
             }
         }
         
@@ -315,7 +326,7 @@ Respond with ONLY the XML tags like one of these examples:
             
         try:
             logger.info(f"Querying Ollama ({self.model})...")
-            response = requests.post(url, json=payload, timeout=300)
+            response = requests.post(url, json=payload, timeout=60)
             response.raise_for_status()
             result = response.json()
             return result.get("message", {}).get("content", "")
@@ -323,218 +334,22 @@ Respond with ONLY the XML tags like one of these examples:
             logger.error(f"Ollama API error: {e}")
             return None
 
-    def _parse_xml(self, text: str) -> dict:
-        """Extracts native Qwen XML tool formats."""
-        func_match = re.search(r'<function=([^>]+)>', text)
-        if not func_match:
-            return {}
-            
-        action = func_match.group(1).strip()
-        params = {}
-        
-        param_matches = re.finditer(r'<parameter=([^>]+)>([^<]*)</parameter>', text)
-        for match in param_matches:
-            key = match.group(1).strip()
-            val = match.group(2).strip()
-            if val.isdigit():
-                val = int(val)
-            params[key] = val
-            
-        return {"action": action, "parameters": params}
-
     def _parse_response(self, response_text: str) -> dict:
+        """Extracts the single letter choice from the LLM and maps it to the real action."""
         if not response_text:
             return self._get_fallback_response("No response from LLM")
-        cleaned = response_text.strip()
-        
-        # Try 0: Qwen Native XML
-        try:
-            xml_parsed = self._parse_xml(cleaned)
-            if xml_parsed.get("action"):
-                return self._normalize_response(xml_parsed)
-        except Exception as e:
-            logger.debug(f"XML parse failed: {e}")
-
-        # Fallback routines in case LLM outputs JSON despite XML instructions
-        cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
-        cleaned = re.sub(r'\s*```$', '', cleaned)
-        cleaned = cleaned.strip()
-        
-        try:
-            parsed = json.loads(cleaned)
-            if isinstance(parsed, dict):
-                return self._normalize_response(parsed)
-        except json.JSONDecodeError:
-            pass
-        
-        try:
-            start = cleaned.find('{')
-            end = cleaned.rfind('}') + 1
-            if start != -1 and end > start:
-                json_str = cleaned[start:end]
-                parsed = json.loads(json_str)
-                if isinstance(parsed, dict):
-                    return self._normalize_response(parsed)
-        except json.JSONDecodeError:
-            pass
             
-        return self._get_fallback_response("Could not parse LLM response into XML or JSON")
-
-    def _validate_action(self, action: dict, cluster_data: dict = None) -> tuple:
-        action_type = action.get("action", "none")
-        params = action.get("parameters", {})
+        cleaned = response_text.strip().upper()
         
-        if action_type == "none":
-            return False, "No action recommended"
-            
-        valid_actions = {"horizontal_scaling", "vertical_scaling", "service_placement", "flow_scheduling"}
-        if action_type not in valid_actions:
-            return False, f"Unknown action type: {action_type}"
-            
-        if not self.actions_enabled.get(action_type, False):
-            return False, f"Action '{action_type}' is not enabled"
-            
-        dep_name = params.get("deployment_name", "")
-        if action_type in ("horizontal_scaling", "vertical_scaling", "service_placement"):
-            if not dep_name:
-                return False, "Missing deployment_name"
-            if self.valid_deployment_names and dep_name.lower() not in self.valid_deployment_names:
-                return False, f"Invalid deployment_name '{dep_name}'. Must be one of: {sorted(self.valid_deployment_names)}"
+        # Regex to find a single standalone letter A-Z
+        match = re.search(r'\b([A-Z])\b', cleaned)
+        if match:
+            letter = match.group(1)
+            # Look up the real action dict in our stored mapping
+            if hasattr(self, '_current_action_mapping') and letter in self._current_action_mapping:
+                return self._current_action_mapping[letter]
                 
-        dep_config = self._get_deployment_config(dep_name)
-        max_replicas = dep_config.get("max_replicas", 5)
-        min_replicas = dep_config.get("min_replicas", 1)
-        current_state = self._get_current_deployment_state(dep_name, cluster_data)
-        
-        if action_type == "horizontal_scaling":
-            replicas = params.get("replicas")
-            if replicas is None:
-                return False, "Missing replicas count"
-            try:
-                replicas = int(replicas)
-            except (ValueError, TypeError):
-                return False, f"Invalid replicas value: {replicas}"
-                
-            if replicas < min_replicas: replicas = min_replicas
-            if replicas > max_replicas: replicas = max_replicas
-            params["replicas"] = replicas
-            
-            current_replicas = current_state.get("replicas", 0)
-            if replicas == current_replicas:
-                return False, f"No change: {dep_name} already has {replicas} replicas."
-                
-        if action_type == "vertical_scaling":
-            cpu = params.get("cpu_limit", "")
-            mem = params.get("memory_limit", "")
-            if not cpu:
-                return False, "Missing cpu_limit"
-                
-            try:
-                cpu_val = int(str(cpu).replace("m", "").strip())
-                if cpu_val < 100: cpu_val = 100
-                if cpu_val > 1000: cpu_val = 1000
-                params["cpu_limit"] = f"{cpu_val}m"
-            except (ValueError, TypeError):
-                return False, f"Invalid cpu_limit value: {cpu}"
-                
-            if not mem:
-                mem_val = max(128, (cpu_val // 100) * 100 + 12)
-                params["memory_limit"] = f"{mem_val}Mi"
-            else:
-                try:
-                    mem_val = int(str(mem).replace("Mi", "").replace("Gi", "000").strip())
-                    if mem_val < 128: mem_val = 128
-                    if mem_val > 1024: mem_val = 1024
-                    params["memory_limit"] = f"{mem_val}Mi"
-                except (ValueError, TypeError):
-                    pass
-                    
-            current_cpu = current_state.get("cpu_limit_m", 0)
-            if cpu_val == current_cpu:
-                return False, f"No change: {dep_name} already has cpu_limit={cpu_val}m."
-                
-        return True, ""
-
-    def _get_current_deployment_state(self, dep_name: str, cluster_data: dict = None) -> dict:
-        if not cluster_data:
-            cluster_data = self._last_cluster_data or {}
-        
-        deployments = cluster_data.get("deployments", {}).get("list", [])
-        if not deployments:
-            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
-        
-        for d in deployments:
-            if d.get("name", "").lower() == dep_name.lower():
-                cpu_str = str(d.get("cpu_limit", "0m")).replace("m", "").strip()
-                try:
-                    cpu_m = int(cpu_str)
-                except (ValueError, TypeError):
-                    cpu_m = 0
-                return {
-                    "replicas": d.get("replicas_ready", d.get("replicas_desired", 0)),
-                    "cpu_limit_m": cpu_m,
-                    "memory_limit": d.get("memory_limit", "")
-                }
-        return {"replicas": 0, "cpu_limit_m": 0, "memory_limit": ""}
-
-    def _get_deployment_config(self, dep_name: str) -> dict:
-        for dep in self.config.get("kubernetes", {}).get("deployments", []):
-            if dep.get("name", "").lower() == dep_name.lower():
-                return dep
-        return {"min_replicas": 1, "max_replicas": 5}
-
-    def _normalize_response(self, parsed: dict) -> dict:
-        action = str(parsed.get("action", "none")).lower().strip()
-        
-        action_mapping = {
-            "horizontal_scaling": "horizontal_scaling",
-            "scale": "horizontal_scaling",
-            "scale_up": "horizontal_scaling",
-            "scale_down": "horizontal_scaling",
-            "vertical_scaling": "vertical_scaling",
-            "resources": "vertical_scaling",
-            "resize": "vertical_scaling",
-            "none": "none"
-        }
-        normalized_action = action_mapping.get(action, "none")
-        
-        if normalized_action != "none" and not self.actions_enabled.get(normalized_action, False):
-            return {"action": "none", "parameters": {}}
-            
-        params = parsed.get("parameters", {})
-        if not isinstance(params, dict):
-            params = {}
-            
-        parameters = {}
-        if normalized_action == "horizontal_scaling":
-            dep_name = params.get("deployment_name") or ""
-            dep_name = self._expand_name(dep_name)
-            replicas = params.get("replicas", 2)
-            try:
-                replicas = int(replicas)
-            except (ValueError, TypeError):
-                replicas = 2
-            replicas = max(1, min(5, replicas))
-            
-            if dep_name:
-                parameters = {"deployment_name": str(dep_name).lower(), "replicas": replicas}
-            else:
-                normalized_action = "none"
-                
-        elif normalized_action == "vertical_scaling":
-            dep_name = params.get("deployment_name") or ""
-            dep_name = self._expand_name(dep_name)
-            cpu = str(params.get("cpu_limit", "500m"))
-            mem = str(params.get("memory_limit", "512Mi"))
-            if cpu.isdigit(): cpu = f"{cpu}m"
-            if mem.isdigit(): mem = f"{mem}Mi"
-            
-            if dep_name:
-                parameters = {"deployment_name": str(dep_name).lower(), "cpu_limit": cpu, "memory_limit": mem}
-            else:
-                normalized_action = "none"
-                
-        return {"action": normalized_action, "parameters": parameters}
+        return self._get_fallback_response(f"Could not extract a valid choice letter from LLM output: {cleaned}")
 
     def _get_fallback_response(self, reason: str) -> dict:
         logger.warning(f"Using fallback response: {reason}")
@@ -565,7 +380,6 @@ Respond with ONLY the XML tags like one of these examples:
                 return {"action": "horizontal_scaling", "parameters": {"deployment_name": best["name"], "replicas": new_replicas}}
             return self._get_fallback_response("All deployments at minimum replicas")
 
-    # Kept signature exact for compatibility with main.py & intent_watch_loop.py
     def analyze_and_recommend(
         self,
         violation_type: str,
@@ -596,18 +410,18 @@ Respond with ONLY the XML tags like one of these examples:
                 continue
                 
             if self.debug_llm:
-                logger.info(f"LLM Response:\n{response_text}")
+                logger.info(f"LLM Raw Output:\n{response_text}")
             
             action = self._parse_response(response_text)
-            is_valid, error_reason = self._validate_action(action, cluster_data)
             
-            if is_valid:
+            # Since the options were pre-computed and valid, if we got a real action, it's valid.
+            if action.get("action") != "none":
                 self._consecutive_failures = 0
-                logger.info(f"Valid XML response on attempt {attempt}: {action['action']} - {action['parameters']}")
+                logger.info(f"Valid MCQ decision on attempt {attempt}: {action['action']} - {action['parameters']}")
                 return action
             else:
-                last_error = error_reason
-                logger.warning(f"Attempt {attempt} invalid: {error_reason}")
+                last_error = action.get("fallback_reason", "Invalid letter chosen")
+                logger.warning(f"Attempt {attempt} invalid: {last_error}")
                 
         self._consecutive_failures += 1
         if self._consecutive_failures <= 3:
@@ -616,7 +430,6 @@ Respond with ONLY the XML tags like one of these examples:
             return self._get_fallback_response("All attempts failed")
 
     def _check_and_adjust_repeated_action(self, action: dict, history: str, violation_type: str, cluster_data: dict) -> dict:
-        # Kept for backward compatibility if called externally, though removed from primary flow
         return action
 
     def is_healthy(self) -> bool:

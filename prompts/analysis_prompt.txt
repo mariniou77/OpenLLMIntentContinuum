@@ -15,9 +15,9 @@ Analyze the current performance violation and select exactly ONE action to retur
 ### CLUSTER STATE
 {deployments_table}
 
-### REQUIRED FORMAT
-You must respond ONLY with one of the following XML tags. Do not provide reasoning. Do not add text before or after the tag.
-
+### AVAILABLE ACTIONS
+Which action is best to fix the issue?
 {available_targets}
 
+Please show your choice by outputting ONLY the single choice letter (e.g., A, B, C).
 ### FINAL DECISION:
