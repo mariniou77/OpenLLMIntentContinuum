@@ -1,0 +1,8 @@
+# Ignore all files in the prompt-testing directory
+prompt-testing/*
+
+# Ignore all files in the results directory
+results/*
+finetuning-prompt-testing/*
+baseline-literature-goal/*
+.claude/*
