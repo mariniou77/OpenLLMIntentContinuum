@@ -68,9 +68,9 @@ RT=$(curl -X POST \
     -F "image=@${LOCAL_IMAGE}" \
     -H "X-Special-Object: person" \
     http://10.56.0.92:5001/resize \
-    --max-time 30 -w '%{time_total}' -o /dev/null -s 2>/dev/null)
+    --max-time 30 -w '%{time_total}' -o /dev/null -s 2>/dev/null) || true
 
-if [ $? -eq 0 ] && [ -n "$RT" ]; then
+if [ -n "$RT" ]; then
     echo "  ✅ Application responded in ${RT}s"
 else
     echo "  ❌ Application not reachable at http://10.56.0.92:5001/resize"
