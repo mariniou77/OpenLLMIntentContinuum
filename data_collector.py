@@ -54,6 +54,7 @@ class DataCollector:
         # Initialize utility clients
         self.k8s_client = KubernetesClient(
             master_ip=config["endpoints"]["kubernetes_master"],
+            username=config["endpoints"].get("kubernetes_user", "cc"),
             deployment_defaults=deployment_defaults
         )
         

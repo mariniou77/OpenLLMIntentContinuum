@@ -90,7 +90,7 @@ class DecisionMaker:
     
     def _load_prompt_template(self) -> str:
         """Load the prompt template from file."""
-        template_path = Path(__file__).parent / "prompts" / "analysis_prompt.txt"
+        template_path = Path(__file__).parent / "prompts" / "system_prompt_6action.txt"
         try:
             with open(template_path, "r") as f:
                 return f.read()

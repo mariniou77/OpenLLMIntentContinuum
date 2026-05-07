@@ -104,37 +104,26 @@ class IntentWatchLoop:
             app_config = self.config["application"]
             k8s_config = self.config["endpoints"]
             
-            # Build the curl command to run on the Master node
+            # Build the curl command to run locally on sdn-controller
             request_id = str(uuid.uuid4())
-            
-            curl_command = (
-                f'curl -X POST '
-                f'-F "image=@{app_config.get("remote_test_image", "/home/antonios-icontinuum/test_converted.jpg")}" '
-                f'-H "X-Request-ID: {request_id}" '
-                f'-H "X-Webhooks: {app_config.get("webhooks", "")}" '
-                f'-H "X-Special-Object: person" '
-                f'-H "X-Central-DB-URL: {app_config.get("db_url", "")}" '
-                f'-H "X-Logs-URL: {app_config.get("logs_url", "")}" '
-                f'{app_config.get("sdn_entry_point", "http://192.168.100.100:5001/resize")} '
-                f'--max-time 60 '
-                f'-w "%{{time_total}}" '
-                f'-o /dev/null -s'
-            )
-            
-            # Execute curl via SSH on the Master node
-            master_host = k8s_config.get("kubernetes_master", "10.132.0.14")
-            master_user = k8s_config.get("kubernetes_user", "antonios-icontinuum")
-            
-            ssh_command = [
-                "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ConnectTimeout=10",
-                f"{master_user}@{master_host}",
-                curl_command
+
+            curl_command = [
+                "curl", "-X", "POST",
+                "-F", f"image=@{app_config.get('test_image', 'images/family.jpg')}",
+                "-H", f"X-Request-ID: {request_id}",
+                "-H", f"X-Webhooks: {app_config.get('webhooks', '')}",
+                "-H", "X-Special-Object: person",
+                "-H", f"X-Central-DB-URL: {app_config.get('db_url', '')}",
+                "-H", f"X-Logs-URL: {app_config.get('logs_url', '')}",
+                app_config.get("entry_point", "http://10.56.0.92:5001/resize"),
+                "--max-time", "60",
+                "-w", "%{time_total}",
+                "-o", "/dev/null",
+                "-s"
             ]
-            
+
             result = subprocess.run(
-                ssh_command,
+                curl_command,
                 capture_output=True,
                 text=True,
                 timeout=90
