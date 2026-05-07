@@ -500,3 +500,224 @@ class DataCollector:
             return f"Switches: {', '.join(switch_names)} | Links: {link_count}"
         else:
             return f"Switches: {switch_count} | Links: {link_count}"
+
+    # ===== STRUCTURED STATE FOR 8-MESSAGE LLM FORMAT =====
+
+    def compute_critical_path(self, system_state: dict) -> list:
+        """
+        Derive the application critical path by ordering deployments
+        by sFlow traffic volume (bytes_in), highest first.
+        
+        Args:
+            system_state: Complete system state from collect_all()
+            
+        Returns:
+            Ordered list of deployment names, e.g.
+            ["microservice3-deployment", "microservice1-deployment", ...]
+        """
+        monitoring = system_state.get("monitoring_data", {}).get("data", {})
+        pod_metrics = monitoring.get("pod_metrics", [])
+        
+        # Aggregate bytes_in per deployment (sum across replicas)
+        dep_traffic = {}
+        for pm in pod_metrics:
+            dep = pm.get("deployment", "")
+            if dep:
+                dep_traffic[dep] = dep_traffic.get(dep, 0) + pm.get("bytes_in", 0)
+        
+        if not dep_traffic:
+            # Fallback: return deployments from cluster info in config order
+            cluster = system_state.get("cluster_info", {}).get("data", {})
+            deployments = cluster.get("deployments", {}).get("list", [])
+            return [d.get("name", "") for d in deployments if d.get("name")]
+        
+        # Sort by traffic volume descending
+        sorted_deps = sorted(dep_traffic.items(), key=lambda x: x[1], reverse=True)
+        return [name for name, _ in sorted_deps]
+
+    def build_structured_state(
+        self,
+        system_state: dict,
+        violation_type: str,
+        ema_rt: float,
+        threshold: float
+    ) -> dict:
+        """
+        Build the structured JSON state matching the 8-message LLM input format.
+        
+        This produces the exact structure used in the test suite:
+        {intent, application, services, nodes, network}
+        
+        Args:
+            system_state: Complete system state from collect_all()
+            violation_type: "UPPER_THRESHOLD_EXCEEDED" or "LOWER_THRESHOLD_EXCEEDED"
+            ema_rt: Current EMA response time
+            threshold: The threshold that was exceeded
+            
+        Returns:
+            Structured dict ready for the 8-message LLM conversation
+        """
+        cluster = system_state.get("cluster_info", {}).get("data", {})
+        monitoring = system_state.get("monitoring_data", {}).get("data", {})
+        
+        # --- Intent ---
+        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
+            status = "upper_violation"
+        else:
+            status = "lower_violation"
+        
+        intent = {
+            "status": status,
+            "metric": "response_time_seconds",
+            "threshold": threshold,
+            "observed": round(ema_rt, 2)
+        }
+        
+        # --- Application (critical path) ---
+        critical_path = self.compute_critical_path(system_state)
+        application = {"critical_path": critical_path}
+        
+        # --- Services ---
+        services = self._build_services_list(cluster, monitoring)
+        
+        # --- Nodes ---
+        nodes = self._build_nodes_list(monitoring)
+        
+        # --- Network ---
+        network = self._build_network_data()
+        
+        return {
+            "intent": intent,
+            "application": application,
+            "services": services,
+            "nodes": nodes,
+            "network": network
+        }
+
+    def _build_services_list(self, cluster: dict, monitoring: dict) -> list:
+        """
+        Build the services list with per-deployment metrics.
+        
+        Computes cpu_util_pct from sFlow pod metrics (averaged across replicas),
+        cpu_max_reached and replica_max_reached from config limits.
+        """
+        deployments = cluster.get("deployments", {}).get("list", [])
+        pods = cluster.get("pods", {}).get("list", [])
+        pod_metrics = monitoring.get("pod_metrics", [])
+        
+        # Map deployment -> pod sFlow metrics
+        dep_sflow = {}
+        for pm in pod_metrics:
+            dep = pm.get("deployment", "")
+            if dep:
+                dep_sflow.setdefault(dep, []).append(pm)
+        
+        # Map deployment -> nodes from pod placement
+        dep_nodes = {}
+        for pod in pods:
+            pod_name = pod.get("name", "")
+            node = pod.get("node", "")
+            if not node or node == "None":
+                continue
+            for d in deployments:
+                dep_name = d.get("name", "")
+                if dep_name and pod_name.startswith(dep_name):
+                    dep_nodes.setdefault(dep_name, [])
+                    if node not in dep_nodes[dep_name]:
+                        dep_nodes[dep_name].append(node)
+        
+        services = []
+        for d in deployments:
+            name = d.get("name", "")
+            if not name:
+                continue
+            
+            replicas = d.get("replicas_ready", d.get("replicas_desired", 1))
+            cpu_limit_str = str(d.get("cpu_limit", "300m")).replace("m", "").strip()
+            try:
+                cpu_limit_m = int(cpu_limit_str)
+            except (ValueError, TypeError):
+                cpu_limit_m = 300
+            
+            # Average CPU utilization across replicas from sFlow
+            sflow_data = dep_sflow.get(name, [])
+            if sflow_data:
+                cpu_util_pct = sum(p.get("cpu_percent", 0) for p in sflow_data) / len(sflow_data)
+            else:
+                cpu_util_pct = 0.0
+            
+            # Determine limits from config
+            dep_config = self._get_deployment_config(name)
+            max_replicas = dep_config.get("max_replicas", 5)
+            cpu_max = cpu_limit_m >= 1000
+            replica_max = replicas >= max_replicas
+            
+            # Primary node (first node where pods are running)
+            nodes_list = dep_nodes.get(name, ["unknown"])
+            node = nodes_list[0] if nodes_list else "unknown"
+            
+            services.append({
+                "name": name,
+                "cpu_util_pct": round(cpu_util_pct, 1),
+                "cpu_limit_m": cpu_limit_m,
+                "replicas": replicas,
+                "cpu_max_reached": cpu_max,
+                "replica_max_reached": replica_max,
+                "node": node
+            })
+        
+        return services
+
+    def _build_nodes_list(self, monitoring: dict) -> list:
+        """Build the nodes list with per-node metrics from sFlow."""
+        node_metrics = monitoring.get("node_metrics", {})
+        
+        nodes = []
+        for name in sorted(node_metrics.keys()):
+            m = node_metrics[name]
+            nodes.append({
+                "name": name,
+                "cpu_util_pct": round(m.get("cpu", 0), 1),
+                "mem_util_pct": round(m.get("memory", 0), 1),
+                "load": round(m.get("load", 0), 2)
+            })
+        
+        return nodes
+
+    def _build_network_data(self) -> dict:
+        """
+        Build network data by combining sFlow SDN bandwidth and ONOS link stats
+        into a composite congestion score and hot_links list.
+        """
+        # Get sFlow-based congestion score
+        sflow_congestion = self.sflow_client.compute_congestion_score()
+        
+        # Get ONOS link utilization for additional hot_links
+        onos_links = self.onos_client.get_link_utilization()
+        
+        # Merge hot_links from both sources
+        hot_links = list(sflow_congestion.get("hot_links", []))
+        for link in onos_links:
+            # Only add ONOS links that aren't already represented
+            link_name = link.get("name", "")
+            if link_name and not any(h["name"] == link_name for h in hot_links):
+                # Estimate utilization from bytes (rough heuristic)
+                max_bw = self.sflow_client.sflow_config.get("max_bandwidth_bps", 1_000_000_000)
+                bytes_total = link.get("bytes_in", 0) + link.get("bytes_out", 0)
+                util_pct = (bytes_total * 8) / max(max_bw, 1) * 100
+                if util_pct > 50:
+                    hot_links.append({"name": link_name, "utilization_pct": round(util_pct, 1)})
+        
+        hot_links.sort(key=lambda x: x.get("utilization_pct", 0), reverse=True)
+        
+        return {
+            "congestion_score": sflow_congestion.get("congestion_score", 0.0),
+            "hot_links": hot_links
+        }
+
+    def _get_deployment_config(self, dep_name: str) -> dict:
+        """Get deployment-specific config (limits etc) from config.yaml."""
+        for dep in self.config.get("kubernetes", {}).get("deployments", []):
+            if dep.get("name", "").lower() == dep_name.lower():
+                return dep
+        return {"min_replicas": 1, "max_replicas": 5}

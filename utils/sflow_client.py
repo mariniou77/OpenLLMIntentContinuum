@@ -268,6 +268,58 @@ class SFlowRTClient:
             ],
         }
     
+    def compute_congestion_score(self) -> dict:
+        """
+        Compute a normalized network congestion score (0-1) from SDN bandwidth data.
+        
+        Combines sFlow SDN overlay bandwidth across all nodes and normalizes
+        against a configured max_bandwidth_bps value.
+        
+        Returns:
+            Dict like:
+            {
+                "congestion_score": 0.72,
+                "hot_links": [{"name": "worker1-in", "utilization_pct": 85.0}, ...]
+            }
+        """
+        sdn_bandwidth = self.get_sdn_bandwidth()
+        max_bw = self.sflow_config.get("max_bandwidth_bps", 1_000_000_000)  # 1 Gbps default
+        
+        if not sdn_bandwidth or max_bw <= 0:
+            return {"congestion_score": 0.0, "hot_links": []}
+        
+        hot_links = []
+        max_utilization = 0.0
+        
+        for node_name, bw in sdn_bandwidth.items():
+            bytes_in = bw.get("bytes_in", 0)
+            bytes_out = bw.get("bytes_out", 0)
+            
+            # Convert bytes/s to bits/s for comparison with max_bandwidth_bps
+            in_utilization = (bytes_in * 8) / max_bw * 100
+            out_utilization = (bytes_out * 8) / max_bw * 100
+            peak = max(in_utilization, out_utilization)
+            
+            if peak > max_utilization:
+                max_utilization = peak
+            
+            # Report links with utilization above 50%
+            if in_utilization > 50:
+                hot_links.append({"name": f"{node_name}-in", "utilization_pct": round(in_utilization, 1)})
+            if out_utilization > 50:
+                hot_links.append({"name": f"{node_name}-out", "utilization_pct": round(out_utilization, 1)})
+        
+        # Normalize to 0-1 (cap at 1.0)
+        congestion_score = min(max_utilization / 100.0, 1.0)
+        
+        # Sort hot_links by utilization descending
+        hot_links.sort(key=lambda x: x["utilization_pct"], reverse=True)
+        
+        return {
+            "congestion_score": round(congestion_score, 2),
+            "hot_links": hot_links
+        }
+
     def is_healthy(self) -> bool:
         """Check if sFlow-RT is responding."""
         try:

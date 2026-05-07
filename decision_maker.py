@@ -1,21 +1,26 @@
 """
-Decision Maker Module (Improved for Small LLMs)
+Decision Maker Module (8-Message Accumulated History Format)
 
-This module integrates with a local LLM (e.g., Qwen2.5:3b via Ollama) to analyze
+This module integrates with a local LLM (qwen3.5:4b via Ollama) to analyze
 system state and recommend actions when SLO violations occur.
 
-Key improvements over the original:
-- Few-shot examples in prompt for better structured output
-- Validation + retry loop (up to 3 attempts with corrective micro-prompts)
-- Deployment name validation against actual config
-- Re-enabled safety net for repeated failed actions
-- Smarter default values and clamping
+Uses the 8-message conversation structure tested at 90% accuracy:
+  Msg 1 (system):    12-rule policy prompt
+  Msg 2 (user):      History of recent violations (rolling window)
+  Msg 3 (assistant):  "Understood."
+  Msg 4 (user):      Intent + application critical path
+  Msg 5 (assistant):  "Understood."
+  Msg 6 (user):      Services + nodes + network metrics
+  Msg 7 (assistant):  "Understood."
+  Msg 8 (user):      Candidate actions + "Select the best action."
 
-Supports 4 action types:
-1. horizontal_scaling - Change replica count
-2. vertical_scaling - Change CPU/memory limits
-3. service_placement - Move pod to different node
-4. flow_scheduling - Change network path via ONOS
+Supports 6 action types:
+1. increase_cpu      → vertical_scaling (executor)
+2. reduce_cpu        → vertical_scaling (executor)
+3. add_replica       → horizontal_scaling (executor)
+4. remove_replica    → horizontal_scaling (executor)
+5. service_placement → service_placement (executor)
+6. flow_scheduling   → flow_scheduling (executor)
 """
 
 import json
@@ -30,41 +35,39 @@ logger = logging.getLogger(__name__)
 # Maximum number of LLM query attempts before falling back
 MAX_LLM_RETRIES = 3
 
+# Bridge message used between user turns
+ASSISTANT_BRIDGE = "Understood."
+
 
 class DecisionMaker:
     """
-    LLM-powered decision maker for intent-based resource management.
+    LLM-powered decision maker using 8-message accumulated history format.
     
-    Optimized for small open-source LLMs (1-7B parameters) with:
-    - Constrained prompts with few-shot examples
-    - Validation and retry logic
-    - Fallback safety nets for repeated failures
+    Uses the conversation structure validated at 90% accuracy in the
+    6-action test suite with qwen3.5:4b.
     """
     
     def __init__(self, config: dict):
-        """
-        Initialize Decision Maker with configuration.
-        
-        Args:
-            config: Configuration dictionary containing LLM settings
-        """
         self.config = config
         self.ollama_url = config["endpoints"]["ollama"]
         self.model = config["llm"]["model"]
         self.temperature = config["llm"]["temperature"]
         self.debug_llm = config.get("debug_llm", False)
         
-        # Load prompt template
+        # Load 8-message system prompt
+        self.system_prompt = self._load_system_prompt()
+        
+        # Legacy prompt template (kept for backward compat)
         self.prompt_template = self._load_prompt_template()
         
-        # Intent thresholds for context
+        # Intent thresholds
         self.upper_threshold = config["intent"]["upper_threshold"]
         self.lower_threshold = config["intent"]["lower_threshold"]
         
         # Enabled actions
         self.actions_enabled = config.get("actions", {})
         
-        # Build valid deployment names set from config (used for validation)
+        # Valid deployment names from config
         self.valid_deployment_names = set()
         k8s_config = config.get("kubernetes", {})
         for dep in k8s_config.get("deployments", []):
@@ -72,11 +75,18 @@ class DecisionMaker:
             if dep_name:
                 self.valid_deployment_names.add(dep_name.lower())
         
-        # Track consecutive parse failures for diagnostics
+        # Track consecutive parse failures
         self._consecutive_failures = 0
-        
-        # Store last cluster data for no-change detection
-        self._last_cluster_data = {}
+    
+    def _load_system_prompt(self) -> str:
+        """Load the 6-action system prompt from file."""
+        prompt_path = Path(__file__).parent / "prompts" / "system_prompt_6action.txt"
+        try:
+            with open(prompt_path, "r") as f:
+                return f.read()
+        except FileNotFoundError:
+            logger.warning(f"System prompt not found at {prompt_path}, using embedded default")
+            return "You are an orchestration policy selector. Choose the best action from candidate_actions. Return JSON: {\"answer\":\"id\",\"reason\":\"explanation\"}"
     
     def _load_prompt_template(self) -> str:
         """Load the prompt template from file."""
@@ -491,69 +501,101 @@ Respond with ONLY a JSON object like one of these:
 
 JSON:"""
 
-    def _query_ollama(self, prompt: str) -> Optional[str]:
+    def _query_ollama_8msg(
+        self,
+        history_entries: list,
+        structured_state: dict,
+        candidate_actions: list
+    ) -> Optional[str]:
         """
-        Send prompt to Ollama API using /api/chat with think:false.
+        Send 8-message conversation to Ollama matching the tested format.
         
-        Uses the chat endpoint with system + user messages and disables
-        thinking mode for qwen3.x models to get direct JSON output.
-        
-        Args:
-            prompt: The complete prompt to send as the user message
-            
-        Returns:
-            LLM response text or None if failed
+        Messages:
+          1. system:    12-rule policy prompt
+          2. user:      {"history": [...]}
+          3. assistant: "Understood."
+          4. user:      {"intent": ..., "application": ...}
+          5. assistant: "Understood."
+          6. user:      {"services": ..., "nodes": ..., "network": ...}
+          7. assistant: "Understood."
+          8. user:      {"candidate_actions": [...]} + "Select the best action."
         """
+        # Build history JSON
+        history_text = json.dumps({"history": history_entries})
+        
+        # Split state into parts
+        part1 = json.dumps({
+            "intent": structured_state["intent"],
+            "application": structured_state["application"]
+        })
+        
+        part2 = json.dumps({
+            "services": structured_state["services"],
+            "nodes": structured_state["nodes"],
+            "network": structured_state["network"]
+        })
+        
+        part3 = json.dumps({"candidate_actions": candidate_actions}) + "\n\nSelect the best action."
+        
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": history_text},
+            {"role": "assistant", "content": ASSISTANT_BRIDGE},
+            {"role": "user", "content": part1},
+            {"role": "assistant", "content": ASSISTANT_BRIDGE},
+            {"role": "user", "content": part2},
+            {"role": "assistant", "content": ASSISTANT_BRIDGE},
+            {"role": "user", "content": part3}
+        ]
+        
+        return self._send_chat(messages)
+
+    def _send_chat(self, messages: list) -> Optional[str]:
+        """Send a chat request to Ollama and return the response text."""
         url = f"{self.ollama_url}/api/chat"
         
         payload = {
             "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a Kubernetes resource manager that analyzes system metrics to find and fix performance problems. When response time is too high, identify the bottleneck and increase its resources. When response time is too low, identify over-provisioned services and reduce their resources to save costs. Output ONLY a single valid JSON object. No markdown, no explanation."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": messages,
             "stream": False,
             "think": False,
             "options": {
                 "temperature": self.temperature,
-                "num_predict": 256
+                "num_predict": 200
             }
         }
         
-        # Debug logging
         if self.debug_llm:
             logger.info("=" * 60)
-            logger.info("LLM DEBUG - PROMPT:")
-            logger.info("=" * 60)
-            logger.info(f"\n{prompt}")
+            logger.info("LLM DEBUG - 8-MSG REQUEST:")
+            logger.info(f"  Messages: {len(messages)}")
+            for i, m in enumerate(messages):
+                role = m['role']
+                content_len = len(m['content'])
+                logger.info(f"  [{i+1}] {role}: [{content_len} chars]")
+                if role == "user":
+                    logger.info(f"      {m['content'][:200]}...")
             logger.info("=" * 60)
         
         try:
-            logger.info(f"Querying Ollama ({self.model})...")
+            logger.info(f"Querying Ollama ({self.model}) with {len(messages)} messages...")
             response = requests.post(url, json=payload, timeout=300)
             response.raise_for_status()
             
             result = response.json()
             llm_response = result.get("message", {}).get("content", "")
             
-            # Log timing info
             total_duration = result.get("total_duration", 0)
+            prompt_tokens = result.get("prompt_eval_count", 0)
+            output_tokens = result.get("eval_count", 0)
             if total_duration:
-                logger.info(f"LLM response time: {total_duration / 1e9:.1f}s")
+                logger.info(f"LLM response time: {total_duration / 1e9:.1f}s "
+                           f"(prompt: {prompt_tokens}, output: {output_tokens} tokens)")
             
             if self.debug_llm:
-                logger.info("LLM DEBUG - RESPONSE:")
-                logger.info("=" * 60)
-                logger.info(f"\n{llm_response}")
-                logger.info("=" * 60)
+                logger.info(f"LLM DEBUG - RESPONSE: {llm_response}")
             
-            return llm_response
+            return llm_response.strip()
             
         except requests.exceptions.Timeout:
             logger.error("Ollama request timed out")
@@ -561,6 +603,158 @@ JSON:"""
         except requests.exceptions.RequestException as e:
             logger.error(f"Ollama API error: {e}")
             return None
+
+    def _parse_candidate_response(
+        self, response_text: str, candidate_actions: list
+    ) -> Optional[dict]:
+        """
+        Parse LLM response in {"answer":"A","reason":"..."} format.
+        
+        Maps the selected candidate action ID back to its full action dict,
+        then converts to executor-compatible format.
+        
+        Returns:
+            Executor-ready action dict or None if parsing failed.
+        """
+        if not response_text:
+            return None
+        
+        # Clean up response
+        cleaned = response_text.strip()
+        cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+        cleaned = re.sub(r'\s*```$', '', cleaned)
+        cleaned = cleaned.strip()
+        
+        # Try to parse JSON
+        answer_id = None
+        reason = ""
+        
+        try:
+            parsed = json.loads(cleaned)
+            answer_id = parsed.get("answer", "").strip().upper()
+            reason = parsed.get("reason", "")
+        except json.JSONDecodeError:
+            # Regex fallback
+            m = re.search(r'"answer"\s*:\s*"([A-D])"', cleaned, re.IGNORECASE)
+            if m:
+                answer_id = m.group(1).upper()
+            r = re.search(r'"reason"\s*:\s*"([^"]*)"', cleaned)
+            if r:
+                reason = r.group(1)
+        
+        if not answer_id:
+            logger.warning(f"Could not extract answer from LLM response: {response_text[:200]}")
+            return None
+        
+        # Find the matching candidate
+        selected = None
+        for c in candidate_actions:
+            if c.get("id", "").upper() == answer_id:
+                selected = c
+                break
+        
+        if not selected:
+            logger.warning(f"Answer '{answer_id}' not found in candidates {[c['id'] for c in candidate_actions]}")
+            return None
+        
+        logger.info(f"LLM selected: {answer_id} ({selected['type']}) — {reason}")
+        
+        # Convert candidate to executor-compatible action
+        return self._candidate_to_executor_action(selected)
+
+    def _candidate_to_executor_action(self, candidate: dict) -> dict:
+        """
+        Convert a candidate action dict to an executor-compatible format.
+        
+        Mapping:
+          increase_cpu / reduce_cpu  → vertical_scaling
+          add_replica / remove_replica → horizontal_scaling
+          service_placement          → service_placement
+          flow_scheduling            → flow_scheduling
+        """
+        action_type = candidate.get("type", "")
+        target = candidate.get("target", "")
+        
+        if action_type == "increase_cpu":
+            cpu_m = candidate.get("to_m", 500)
+            mem_mi = max(128, (cpu_m // 100) * 100 + 12)
+            return {
+                "action": "vertical_scaling",
+                "parameters": {
+                    "deployment_name": target,
+                    "cpu_limit": f"{cpu_m}m",
+                    "memory_limit": f"{mem_mi}Mi"
+                }
+            }
+        
+        elif action_type == "reduce_cpu":
+            cpu_m = candidate.get("to_m", 200)
+            mem_mi = max(128, (cpu_m // 100) * 100 + 12)
+            return {
+                "action": "vertical_scaling",
+                "parameters": {
+                    "deployment_name": target,
+                    "cpu_limit": f"{cpu_m}m",
+                    "memory_limit": f"{mem_mi}Mi"
+                }
+            }
+        
+        elif action_type == "add_replica":
+            return {
+                "action": "horizontal_scaling",
+                "parameters": {
+                    "deployment_name": target,
+                    "replicas": candidate.get("to_replicas", 2)
+                }
+            }
+        
+        elif action_type == "remove_replica":
+            return {
+                "action": "horizontal_scaling",
+                "parameters": {
+                    "deployment_name": target,
+                    "replicas": candidate.get("to_replicas", 1)
+                }
+            }
+        
+        elif action_type == "service_placement":
+            return {
+                "action": "service_placement",
+                "parameters": {
+                    "deployment_name": target,
+                    "target_node": candidate.get("to_node", "")
+                }
+            }
+        
+        elif action_type == "flow_scheduling":
+            new_path = candidate.get("new_path", [])
+            src = new_path[0] if new_path else ""
+            dst = new_path[-1] if new_path else ""
+            return {
+                "action": "flow_scheduling",
+                "parameters": {
+                    "source_switch": src,
+                    "destination_switch": dst,
+                    "new_path": new_path,
+                    "description": candidate.get("description", "")
+                }
+            }
+        
+        logger.warning(f"Unknown candidate type: {action_type}")
+        return {"action": "none", "parameters": {}}
+
+    def _build_retry_messages(
+        self, base_messages: list, previous_response: str, error_reason: str
+    ) -> list:
+        """
+        Append a corrective user message to the 8-msg conversation for retry.
+        """
+        retry_msg = (
+            f"Your previous response was invalid: {error_reason}\n"
+            f"Previous response: {previous_response[:100]}\n"
+            f"Respond with ONLY valid JSON: {{\"answer\":\"A\",\"reason\":\"short explanation\"}}"
+        )
+        return base_messages + [{"role": "user", "content": retry_msg}]
     
     def _validate_action(self, action: dict, cluster_data: dict = None) -> tuple:
         """
@@ -988,83 +1182,19 @@ JSON:"""
             "fallback_reason": reason
         }
     
-    def _get_smart_fallback(self, violation_type: str, cluster_data: dict) -> dict:
-        """
-        Generate an intelligent fallback when the LLM fails after all retries.
-        
-        Instead of returning 'none', pick a reasonable default action based on
-        the violation type and current cluster state.
-        
-        Args:
-            violation_type: Type of violation
-            cluster_data: Current cluster state
-            
-        Returns:
-            A reasonable default action
-        """
-        # Get deployments from cluster data
-        deployments = cluster_data.get("deployments", {}).get("list", [])
-        if not deployments:
-            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
-        
-        # Filter to valid deployments
-        valid_deps = []
-        for d in deployments:
-            name = d.get("name", "")
-            if self.valid_deployment_names and name.lower() not in self.valid_deployment_names:
-                continue
-            valid_deps.append(d)
-        
-        if not valid_deps:
-            return self._get_fallback_response("No valid deployments found for smart fallback")
-        
-        if violation_type == "UPPER_THRESHOLD_EXCEEDED":
-            # Find deployment with lowest replica count (bottleneck candidate)
-            best = min(valid_deps, key=lambda d: d.get("replicas_ready", d.get("replicas_desired", 1)))
-            current_replicas = best.get("replicas_ready", best.get("replicas_desired", 1))
-            new_replicas = min(5, current_replicas + 1)
-            
-            logger.warning(f"Smart fallback: scaling up {best['name']} from {current_replicas} to {new_replicas}")
-            return {
-                "action": "horizontal_scaling",
-                "parameters": {
-                    "deployment_name": best["name"],
-                    "replicas": new_replicas
-                },
-                "fallback_reason": "LLM failed after retries, using smart fallback"
-            }
-        else:  # LOWER_THRESHOLD_EXCEEDED
-            # Find deployment with highest replica count (can be scaled down)
-            candidates = [d for d in valid_deps 
-                         if d.get("replicas_ready", d.get("replicas_desired", 1)) > 1]
-            
-            if candidates:
-                best = max(candidates, key=lambda d: d.get("replicas_ready", d.get("replicas_desired", 1)))
-                current_replicas = best.get("replicas_ready", best.get("replicas_desired", 1))
-                new_replicas = max(1, current_replicas - 1)
-                
-                logger.warning(f"Smart fallback: scaling down {best['name']} from {current_replicas} to {new_replicas}")
-                return {
-                    "action": "horizontal_scaling",
-                    "parameters": {
-                        "deployment_name": best["name"],
-                        "replicas": new_replicas
-                    },
-                    "fallback_reason": "LLM failed after retries, using smart fallback"
-                }
-            else:
-                return self._get_fallback_response("All deployments at minimum replicas, no scale-down possible")
-
     def analyze_and_recommend(
         self,
         violation_type: str,
         current_rt: float,
         ema_rt: float,
+        structured_state: dict = None,
+        candidate_actions: list = None,
+        history_entries: list = None,
+        # Legacy parameters (kept for backward compat, unused in 8-msg mode)
         cluster_data: dict = None,
         network_data: dict = None,
         monitoring_data: dict = None,
         history: str = "",
-        # Legacy parameters for backward compatibility
         monitoring_data_str: str = "",
         deployments_data: str = "",
         available_nodes: str = ""
@@ -1072,17 +1202,15 @@ JSON:"""
         """
         Main method: Analyze system state and recommend an action.
         
-        Uses a retry loop: if the first LLM response is invalid, retries
-        with a corrective micro-prompt up to MAX_LLM_RETRIES times.
+        Uses the 8-message conversation format with retry on parse failure.
         
         Args:
             violation_type: "UPPER_THRESHOLD_EXCEEDED" or "LOWER_THRESHOLD_EXCEEDED"
             current_rt: Current response time in seconds
             ema_rt: EMA response time in seconds
-            cluster_data: Kubernetes cluster state dict
-            network_data: ONOS network state dict
-            monitoring_data: sFlow monitoring data dict
-            history: Formatted decision history string
+            structured_state: Structured JSON from DataCollector.build_structured_state()
+            candidate_actions: List of candidate actions from CandidateActionGenerator
+            history_entries: List of structured history dicts (rolling window)
             
         Returns:
             Dictionary with 'action' and 'parameters' keys
@@ -1091,203 +1219,93 @@ JSON:"""
         logger.info(f"Current RT: {current_rt:.2f}s, EMA: {ema_rt:.2f}s")
         logger.info(f"Thresholds: [{self.lower_threshold}, {self.upper_threshold}]")
         
-        # Use empty dicts if not provided
-        cluster_data = cluster_data or {}
-        network_data = network_data or {}
-        monitoring_data = monitoring_data or {}
+        # Ensure we have structured data
+        if not structured_state or not candidate_actions:
+            logger.error("Missing structured_state or candidate_actions for 8-msg mode")
+            return self._get_fallback_response("Missing structured data for LLM query")
         
-        # Store for no-change detection
-        self._last_cluster_data = cluster_data
+        history_entries = history_entries or []
         
-        # Build the initial prompt
-        prompt = self.build_prompt(
-            violation_type=violation_type,
-            current_rt=current_rt,
-            ema_rt=ema_rt,
-            cluster_data=cluster_data,
-            network_data=network_data,
-            monitoring_data=monitoring_data,
-            history=history
-        )
-        
-        logger.debug(f"Prompt length: {len(prompt)} characters")
+        logger.info(f"Candidates: {len(candidate_actions)} actions, History: {len(history_entries)} entries")
+        if self.debug_llm:
+            for c in candidate_actions:
+                logger.info(f"  [{c['id']}] {c['type']} → {c.get('target', c.get('description', 'n/a'))}")
         
         # === RETRY LOOP ===
         last_response_text = None
         last_error = ""
         
+        # Build base 8-message array
+        history_text = json.dumps({"history": history_entries})
+        part1 = json.dumps({
+            "intent": structured_state["intent"],
+            "application": structured_state["application"]
+        })
+        part2 = json.dumps({
+            "services": structured_state["services"],
+            "nodes": structured_state["nodes"],
+            "network": structured_state["network"]
+        })
+        part3 = json.dumps({"candidate_actions": candidate_actions}) + "\n\nSelect the best action."
+        
+        base_messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": history_text},
+            {"role": "assistant", "content": ASSISTANT_BRIDGE},
+            {"role": "user", "content": part1},
+            {"role": "assistant", "content": ASSISTANT_BRIDGE},
+            {"role": "user", "content": part2},
+            {"role": "assistant", "content": ASSISTANT_BRIDGE},
+            {"role": "user", "content": part3}
+        ]
+        
         for attempt in range(1, MAX_LLM_RETRIES + 1):
             if attempt == 1:
-                current_prompt = prompt
+                messages = base_messages
             else:
-                # Use corrective micro-prompt on retry
                 logger.warning(f"Retry {attempt}/{MAX_LLM_RETRIES}: {last_error}")
-                current_prompt = self._build_retry_prompt(last_response_text or "", last_error)
+                messages = self._build_retry_messages(
+                    base_messages, last_response_text or "", last_error
+                )
             
-            # Query the LLM
-            response_text = self._query_ollama(current_prompt)
+            response_text = self._send_chat(messages)
             last_response_text = response_text
             
             if not response_text:
                 last_error = "No response from LLM"
                 continue
             
-            # Parse the response
-            action = self._parse_response(response_text)
+            action = self._parse_candidate_response(response_text, candidate_actions)
             
-            # Validate the parsed action
-            is_valid, error_reason = self._validate_action(action, cluster_data)
-            
-            if is_valid:
-                self._consecutive_failures = 0
-                logger.info(f"Valid action on attempt {attempt}: {action['action']}")
+            if action and action.get("action") != "none":
+                # Validate against config constraints
+                is_valid, error_reason = self._validate_action(action)
                 
-                # Apply safety net for repeated failures
-                action = self._check_and_adjust_repeated_action(
-                    action, history, violation_type, cluster_data
-                )
-                
-                logger.info(f"Final recommended action: {action['action']}")
-                if action['action'] != 'none':
+                if is_valid:
+                    self._consecutive_failures = 0
+                    logger.info(f"Valid action on attempt {attempt}: {action['action']}")
                     logger.info(f"Parameters: {action['parameters']}")
-                
-                return action
+                    return action
+                else:
+                    last_error = error_reason
+                    logger.warning(f"Attempt {attempt}: valid parse but invalid action - {error_reason}")
             else:
-                last_error = error_reason
-                logger.warning(f"Attempt {attempt}: invalid action - {error_reason}")
+                last_error = "Could not parse answer from LLM response"
+                logger.warning(f"Attempt {attempt}: parse failed")
         
-        # All retries exhausted
+        # All retries exhausted — smart fallback
         self._consecutive_failures += 1
         logger.error(f"All {MAX_LLM_RETRIES} LLM attempts failed. Consecutive failures: {self._consecutive_failures}")
         
-        # Use smart fallback instead of returning 'none'
-        if self._consecutive_failures <= 3:
-            return self._get_smart_fallback(violation_type, cluster_data)
+        if self._consecutive_failures <= 3 and candidate_actions:
+            # Pick the first candidate as a reasonable default
+            fallback = self._candidate_to_executor_action(candidate_actions[0])
+            fallback["fallback_reason"] = f"LLM failed after {MAX_LLM_RETRIES} retries, using first candidate"
+            logger.warning(f"Fallback: using candidate A ({candidate_actions[0]['type']})")
+            return fallback
         else:
-            logger.error("Too many consecutive failures, returning no-action to avoid instability")
+            logger.error("Too many consecutive failures, returning no-action")
             return self._get_fallback_response(f"All {MAX_LLM_RETRIES} attempts failed: {last_error}")
-    
-    def _check_and_adjust_repeated_action(self, action: dict, history: str, violation_type: str, cluster_data: dict) -> dict:
-        """
-        Check if the LLM is repeating a failed action and suggest an alternative.
-        
-        This safety net helps overcome limitations of smaller LLMs that may not 
-        learn from feedback in the history.
-        
-        NOTE: Only WORSENED outcomes count as failures. NO_CHANGE outcomes are
-        not counted because with low EMA alpha, even successful actions may
-        appear as NO_CHANGE before EMA catches up.
-        """
-        if action['action'] == 'none':
-            return action
-        
-        # Count only genuine failures (WORSENED), not NO_CHANGE
-        # NO_CHANGE with low alpha may just mean EMA hasn't caught up yet
-        failed_count = history.count("WORSENED")
-        
-        # Track failures for the specific deployment
-        same_deployment_failures = 0
-        if action['action'] in ('horizontal_scaling', 'vertical_scaling'):
-            dep_name = action['parameters'].get('deployment_name', '')
-            if dep_name and dep_name in history:
-                # Count only WORSENED lines that mention this deployment
-                for line in history.split('\n'):
-                    if dep_name in line and 'WORSENED' in line:
-                        same_deployment_failures += 1
-        
-        # If we see 3+ WORSENED failures with horizontal_scaling, try vertical_scaling
-        if failed_count >= 3 and action['action'] == 'horizontal_scaling' and self.actions_enabled.get('vertical_scaling', False):
-            dep_name = action['parameters'].get('deployment_name', '')
-            if not dep_name:
-                return action
-                
-            logger.warning(f"Detected {failed_count} WORSENED attempts. Switching to vertical_scaling.")
-            
-            # Get current limits for this deployment to make a proportional change
-            current_cpu = self._get_current_cpu_limit(dep_name, cluster_data)
-            
-            if violation_type == "LOWER_THRESHOLD_EXCEEDED":
-                # Reduce by ~30% but not below 100m
-                new_cpu = max(100, int(current_cpu * 0.7))
-                new_mem = max(128, new_cpu + 12)
-                return {
-                    "action": "vertical_scaling",
-                    "parameters": {
-                        "deployment_name": dep_name,
-                        "cpu_limit": f"{new_cpu}m",
-                        "memory_limit": f"{new_mem}Mi"
-                    },
-                    "adjusted_reason": "Switched from repeated WORSENED horizontal_scaling"
-                }
-            else:
-                # Increase by ~30% but not above 1000m
-                new_cpu = min(1000, int(current_cpu * 1.3))
-                new_mem = min(1024, new_cpu + 12)
-                return {
-                    "action": "vertical_scaling",
-                    "parameters": {
-                        "deployment_name": dep_name,
-                        "cpu_limit": f"{new_cpu}m",
-                        "memory_limit": f"{new_mem}Mi"
-                    },
-                    "adjusted_reason": "Switched from repeated WORSENED horizontal_scaling"
-                }
-        
-        # If same deployment WORSENED 2+ times, try a different deployment
-        if same_deployment_failures >= 2 and action['action'] == 'horizontal_scaling':
-            try:
-                deployments = cluster_data.get('deployments', {}).get('list', [])
-                if not deployments:
-                    deployments = cluster_data.get('data', {}).get('deployments', {}).get('list', [])
-            except (AttributeError, TypeError):
-                deployments = []
-            
-            current_dep = action['parameters'].get('deployment_name', '')
-            
-            for dep in deployments:
-                if isinstance(dep, dict):
-                    dep_name = dep.get('name', '')
-                    replicas = dep.get('replicas_desired', 1)
-                elif isinstance(dep, str):
-                    dep_name = dep
-                    replicas = 1
-                else:
-                    continue
-                
-                # Only consider valid deployments that aren't the current one
-                if (dep_name and dep_name.lower() != current_dep.lower() 
-                    and dep_name.lower() in self.valid_deployment_names):
-                    if violation_type == "LOWER_THRESHOLD_EXCEEDED":
-                        new_replicas = max(1, replicas - 1)
-                    else:
-                        new_replicas = replicas + 1
-                    
-                    logger.warning(f"Same deployment WORSENED {same_deployment_failures} times. Trying {dep_name} instead.")
-                    return {
-                        "action": "horizontal_scaling",
-                        "parameters": {
-                            "deployment_name": dep_name,
-                            "replicas": new_replicas
-                        },
-                        "adjusted_reason": f"Switched from {current_dep} due to repeated WORSENED outcomes"
-                    }
-        
-        return action
-    
-    def _get_current_cpu_limit(self, deployment_name: str, cluster_data: dict) -> int:
-        """Get current CPU limit in millicores for a deployment."""
-        deployments = cluster_data.get("deployments", {}).get("list", [])
-        if not deployments:
-            deployments = cluster_data.get("data", {}).get("deployments", {}).get("list", [])
-        
-        for d in deployments:
-            if d.get("name", "").lower() == deployment_name.lower():
-                cpu_str = str(d.get("cpu_limit", "300m")).replace("m", "").strip()
-                try:
-                    return int(cpu_str)
-                except ValueError:
-                    return 300
-        return 300
     
     def is_healthy(self) -> bool:
         """Check if Ollama is responding."""

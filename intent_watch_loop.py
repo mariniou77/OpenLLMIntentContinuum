@@ -25,6 +25,7 @@ from data_collector import DataCollector
 from decision_maker import DecisionMaker
 from decision_history import DecisionHistory
 from action_executor import ActionExecutor
+from candidate_generator import CandidateActionGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ class IntentWatchLoop:
         # Initialize components
         self.data_collector = DataCollector(config)
         self.decision_maker = DecisionMaker(config)
+        self.candidate_generator = CandidateActionGenerator(config)
         self.action_executor = ActionExecutor(
             config, 
             self.data_collector.k8s_client,
@@ -68,7 +70,7 @@ class IntentWatchLoop:
         )
         
         # Decision history
-        max_history = config.get("history", {}).get("max_entries", 3)
+        max_history = config.get("history", {}).get("max_entries", 5)
         self.decision_history = DecisionHistory(max_entries=max_history)
         
         # EMA state
@@ -193,11 +195,10 @@ class IntentWatchLoop:
     
     def _handle_violation(self, violation_type: str, current_rt: float):
         """
-        Handle a detected violation by invoking Decision Maker and Action Executor.
+        Handle a detected violation using the 8-message LLM conversation format.
         
-        Args:
-            violation_type: Type of violation detected
-            current_rt: Current response time measurement
+        Flow: collect data → build structured state → generate candidates →
+              query LLM (8-msg) → execute action → record history
         """
         logger.warning("=" * 60)
         logger.warning(f"VIOLATION DETECTED: {violation_type}")
@@ -208,48 +209,61 @@ class IntentWatchLoop:
         
         self.stats["violations_detected"] += 1
         
-        # Step 1: Collect system data
+        # Step 1: Collect raw system data
         logger.info("Collecting system data...")
         system_state = self.data_collector.collect_all()
         
-        # Extract data for decision maker (correct keys from data_collector)
-        cluster_data = system_state.get("cluster_info", {}).get("data", {})
-        network_data = system_state.get("network_info", {}).get("data", {})
-        monitoring_data = system_state.get("monitoring_data", {}).get("data", {})
-        
-        # Get compact strings for logging
+        # Get compact strings for logging and legacy history
         monitoring_str = self.data_collector.format_monitoring_compact(system_state)
         deployments_str = self.data_collector.format_deployments_compact(system_state)
+        logger.info(f"Deployments: {deployments_str}")
         
-        # Update the outcome of the previous decision BEFORE getting history
-        # This ensures the history includes the outcome when building the prompt
+        # Step 2: Build structured state for 8-message format
+        threshold = (self.upper_threshold if violation_type == "UPPER_THRESHOLD_EXCEEDED"
+                     else self.lower_threshold)
+        structured_state = self.data_collector.build_structured_state(
+            system_state=system_state,
+            violation_type=violation_type,
+            ema_rt=self.ema_rt,
+            threshold=threshold
+        )
+        
+        # Step 3: Generate candidate actions
+        candidate_actions = self.candidate_generator.generate(
+            structured_state=structured_state,
+            violation_type=violation_type
+        )
+        logger.info(f"Generated {len(candidate_actions)} candidate actions:")
+        for c in candidate_actions:
+            logger.info(f"  [{c['id']}] {c['type']} → {c.get('target', c.get('description', 'n/a'))}")
+        
+        # Step 4: Update outcome of previous decision and get history
         self.decision_history.update_pending_outcome_before_prompt(
             current_rt=current_rt,
             current_ema=self.ema_rt,
             violation_type=violation_type
         )
+        # Also update structured history outcome
+        self.decision_history.update_last_structured_outcome("violation_persisted")
         
-        history_str = self.decision_history.format_for_prompt()
+        history_entries = self.decision_history.get_structured_history()
         
-        logger.info(f"Deployments: {deployments_str}")
-        
-        # Step 2: Get LLM recommendation
-        logger.info("Querying LLM for recommendation...")
+        # Step 5: Query LLM with 8-message format
+        logger.info("Querying LLM for recommendation (8-msg format)...")
         recommendation = self.decision_maker.analyze_and_recommend(
             violation_type=violation_type,
             current_rt=current_rt,
             ema_rt=self.ema_rt,
-            cluster_data=cluster_data,
-            network_data=network_data,
-            monitoring_data=monitoring_data,
-            history=history_str
+            structured_state=structured_state,
+            candidate_actions=candidate_actions,
+            history_entries=history_entries
         )
         
         logger.info(f"Recommended Action: {recommendation.get('action', 'none')}")
         if recommendation.get('parameters'):
             logger.info(f"Parameters: {recommendation.get('parameters')}")
         
-        # Step 3: Execute the action
+        # Step 6: Execute the action
         action_executed = False
         if recommendation.get("action") != "none":
             logger.info("Executing recommended action...")
@@ -264,19 +278,14 @@ class IntentWatchLoop:
                 self.stats["actions_taken"] += 1
                 action_executed = True
                 
-                # Wait for system to stabilize
                 logger.info(f"Waiting {self.wait_after_action}s for system to stabilize...")
                 time.sleep(self.wait_after_action)
-                
-                # Note: We no longer reset EMA after action
-                # This allows EMA to properly smooth response times over time
-                # The wait_after_action period gives the system time to stabilize
             else:
                 logger.error(f"Action failed: {result['message']}")
         else:
             logger.info("No action recommended by LLM")
         
-        # Step 4: Save decision to history
+        # Step 7: Save to both legacy and structured history
         self.decision_history.add_entry(
             violation_type=violation_type,
             response_time=current_rt,
@@ -288,6 +297,24 @@ class IntentWatchLoop:
                 "parameters": recommendation.get("parameters", {})
             }
         )
+        
+        # Build and save structured history entry for 8-msg format
+        # Find which candidate was selected (match by action type + target)
+        selected_candidate = candidate_actions[0] if candidate_actions else {}
+        for c in candidate_actions:
+            executor_action = self.decision_maker._candidate_to_executor_action(c)
+            if (executor_action.get("action") == recommendation.get("action") and
+                executor_action.get("parameters", {}).get("deployment_name") == 
+                recommendation.get("parameters", {}).get("deployment_name")):
+                selected_candidate = c
+                break
+        
+        structured_entry = self.decision_history.build_structured_entry(
+            structured_state=structured_state,
+            selected_candidate=selected_candidate,
+            candidate_actions=candidate_actions
+        )
+        self.decision_history.add_structured_entry(structured_entry)
     
     def run_once(self) -> dict:
         """
@@ -338,6 +365,8 @@ class IntentWatchLoop:
             # No violation - finalize outcome of previous decision if any
             # This records that the previous action resolved the issue
             self.decision_history.finalize_pending_outcome(rt, self.ema_rt, is_violation=False)
+            # Also update structured history outcome to resolved
+            self.decision_history.update_last_structured_outcome("violation_resolved")
         
         return result
     
