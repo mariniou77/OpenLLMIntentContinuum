@@ -579,7 +579,7 @@ JSON:"""
         
         try:
             logger.info(f"Querying Ollama ({self.model}) with {len(messages)} messages...")
-            response = requests.post(url, json=payload, timeout=300)
+            response = requests.post(url, json=payload, timeout=900)
             response.raise_for_status()
             
             result = response.json()
