@@ -39,7 +39,7 @@ fi
 # Verify SSH to master node
 echo ""
 echo "🔑 Testing SSH to master node..."
-MASTER_HOST=${MASTER_HOST:-10.56.0.92}
+MASTER_HOST=${MASTER_HOST:-10.56.1.209}
 MASTER_USER=${MASTER_USER:-cc}
 if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${MASTER_USER}@${MASTER_HOST} "echo OK" 2>/dev/null; then
     echo "  ✅ SSH to master node works"
@@ -67,20 +67,20 @@ echo "🌐 Testing application endpoint..."
 RT=$(curl -X POST \
     -F "image=@${LOCAL_IMAGE}" \
     -H "X-Special-Object: person" \
-    http://10.56.0.92:5001/resize \
+    http://10.56.1.209:5001/resize \
     --max-time 30 -w '%{time_total}' -o /dev/null -s 2>/dev/null) || true
 
 if [ -n "$RT" ]; then
     echo "  ✅ Application responded in ${RT}s"
 else
-    echo "  ❌ Application not reachable at http://10.56.0.92:5001/resize"
+    echo "  ❌ Application not reachable at http://10.56.1.209:5001/resize"
     exit 1
 fi
 
 # Verify Ollama (on llm-server, not localhost)
 echo ""
 echo "🤖 Checking Ollama..."
-OLLAMA_URL=${OLLAMA_URL:-http://10.56.3.87:11434}
+OLLAMA_URL=${OLLAMA_URL:-http://10.56.2.204:11434}
 if curl -s ${OLLAMA_URL}/api/tags | python3 -c "import sys,json; models=[m['name'] for m in json.load(sys.stdin)['models']]; print('  ✅ Models:', ', '.join(models))" 2>/dev/null; then
     :
 else

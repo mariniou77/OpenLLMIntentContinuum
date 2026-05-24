@@ -115,7 +115,7 @@ class IntentWatchLoop:
                 "-H", "X-Special-Object: person",
                 "-H", f"X-Central-DB-URL: {app_config.get('db_url', '')}",
                 "-H", f"X-Logs-URL: {app_config.get('logs_url', '')}",
-                app_config.get("entry_point", "http://10.56.0.92:5001/resize"),
+                app_config.get("entry_point", "http://10.56.1.209:5001/resize"),
                 "--max-time", "60",
                 "-w", "%{time_total}",
                 "-o", "/dev/null",
