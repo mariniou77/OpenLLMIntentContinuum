@@ -44,8 +44,9 @@ LOCUST_BIN = _find_locust()
 
 
 # ── Default Experiment Configuration ────────────────────────────────────────
-# Matches the IntentContinuum paper's computing experiment
-DEFAULT_LOAD_PATTERN = [10, 20, 15, 10, 5, 20, 10]
+# Reduced load pattern suited to single-threaded OpenFaaS SSD runtime in ms3.
+# Each value is concurrent Locust users; intervals are DEFAULT_INTERVAL seconds.
+DEFAULT_LOAD_PATTERN = [3, 5, 4, 3, 2, 5, 3]
 DEFAULT_INTERVAL = 120  # seconds between load changes
 DEFAULT_SPAWN_RATE = 1  # users per second
 LOCUST_WEB_PORT = 8089
@@ -115,9 +116,23 @@ def reset_cluster(config_path: str):
         else:
             print(f"  ⚠️  {name}: could not determine container name, skipping resource reset")
 
-    # Wait for pods to stabilize
-    print("  ⏳ Waiting 30s for pods to stabilize...")
-    time.sleep(30)
+    # Ensure ms3 fwatchdog allows enough time for SSD model cold-start.
+    # Only set if not already correct — avoids triggering an unnecessary rollout.
+    result = ssh_cmd(user, master,
+        'kubectl get deployment microservice3-deployment -o jsonpath="{.spec.template.spec.containers[0].env}"')
+    if "exec_timeout" not in result.stdout:
+        ssh_cmd(user, master,
+            "kubectl set env deployment/microservice3-deployment exec_timeout=90s -c nginx")
+        print("  ✅ microservice3-deployment: exec_timeout=90s set (fwatchdog SSD cold-start)")
+    else:
+        print("  ✅ microservice3-deployment: exec_timeout already configured")
+
+    # Wait for all rollouts to complete (set resources + possible set env above)
+    print("  ⏳ Waiting for rollouts to complete...")
+    for dep_name in ["microservice1-deployment", "microservice2-deployment",
+                     "microservice3-deployment", "microservice4-deployment"]:
+        ssh_cmd(user, master, f"kubectl rollout status deployment/{dep_name} --timeout=120s", timeout=130)
+    print("  ✅ All rollouts complete")
 
     # Verify pods are running
     result = ssh_cmd(user, master, "kubectl get pods --no-headers | grep -c Running")
