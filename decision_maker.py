@@ -77,6 +77,9 @@ class DecisionMaker:
         
         # Track consecutive parse failures
         self._consecutive_failures = 0
+
+        # Cache of last cluster data for action validation
+        self._last_cluster_data = None
     
     def _load_system_prompt(self) -> str:
         """Load the 6-action system prompt from file."""
