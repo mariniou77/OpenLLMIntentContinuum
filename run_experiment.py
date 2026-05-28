@@ -20,6 +20,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -28,6 +29,18 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
+
+
+def _find_locust() -> str:
+    """Return the locust executable path, preferring a local venv."""
+    venv_bin = os.path.expanduser("~/locust-venv/bin/locust")
+    if os.path.exists(venv_bin):
+        return venv_bin
+    found = shutil.which("locust")
+    return found if found else "locust"
+
+
+LOCUST_BIN = _find_locust()
 
 
 # ── Default Experiment Configuration ────────────────────────────────────────
@@ -145,7 +158,7 @@ def start_locust_locally(config_path, initial_users, spawn_rate, total_duration,
     })
 
     cmd = [
-        "locust", "-f", "locustfile.py",
+        LOCUST_BIN, "-f", "locustfile.py",
         "--host", entry_point,
         "-u", str(initial_users), "-r", str(spawn_rate),
         "--run-time", f"{total_duration}s",
