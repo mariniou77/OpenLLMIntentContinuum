@@ -266,7 +266,18 @@ class IntentWatchLoop:
                 logger.info(f"Action successful: {result['message']}")
                 self.stats["actions_taken"] += 1
                 action_executed = True
-                
+
+                # Restart ms3 to clear any CLOSE_WAIT connections accumulated while
+                # the affected pod was restarting (ms3 hangs 90s on calls to a missing endpoint)
+                logger.info("Restarting ms3 pod to clear connection state...")
+                self.data_collector.k8s_client._run_kubectl(
+                    "delete pod -l app=microservice3 --force --grace-period=0"
+                )
+                self.data_collector.k8s_client._run_kubectl(
+                    "rollout status deployment/microservice3-deployment --timeout=120s"
+                )
+                logger.info("ms3 pod ready.")
+
                 logger.info(f"Waiting {self.wait_after_action}s for system to stabilize...")
                 time.sleep(self.wait_after_action)
             else:

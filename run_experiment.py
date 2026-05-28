@@ -44,9 +44,9 @@ LOCUST_BIN = _find_locust()
 
 
 # ── Default Experiment Configuration ────────────────────────────────────────
-# Reduced load pattern suited to single-threaded OpenFaaS SSD runtime in ms3.
-# Each value is concurrent Locust users; intervals are DEFAULT_INTERVAL seconds.
-DEFAULT_LOAD_PATTERN = [3, 5, 4, 3, 2, 5, 3]
+# Load pattern: ms3 at 500m CPU handles ~3.7 req/s (4 waitress threads × 1/0.65s).
+# 10 users saturate it and trigger upper-threshold violations; 3 users ease off.
+DEFAULT_LOAD_PATTERN = [5, 10, 8, 5, 3, 10, 5]
 DEFAULT_INTERVAL = 120  # seconds between load changes
 DEFAULT_SPAWN_RATE = 1  # users per second
 LOCUST_WEB_PORT = 8089
