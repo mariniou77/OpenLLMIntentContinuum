@@ -134,13 +134,21 @@ def reset_cluster(config_path: str):
         ssh_cmd(user, master, f"kubectl rollout status deployment/{dep_name} --timeout=120s", timeout=130)
     print("  ✅ All rollouts complete")
 
+    # Always force-restart ms3 regardless of whether its resources changed.
+    # kubectl set resources is idempotent: if values are unchanged it skips the rollout,
+    # leaving an old pod alive that may have accumulated CLOSE_WAIT connections from
+    # a previous experiment. A fresh pod guarantees a clean connection state.
+    print("  ♻️  Force-restarting ms3 pod to guarantee clean connection state...")
+    ssh_cmd(user, master, "kubectl delete pod -l app=microservice3 --force --grace-period=0")
+    ssh_cmd(user, master, "kubectl rollout status deployment/microservice3-deployment --timeout=120s", timeout=130)
+    print("  ✅ ms3 pod restarted")
+
     # Verify pods are running
     result = ssh_cmd(user, master, "kubectl get pods --no-headers | grep -c Running")
     running = result.stdout.strip()
     print(f"  ✅ {running} pods running")
 
-    # Pre-warm the application so ms3's SSD model is loaded before Locust starts.
-    # The SSD model takes ~30-60s to initialize; pod readiness probes don't wait for it.
+    # Pre-warm the application to confirm the full chain is healthy before Locust starts.
     import yaml as _yaml
     with open(config_path) as _f:
         _cfg = _yaml.safe_load(_f)
