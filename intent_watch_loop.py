@@ -267,15 +267,30 @@ class IntentWatchLoop:
                 self.stats["actions_taken"] += 1
                 action_executed = True
 
-                # Restart ms3 to clear any CLOSE_WAIT connections accumulated while
-                # the affected pod was restarting (ms3 hangs 90s on calls to a missing endpoint)
-                logger.info("Restarting ms3 pod to clear connection state...")
-                self.data_collector.k8s_client._run_kubectl(
-                    "delete pod -l app=microservice3 --force --grace-period=0"
-                )
-                self.data_collector.k8s_client._run_kubectl(
-                    "rollout status deployment/microservice3-deployment --timeout=120s"
-                )
+                # Clear CLOSE_WAIT state on ms3 after any action that restarted another
+                # service pod (ms3 hangs 90s when a downstream pod is briefly unavailable,
+                # accumulating CLOSE_WAIT sockets that block new requests).
+                # Exception: when the action scaled ms3 itself, its pods are already fresh
+                # — force-deleting them immediately would kill the just-scheduled replicas
+                # and double the time waiting for the rollout to complete.
+                action_target = recommendation.get("parameters", {}).get("deployment_name", "")
+                ms3_was_scaled = "microservice3" in action_target
+
+                if ms3_was_scaled:
+                    # Just wait for the rollout K8s already started (no delete needed)
+                    logger.info("Waiting for ms3 rollout to complete...")
+                    self.data_collector.k8s_client._run_kubectl(
+                        "rollout status deployment/microservice3-deployment --timeout=180s"
+                    )
+                else:
+                    # Another service's pod restarted → ms3 may have accumulated CLOSE_WAIT
+                    logger.info("Restarting ms3 pod to clear connection state...")
+                    self.data_collector.k8s_client._run_kubectl(
+                        "delete pod -l app=microservice3 --force --grace-period=0"
+                    )
+                    self.data_collector.k8s_client._run_kubectl(
+                        "rollout status deployment/microservice3-deployment --timeout=120s"
+                    )
                 logger.info("ms3 pod ready.")
 
                 logger.info(f"Waiting {self.wait_after_action}s for system to stabilize...")
