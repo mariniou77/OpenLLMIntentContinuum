@@ -81,11 +81,14 @@ class CandidateActionGenerator:
             return candidates
 
         # Sort services on critical path by cpu_util_pct descending
+        # Only include services that are in the config's deployments list (avoid offering
+        # non-scalable services like db-deployment that the validator would reject)
         path_set = set(critical_path)
-        on_path = [s for s in services if s["name"] in path_set]
+        on_path = [s for s in services if s["name"] in path_set and s["name"].lower() in self._dep_configs]
         on_path.sort(key=lambda s: s["cpu_util_pct"], reverse=True)
         if not on_path:
-            on_path = sorted(services, key=lambda s: s["cpu_util_pct"], reverse=True)
+            on_path = [s for s in sorted(services, key=lambda s: s["cpu_util_pct"], reverse=True)
+                       if s["name"].lower() in self._dep_configs]
 
         # Find the highest-CPU non-blocked service
         target_svc = None
@@ -167,8 +170,9 @@ class CandidateActionGenerator:
         if not services:
             return candidates
 
-        # Separate multi-replica services from single-replica
-        multi_rep = [s for s in services if s["replicas"] > 1]
+        # Separate multi-replica services from single-replica (only scalable deployments)
+        scalable = [s for s in services if s["name"].lower() in self._dep_configs]
+        multi_rep = [s for s in scalable if s["replicas"] > 1]
         multi_rep.sort(key=lambda s: s["cpu_util_pct"])  # lowest CPU first = most over-provisioned
 
         # --- remove_replica for multi-replica services ---
@@ -185,7 +189,7 @@ class CandidateActionGenerator:
 
         # --- reduce_cpu by absolute waste ---
         waste_list = []
-        for svc in services:
+        for svc in scalable:
             waste = svc["cpu_limit_m"] * (100 - svc["cpu_util_pct"]) / 100
             new_cpu = max(svc["cpu_limit_m"] - CPU_DECREASE_STEP, CPU_MIN)
             if new_cpu != svc["cpu_limit_m"]:

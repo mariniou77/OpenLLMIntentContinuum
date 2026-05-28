@@ -425,7 +425,11 @@ def main():
             intent_proc.wait(timeout=180)
         except subprocess.TimeoutExpired:
             intent_proc.send_signal(signal.SIGINT)
-            intent_proc.wait(timeout=15)
+            try:
+                intent_proc.wait(timeout=120)  # Allow graceful shutdown (may need to finish a 60s wait)
+            except subprocess.TimeoutExpired:
+                intent_proc.kill()
+                intent_proc.wait()
         print("  ✅ Intent Watch Loop stopped")
 
         intent_log.close()
