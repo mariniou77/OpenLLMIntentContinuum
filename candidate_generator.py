@@ -90,13 +90,23 @@ class CandidateActionGenerator:
             on_path = [s for s in sorted(services, key=lambda s: s["cpu_util_pct"], reverse=True)
                        if s["name"].lower() in self._dep_configs]
 
-        # Find the highest-CPU non-blocked service
+        # Prefer services that hit their CPU ceiling but still have replica headroom.
+        # Their cpu_util_pct is artificially low because they are being throttled, so
+        # they won't rank first in the cpu-descending sort — but they ARE the bottleneck
+        # and can only scale horizontally. Surfacing them as the primary target ensures
+        # add_replica appears as a top candidate (A/B) rather than being crowded out.
         target_svc = None
         for svc in on_path:
-            if not (svc.get("cpu_max_reached") and svc.get("replica_max_reached")):
+            if svc.get("cpu_max_reached") and not svc.get("replica_max_reached"):
                 target_svc = svc
                 break
-        # If all blocked, use the first one anyway (LLM will see constraints)
+        # Standard fallback: highest-CPU service that isn't fully blocked
+        if target_svc is None:
+            for svc in on_path:
+                if not (svc.get("cpu_max_reached") and svc.get("replica_max_reached")):
+                    target_svc = svc
+                    break
+        # If everything is fully blocked, use the first one (LLM will see constraints)
         if target_svc is None:
             target_svc = on_path[0]
 

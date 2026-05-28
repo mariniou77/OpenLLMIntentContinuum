@@ -180,6 +180,40 @@ def reset_cluster(config_path: str):
         print(f"  ⚠️  Warm-up failed: {_e} — continuing anyway")
 
 
+def warmup_llm(config_path: str):
+    """
+    Send a trivial prompt to Ollama to force the model into GPU VRAM before the
+    experiment starts. Without this, the first real LLM call (a violation decision)
+    pays a ~15s cold-load penalty instead of the normal ~1s inference time.
+    """
+    import yaml
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    ollama_url = cfg.get("endpoints", {}).get("ollama", "http://10.56.2.204:11434")
+    model = cfg.get("llm", {}).get("model", "qwen3.5:4b")
+
+    print(f"\n🔥 Pre-warming LLM ({model} on {ollama_url})...")
+    url = f"{ollama_url}/api/generate"
+    payload = json.dumps({
+        "model": model,
+        "prompt": "Hi",
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0},
+    }).encode()
+
+    try:
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp.read()
+        elapsed = time.time() - t0
+        print(f"  ✅ LLM warmed up in {elapsed:.1f}s (model loaded into VRAM)")
+    except Exception as e:
+        print(f"  ⚠️  LLM warm-up failed: {e} — continuing anyway")
+
+
 def start_locust_locally(config_path, initial_users, spawn_rate, total_duration, results_dir):
     """
     Start Locust locally on the SDN controller as a subprocess.
@@ -433,6 +467,9 @@ def main():
         reset_cluster(args.config)
     else:
         print("\n⏭️  Skipping cluster reset")
+
+    # Step 1b: Warm up LLM (force model into GPU VRAM before first real decision)
+    warmup_llm(args.config)
 
     # Step 2: Start Intent Watch Loop (on SDN controller)
     intent_proc, intent_log = start_intent_loop(
