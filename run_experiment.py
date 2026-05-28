@@ -112,7 +112,21 @@ def reset_cluster(config_path: str):
         if container_name:
             ssh_cmd(user, master,
                 f"kubectl set resources deployment {name} --limits=cpu={cpu},memory={mem} -c {container_name}")
-            print(f"  ✅ {name}: cpu={cpu}, memory={mem} (container: {container_name})")
+            # Re-read from the API to confirm the spec was actually updated.
+            # "kubectl set resources" prints "updated" even if the value was unchanged
+            # (idempotent), so an optimistic print can mask stale state carried over from
+            # a previous experiment's actions.
+            verify = ssh_cmd(user, master,
+                f'kubectl get deployment {name} -o jsonpath="{{.spec.template.spec.containers[0].resources.limits.cpu}}"')
+            actual_cpu = verify.stdout.strip().strip("'\"")
+            if actual_cpu != cpu:
+                print(f"  ⚠️  {name}: cpu mismatch after reset — wanted {cpu}, API returns {actual_cpu!r}. Retrying...")
+                ssh_cmd(user, master,
+                    f"kubectl set resources deployment {name} --limits=cpu={cpu},memory={mem} -c {container_name}")
+                verify2 = ssh_cmd(user, master,
+                    f'kubectl get deployment {name} -o jsonpath="{{.spec.template.spec.containers[0].resources.limits.cpu}}"')
+                actual_cpu = verify2.stdout.strip().strip("'\"")
+            print(f"  ✅ {name}: cpu={actual_cpu}, memory={mem} (container: {container_name})")
         else:
             print(f"  ⚠️  {name}: could not determine container name, skipping resource reset")
 
