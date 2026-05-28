@@ -65,6 +65,26 @@ def parse_args():
     return parser.parse_args()
 
 
+def _cpu_millicores(cpu_str: str) -> int:
+    """Convert a K8s CPU string to millicores for numeric comparison.
+
+    K8s normalises "1000m" to "1" in its API response, so a plain
+    string equality check ("1" != "1000m") always reports a false
+    mismatch.  Converting both sides to an integer millicores value
+    before comparing avoids the false positive.
+    """
+    s = cpu_str.strip()
+    if s.endswith("m"):
+        try:
+            return int(s[:-1])
+        except ValueError:
+            return -1
+    try:
+        return int(float(s) * 1000)
+    except ValueError:
+        return -1
+
+
 def get_master_info(config_path: str):
     """Read master node connection info from config."""
     import yaml
@@ -119,14 +139,18 @@ def reset_cluster(config_path: str):
             verify = ssh_cmd(user, master,
                 f'kubectl get deployment {name} -o jsonpath="{{.spec.template.spec.containers[0].resources.limits.cpu}}"')
             actual_cpu = verify.stdout.strip().strip("'\"")
-            if actual_cpu != cpu:
-                print(f"  ⚠️  {name}: cpu mismatch after reset — wanted {cpu}, API returns {actual_cpu!r}. Retrying...")
-                ssh_cmd(user, master,
+            if _cpu_millicores(actual_cpu) != _cpu_millicores(cpu):
+                print(f"  ⚠️  {name}: cpu mismatch after reset — wanted {cpu} ({_cpu_millicores(cpu)}m), API returns {actual_cpu!r} ({_cpu_millicores(actual_cpu)}m). Retrying...")
+                r2 = ssh_cmd(user, master,
                     f"kubectl set resources deployment {name} --limits=cpu={cpu},memory={mem} -c {container_name}")
+                if r2.returncode != 0:
+                    print(f"  ❌ {name}: retry failed: {r2.stderr.strip()}")
                 verify2 = ssh_cmd(user, master,
                     f'kubectl get deployment {name} -o jsonpath="{{.spec.template.spec.containers[0].resources.limits.cpu}}"')
                 actual_cpu = verify2.stdout.strip().strip("'\"")
-            print(f"  ✅ {name}: cpu={actual_cpu}, memory={mem} (container: {container_name})")
+                if _cpu_millicores(actual_cpu) != _cpu_millicores(cpu):
+                    print(f"  ❌ {name}: still mismatched after retry: {actual_cpu!r} (wanted {cpu}). Proceeding with current state.")
+            print(f"  ✅ {name}: cpu={actual_cpu} ({_cpu_millicores(actual_cpu)}m), memory={mem} (container: {container_name})")
         else:
             print(f"  ⚠️  {name}: could not determine container name, skipping resource reset")
 
