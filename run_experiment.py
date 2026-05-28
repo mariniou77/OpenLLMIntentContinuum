@@ -44,9 +44,9 @@ LOCUST_BIN = _find_locust()
 
 
 # ── Default Experiment Configuration ────────────────────────────────────────
-# Load pattern: ms3 at 500m CPU handles ~3.7 req/s (4 waitress threads × 1/0.65s).
-# 10 users saturate it and trigger upper-threshold violations; 3 users ease off.
-DEFAULT_LOAD_PATTERN = [5, 10, 8, 5, 3, 10, 5]
+# Load pattern: 20 users at peak saturate ms3 (500m CPU, ~3.7 req/s capacity) and
+# trigger upper-threshold violations; 5 users ease off below lower threshold.
+DEFAULT_LOAD_PATTERN = [10, 20, 15, 10, 5, 20, 10]
 DEFAULT_INTERVAL = 120  # seconds between load changes
 DEFAULT_SPAWN_RATE = 1  # users per second
 LOCUST_WEB_PORT = 8089

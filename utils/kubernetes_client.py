@@ -255,8 +255,15 @@ class KubernetesClient:
             Dictionary with success status and message
         """
         logger.info(f"Setting resources for {deployment_name}: CPU={cpu_limit}, Memory={memory_limit}")
-        
-        command = f"set resources deployment {deployment_name} --limits=cpu={cpu_limit},memory={memory_limit} --requests=cpu={cpu_limit},memory={memory_limit} -n {namespace}"
+
+        # Look up the first container name so we only update the app container,
+        # consistent with how reset_cluster() uses -c to avoid touching sidecars.
+        container_name = self._run_kubectl(
+            f'get deployment {deployment_name} -o jsonpath="{{.spec.template.spec.containers[0].name}}" -n {namespace}'
+        ).strip().strip('"')
+        container_flag = f"-c {container_name}" if container_name else ""
+
+        command = f"set resources deployment {deployment_name} --limits=cpu={cpu_limit},memory={memory_limit} --requests=cpu={cpu_limit},memory={memory_limit} {container_flag} -n {namespace}"
         output = self._run_kubectl(command)
         
         # kubectl set resources returns something like "deployment.apps/xxx resource requirements updated"
