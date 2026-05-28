@@ -178,29 +178,27 @@ class ImageProcessingUser(User):
             )
 
 
-class StagesShape(LoadTestShape):
-    """
-    Staged load pattern matching the IntentContinuum paper.
-    
-    Varies user count over time: [10, 20, 15, 10, 5, 20, 10]
-    with 120-second intervals between changes.
-    
-    Only active when LOCUST_STAGED=1 environment variable is set.
-    """
-    
-    stages = LOAD_STAGES
-    
-    def tick(self):
-        if not USE_STAGED:
-            return None  # Fall back to --users flag
-        
-        run_time = self.get_run_time()
-        
-        elapsed = 0
-        for duration, users, spawn_rate in self.stages:
-            if run_time < elapsed + duration:
-                return (users, spawn_rate)
-            elapsed += duration
-        
-        # Past all stages — stop
-        return None
+if USE_STAGED:
+    class StagesShape(LoadTestShape):
+        """
+        Staged load pattern matching the IntentContinuum paper.
+
+        Varies user count over time: [10, 20, 15, 10, 5, 20, 10]
+        with 120-second intervals between changes.
+
+        Only active when LOCUST_STAGED=1 environment variable is set.
+        """
+
+        stages = LOAD_STAGES
+
+        def tick(self):
+            run_time = self.get_run_time()
+
+            elapsed = 0
+            for duration, users, spawn_rate in self.stages:
+                if run_time < elapsed + duration:
+                    return (users, spawn_rate)
+                elapsed += duration
+
+            # Past all stages — stop
+            return None
