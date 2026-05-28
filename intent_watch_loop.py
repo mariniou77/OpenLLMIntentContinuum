@@ -318,6 +318,18 @@ class IntentWatchLoop:
                         )
                 logger.info("ms3 pod ready.")
 
+                # After any ms3 pod replacement (rollout or force-delete), the new pod
+                # starts with a cold SSD model. The first real request will be slow
+                # (~5-7s), pushing EMA over the upper threshold immediately and causing
+                # a spurious violation on the next check. Send one warm-up request now
+                # so the SSD model is loaded before the stabilization wait ends.
+                logger.info("Sending ms3 warm-up request to pre-load SSD model...")
+                warmup_rt = self._measure_response_time()
+                if warmup_rt is not None:
+                    logger.info(f"ms3 warm-up complete (RT={warmup_rt:.3f}s, not counted in metrics)")
+                else:
+                    logger.warning("ms3 warm-up request failed — SSD model may still be cold")
+
                 logger.info(f"Waiting {self.wait_after_action}s for system to stabilize...")
                 time.sleep(self.wait_after_action)
             else:
