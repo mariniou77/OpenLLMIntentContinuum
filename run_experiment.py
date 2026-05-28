@@ -139,6 +139,38 @@ def reset_cluster(config_path: str):
     running = result.stdout.strip()
     print(f"  ✅ {running} pods running")
 
+    # Pre-warm the application so ms3's SSD model is loaded before Locust starts.
+    # The SSD model takes ~30-60s to initialize; pod readiness probes don't wait for it.
+    import yaml as _yaml
+    with open(config_path) as _f:
+        _cfg = _yaml.safe_load(_f)
+    _app = _cfg.get("application", {})
+    _entry = _app.get("entry_point", "http://10.56.1.209:5001/resize")
+    _image = _app.get("test_image", "/home/cc/OpenLLMIntentContinuum/images/family.jpg")
+    _webhooks = _app.get("webhooks", "")
+    _db_url = _app.get("db_url", "")
+    _logs_url = _app.get("logs_url", "")
+    print("  🔥 Pre-warming application (waiting for ms3 SSD model cold-start, up to 90s)...")
+    try:
+        warmup_result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "-X", "POST",
+             "-F", f"image=@{_image}",
+             "-H", "X-Special-Object: person",
+             "-H", f"X-Webhooks: {_webhooks}",
+             "-H", f"X-Central-DB-URL: {_db_url}",
+             "-H", f"X-Logs-URL: {_logs_url}",
+             _entry, "--max-time", "90"],
+            capture_output=True, text=True, timeout=100
+        )
+        code = warmup_result.stdout.strip()
+        if code == "200":
+            print("  ✅ Application warmed up (HTTP 200)")
+        else:
+            print(f"  ⚠️  Warm-up response code: {code or 'timeout'} — continuing anyway")
+    except Exception as _e:
+        print(f"  ⚠️  Warm-up failed: {_e} — continuing anyway")
+
 
 def start_locust_locally(config_path, initial_users, spawn_rate, total_duration, results_dir):
     """

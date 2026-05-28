@@ -116,7 +116,7 @@ class IntentWatchLoop:
                 "-H", f"X-Central-DB-URL: {app_config.get('db_url', '')}",
                 "-H", f"X-Logs-URL: {app_config.get('logs_url', '')}",
                 app_config.get("entry_point", "http://10.56.1.209:5001/resize"),
-                "--max-time", "60",
+                "--max-time", "90",
                 "-w", "%{time_total}",
                 "-o", "/dev/null",
                 "-s"
@@ -126,7 +126,7 @@ class IntentWatchLoop:
                 curl_command,
                 capture_output=True,
                 text=True,
-                timeout=90
+                timeout=120
             )
             
             if result.returncode == 0:
