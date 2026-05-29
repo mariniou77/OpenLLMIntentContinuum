@@ -26,6 +26,7 @@ from decision_maker import DecisionMaker
 from decision_history import DecisionHistory
 from action_executor import ActionExecutor
 from candidate_generator import CandidateActionGenerator
+from candidate_filter import CandidateFilter
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,9 @@ class IntentWatchLoop:
         # Decision history
         max_history = config.get("history", {}).get("max_entries", 5)
         self.decision_history = DecisionHistory(max_entries=max_history)
+
+        # Hybrid filter: enforces Rule 3 in Python before LLM sees candidates
+        self.candidate_filter = CandidateFilter(config)
         
         # EMA state
         self.ema_rt: Optional[float] = None
@@ -234,20 +238,45 @@ class IntentWatchLoop:
         )
         # Also update structured history outcome
         self.decision_history.update_last_structured_outcome("violation_persisted")
-        
+
         history_entries = self.decision_history.get_structured_history()
-        
-        # Step 5: Query LLM with 8-message format
+
+        # Step 4b: Hybrid filter — enforce Rule 3 in Python before the LLM
+        # sees the candidates.  Removes (action_type, target) pairs that
+        # already appeared in history with result=violation_persisted.
+        # Re-letters the remaining candidates A/B/C/... so the LLM sees a
+        # compact list without gaps.
+        filtered_candidates = self.candidate_filter.filter(
+            candidate_actions, history_entries
+        )
+        if len(filtered_candidates) != len(candidate_actions):
+            logger.info("Filtered candidate list (shown to LLM):")
+            for c in filtered_candidates:
+                logger.info(
+                    f"  [{c['id']}] {c['type']} → "
+                    f"{c.get('target', c.get('description', 'n/a'))}"
+                )
+
+        # Step 5: Query LLM with 8-message format (filtered candidates)
         logger.info("Querying LLM for recommendation (8-msg format)...")
         recommendation = self.decision_maker.analyze_and_recommend(
             violation_type=violation_type,
             current_rt=current_rt,
             ema_rt=self.ema_rt,
             structured_state=structured_state,
-            candidate_actions=candidate_actions,
+            candidate_actions=filtered_candidates,
             history_entries=history_entries
         )
-        
+
+        # Step 5b: Post-selection validation — catch position bias where the
+        # LLM's reasoning identified a valid service but the selected letter
+        # resolved to a candidate outside the filtered set.
+        recommendation, was_overridden = self.candidate_filter.validate_selection(
+            recommendation, filtered_candidates
+        )
+        if was_overridden:
+            logger.warning("Hybrid filter: position-bias correction applied")
+
         logger.info(f"Recommended Action: {recommendation.get('action', 'none')}")
         if recommendation.get('parameters'):
             logger.info(f"Parameters: {recommendation.get('parameters')}")
@@ -350,13 +379,13 @@ class IntentWatchLoop:
             }
         )
         
-        # Build and save structured history entry for 8-msg format
-        # Find which candidate was selected (match by action type + target)
-        selected_candidate = candidate_actions[0] if candidate_actions else {}
-        for c in candidate_actions:
+        # Build and save structured history entry for 8-msg format.
+        # Match against filtered_candidates (what the LLM actually saw).
+        selected_candidate = filtered_candidates[0] if filtered_candidates else {}
+        for c in filtered_candidates:
             executor_action = self.decision_maker._candidate_to_executor_action(c)
             if (executor_action.get("action") == recommendation.get("action") and
-                executor_action.get("parameters", {}).get("deployment_name") == 
+                executor_action.get("parameters", {}).get("deployment_name") ==
                 recommendation.get("parameters", {}).get("deployment_name")):
                 selected_candidate = c
                 break
