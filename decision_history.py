@@ -50,19 +50,10 @@ class DecisionHistory:
         # Pending outcome tracking - stores data needed to evaluate last decision
         self.pending_outcome: Optional[dict] = None
         
-        logger.info(f"DecisionHistory initialized with max_entries={max_entries}")
-    
-    def reset(self):
-        """
-        Reset history for a new experiment session.
+        # Structured history for 8-message LLM format
+        self._structured_history = deque(maxlen=max_entries)
         
-        Called at the start of each time window experiment.
-        """
-        self.history.clear()
-        self.session_start = datetime.now()
-        self.violation_counter = 0
-        self.pending_outcome = None
-        logger.info("Decision history reset for new session")
+        logger.info(f"DecisionHistory initialized with max_entries={max_entries}")
     
     def add_entry(
         self,
@@ -326,3 +317,92 @@ class DecisionHistory:
     def __repr__(self) -> str:
         """String representation."""
         return f"DecisionHistory(entries={len(self.history)}, max={self.max_entries})"
+
+    # ===== STRUCTURED HISTORY FOR 8-MESSAGE FORMAT =====
+
+    def build_structured_entry(
+        self,
+        structured_state: dict,
+        selected_candidate: dict,
+        candidate_actions: list
+    ) -> dict:
+        """
+        Build a structured history entry matching the test suite format.
+        
+        Called after a decision is made, before knowing the outcome.
+        
+        Args:
+            structured_state: The structured state that was sent to the LLM
+            selected_candidate: The candidate action that was selected
+            candidate_actions: The full list of candidates offered
+            
+        Returns:
+            Structured history entry dict
+        """
+        services = structured_state.get("services", [])
+        intent = structured_state.get("intent", {})
+        network = structured_state.get("network", {})
+        
+        # Find highest CPU service
+        highest_svc = max(services, key=lambda s: s.get("cpu_util_pct", 0)) if services else {}
+        
+        return {
+            "violation": {
+                "status": intent.get("status", "unknown"),
+                "observed": intent.get("observed", 0),
+                "threshold": intent.get("threshold", 0)
+            },
+            "metrics": {
+                "highest_cpu_service": highest_svc.get("name", "unknown"),
+                "cpu_util_pct": highest_svc.get("cpu_util_pct", 0),
+                "congestion_score": network.get("congestion_score", 0)
+            },
+            "action_taken": {
+                "type": selected_candidate.get("type", "unknown"),
+                "target": selected_candidate.get("target", "unknown"),
+                "result": "violation_persisted"  # Default; updated on next violation
+            }
+        }
+
+    def get_structured_history(self) -> list:
+        """
+        Get structured history entries for the 8-message LLM format.
+        
+        Returns the last max_entries structured entries in chronological order.
+        """
+        return list(self._structured_history)
+
+    def add_structured_entry(self, entry: dict):
+        """
+        Add a structured history entry to the rolling window.
+        
+        Args:
+            entry: Structured entry from build_structured_entry()
+        """
+        if not hasattr(self, '_structured_history'):
+            self._structured_history = deque(maxlen=self.max_entries)
+        self._structured_history.append(entry)
+        logger.info(f"Added structured history entry (total: {len(self._structured_history)})")
+
+    def update_last_structured_outcome(self, result: str):
+        """
+        Update the outcome of the most recent structured history entry.
+        
+        Args:
+            result: "violation_persisted", "violation_resolved", or "improved"
+        """
+        if not hasattr(self, '_structured_history') or not self._structured_history:
+            return
+        self._structured_history[-1]["action_taken"]["result"] = result
+
+    def reset(self):
+        """
+        Reset history for a new experiment session.
+        """
+        self.history.clear()
+        if hasattr(self, '_structured_history'):
+            self._structured_history.clear()
+        self.session_start = datetime.now()
+        self.violation_counter = 0
+        self.pending_outcome = None
+        logger.info("Decision history reset for new session")

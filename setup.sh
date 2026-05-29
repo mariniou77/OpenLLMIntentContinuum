@@ -39,8 +39,8 @@ fi
 # Verify SSH to master node
 echo ""
 echo "🔑 Testing SSH to master node..."
-MASTER_HOST=${MASTER_HOST:-10.132.0.14}
-MASTER_USER=${MASTER_USER:-antonios-icontinuum}
+MASTER_HOST=${MASTER_HOST:-10.56.1.209}
+MASTER_USER=${MASTER_USER:-cc}
 if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${MASTER_USER}@${MASTER_HOST} "echo OK" 2>/dev/null; then
     echo "  ✅ SSH to master node works"
 else
@@ -49,42 +49,42 @@ else
     exit 1
 fi
 
-# Verify test image exists on master
+# Verify local test image exists
 echo ""
-echo "🖼️  Checking test image on master node..."
-REMOTE_IMAGE=${REMOTE_IMAGE:-/home/antonios-icontinuum/test_converted.jpg}
-if ssh ${MASTER_USER}@${MASTER_HOST} "test -f ${REMOTE_IMAGE}" 2>/dev/null; then
-    SIZE=$(ssh ${MASTER_USER}@${MASTER_HOST} "ls -lh ${REMOTE_IMAGE} | awk '{print \$5}'" 2>/dev/null)
-    echo "  ✅ Image exists: ${REMOTE_IMAGE} (${SIZE})"
+echo "🖼️  Checking local test image..."
+LOCAL_IMAGE=${LOCAL_IMAGE:-images/family.jpg}
+if [ -f "${LOCAL_IMAGE}" ]; then
+    SIZE=$(ls -lh "${LOCAL_IMAGE}" | awk '{print $5}')
+    echo "  ✅ Image exists: ${LOCAL_IMAGE} (${SIZE})"
 else
-    echo "  ❌ Image not found: ${REMOTE_IMAGE}"
+    echo "  ❌ Image not found: ${LOCAL_IMAGE}"
     exit 1
 fi
 
-# Verify application is reachable
+# Verify application is reachable (curl directly from sdn-controller)
 echo ""
 echo "🌐 Testing application endpoint..."
-RT=$(ssh ${MASTER_USER}@${MASTER_HOST} \
-    "curl -X POST \
-    -F 'image=@${REMOTE_IMAGE}' \
-    -H 'X-Special-Object: person' \
-    http://192.168.100.100:5001/resize \
-    --max-time 30 -w '%{time_total}' -o /dev/null -s" 2>/dev/null)
+RT=$(curl -X POST \
+    -F "image=@${LOCAL_IMAGE}" \
+    -H "X-Special-Object: person" \
+    http://10.56.1.209:5001/resize \
+    --max-time 30 -w '%{time_total}' -o /dev/null -s 2>/dev/null) || true
 
-if [ $? -eq 0 ] && [ -n "$RT" ]; then
+if [ -n "$RT" ]; then
     echo "  ✅ Application responded in ${RT}s"
 else
-    echo "  ❌ Application not reachable"
+    echo "  ❌ Application not reachable at http://10.56.1.209:5001/resize"
     exit 1
 fi
 
-# Verify Ollama
+# Verify Ollama (on llm-server, not localhost)
 echo ""
 echo "🤖 Checking Ollama..."
-if curl -s http://localhost:11434/api/tags | python3 -c "import sys,json; models=[m['name'] for m in json.load(sys.stdin)['models']]; print('  ✅ Models:', ', '.join(models))" 2>/dev/null; then
+OLLAMA_URL=${OLLAMA_URL:-http://10.56.2.204:11434}
+if curl -s ${OLLAMA_URL}/api/tags | python3 -c "import sys,json; models=[m['name'] for m in json.load(sys.stdin)['models']]; print('  ✅ Models:', ', '.join(models))" 2>/dev/null; then
     :
 else
-    echo "  ❌ Ollama not responding"
+    echo "  ❌ Ollama not responding at ${OLLAMA_URL}"
     exit 1
 fi
 

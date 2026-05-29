@@ -20,6 +20,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,8 +31,21 @@ from datetime import datetime
 from pathlib import Path
 
 
+def _find_locust() -> str:
+    """Return the locust executable path, preferring a local venv."""
+    venv_bin = os.path.expanduser("~/locust-venv/bin/locust")
+    if os.path.exists(venv_bin):
+        return venv_bin
+    found = shutil.which("locust")
+    return found if found else "locust"
+
+
+LOCUST_BIN = _find_locust()
+
+
 # ── Default Experiment Configuration ────────────────────────────────────────
-# Matches the IntentContinuum paper's computing experiment
+# Load pattern: 20 users at peak saturate ms3 (500m CPU, ~3.7 req/s capacity) and
+# trigger upper-threshold violations; 5 users ease off below lower threshold.
 DEFAULT_LOAD_PATTERN = [10, 20, 15, 10, 5, 20, 10]
 DEFAULT_INTERVAL = 120  # seconds between load changes
 DEFAULT_SPAWN_RATE = 1  # users per second
@@ -49,6 +63,26 @@ def parse_args():
     parser.add_argument("--skip-reset", action="store_true", help="Skip cluster reset")
     parser.add_argument("--debug-llm", action="store_true", help="Enable LLM debug logging")
     return parser.parse_args()
+
+
+def _cpu_millicores(cpu_str: str) -> int:
+    """Convert a K8s CPU string to millicores for numeric comparison.
+
+    K8s normalises "1000m" to "1" in its API response, so a plain
+    string equality check ("1" != "1000m") always reports a false
+    mismatch.  Converting both sides to an integer millicores value
+    before comparing avoids the false positive.
+    """
+    s = cpu_str.strip()
+    if s.endswith("m"):
+        try:
+            return int(s[:-1])
+        except ValueError:
+            return -1
+    try:
+        return int(float(s) * 1000)
+    except ValueError:
+        return -1
 
 
 def get_master_info(config_path: str):
@@ -96,159 +130,228 @@ def reset_cluster(config_path: str):
             f'kubectl get deployment {name} -o jsonpath="{{.spec.template.spec.containers[0].name}}"')
         container_name = result.stdout.strip().strip("'\"")
         if container_name:
-            ssh_cmd(user, master,
-                f"kubectl set resources deployment {name} --limits=cpu={cpu},memory={mem} -c {container_name}")
-            print(f"  ✅ {name}: cpu={cpu}, memory={mem} (container: {container_name})")
+            # Always set --requests alongside --limits so K8s validation passes.
+            # K8s requires requests ≤ limits atomically; setting only --limits while
+            # old requests are higher (e.g. 1000m > 300m) causes an invalid-value error.
+            set_cmd = (f"kubectl set resources deployment {name}"
+                       f" --limits=cpu={cpu},memory={mem}"
+                       f" --requests=cpu={cpu},memory={mem}"
+                       f" -c {container_name}")
+            r0 = ssh_cmd(user, master, set_cmd)
+            if r0.returncode != 0:
+                print(f"  ❌ {name}: set resources failed: {r0.stderr.strip()}")
+            # Re-read from the API to confirm the spec was actually updated.
+            verify = ssh_cmd(user, master,
+                f'kubectl get deployment {name} -o jsonpath="{{.spec.template.spec.containers[0].resources.limits.cpu}}"')
+            actual_cpu = verify.stdout.strip().strip("'\"")
+            if _cpu_millicores(actual_cpu) != _cpu_millicores(cpu):
+                print(f"  ⚠️  {name}: cpu mismatch after reset — wanted {cpu} ({_cpu_millicores(cpu)}m), "
+                      f"API returns {actual_cpu!r} ({_cpu_millicores(actual_cpu)}m). Retrying...")
+                r2 = ssh_cmd(user, master, set_cmd)
+                if r2.returncode != 0:
+                    print(f"  ❌ {name}: retry failed: {r2.stderr.strip()}")
+                verify2 = ssh_cmd(user, master,
+                    f'kubectl get deployment {name} -o jsonpath="{{.spec.template.spec.containers[0].resources.limits.cpu}}"')
+                actual_cpu = verify2.stdout.strip().strip("'\"")
+                if _cpu_millicores(actual_cpu) != _cpu_millicores(cpu):
+                    print(f"  ❌ {name}: still mismatched after retry: {actual_cpu!r} (wanted {cpu}).")
+            print(f"  ✅ {name}: cpu={actual_cpu} ({_cpu_millicores(actual_cpu)}m), memory={mem} (container: {container_name})")
         else:
             print(f"  ⚠️  {name}: could not determine container name, skipping resource reset")
 
-    # Wait for pods to stabilize
-    print("  ⏳ Waiting 30s for pods to stabilize...")
-    time.sleep(30)
+    # Ensure ms3 fwatchdog allows enough time for SSD model cold-start.
+    # Only set if not already correct — avoids triggering an unnecessary rollout.
+    result = ssh_cmd(user, master,
+        'kubectl get deployment microservice3-deployment -o jsonpath="{.spec.template.spec.containers[0].env}"')
+    if "exec_timeout" not in result.stdout:
+        ssh_cmd(user, master,
+            "kubectl set env deployment/microservice3-deployment exec_timeout=90s -c nginx")
+        print("  ✅ microservice3-deployment: exec_timeout=90s set (fwatchdog SSD cold-start)")
+    else:
+        print("  ✅ microservice3-deployment: exec_timeout already configured")
+
+    # Wait for all rollouts to complete (set resources + possible set env above)
+    print("  ⏳ Waiting for rollouts to complete...")
+    for dep_name in ["microservice1-deployment", "microservice2-deployment",
+                     "microservice3-deployment", "microservice4-deployment"]:
+        ssh_cmd(user, master, f"kubectl rollout status deployment/{dep_name} --timeout=120s", timeout=130)
+    print("  ✅ All rollouts complete")
+
+    # Always force-restart ms3 regardless of whether its resources changed.
+    # kubectl set resources is idempotent: if values are unchanged it skips the rollout,
+    # leaving an old pod alive that may have accumulated CLOSE_WAIT connections from
+    # a previous experiment. A fresh pod guarantees a clean connection state.
+    print("  ♻️  Force-restarting ms3 pod to guarantee clean connection state...")
+    ssh_cmd(user, master, "kubectl delete pod -l app=microservice3 --force --grace-period=0")
+    ssh_cmd(user, master, "kubectl rollout status deployment/microservice3-deployment --timeout=120s", timeout=130)
+    print("  ✅ ms3 pod restarted")
 
     # Verify pods are running
     result = ssh_cmd(user, master, "kubectl get pods --no-headers | grep -c Running")
     running = result.stdout.strip()
     print(f"  ✅ {running} pods running")
 
+    # Pre-warm the application to confirm the full chain is healthy before Locust starts.
+    import yaml as _yaml
+    with open(config_path) as _f:
+        _cfg = _yaml.safe_load(_f)
+    _app = _cfg.get("application", {})
+    _entry = _app.get("entry_point", "http://10.56.1.209:5001/resize")
+    _image = _app.get("test_image", "/home/cc/OpenLLMIntentContinuum/images/family.jpg")
+    _webhooks = _app.get("webhooks", "")
+    _db_url = _app.get("db_url", "")
+    _logs_url = _app.get("logs_url", "")
+    print("  🔥 Pre-warming application (waiting for ms3 SSD model cold-start, up to 90s)...")
+    try:
+        warmup_result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "-X", "POST",
+             "-F", f"image=@{_image}",
+             "-H", "X-Special-Object: person",
+             "-H", f"X-Webhooks: {_webhooks}",
+             "-H", f"X-Central-DB-URL: {_db_url}",
+             "-H", f"X-Logs-URL: {_logs_url}",
+             _entry, "--max-time", "90"],
+            capture_output=True, text=True, timeout=100
+        )
+        code = warmup_result.stdout.strip()
+        if code == "200":
+            print("  ✅ Application warmed up (HTTP 200)")
+        else:
+            print(f"  ⚠️  Warm-up response code: {code or 'timeout'} — continuing anyway")
+    except Exception as _e:
+        print(f"  ⚠️  Warm-up failed: {_e} — continuing anyway")
 
-def start_locust_on_master(user, master, initial_users, spawn_rate, total_duration):
+
+def warmup_llm(config_path: str):
     """
-    Start Locust on the master node via SSH.
-    Locust runs in the background with web UI enabled for REST API control.
-    The locustfile.py must already exist on the master at ~/locustfile.py.
+    Send a trivial prompt to Ollama to force the model into GPU VRAM before the
+    experiment starts. Without this, the first real LLM call (a violation decision)
+    pays a ~15s cold-load penalty instead of the normal ~1s inference time.
     """
-    print(f"\n🦗 Starting Locust on master node ({master})...")
+    import yaml
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    ollama_url = cfg.get("endpoints", {}).get("ollama", "http://10.56.2.204:11434")
+    model = cfg.get("llm", {}).get("model", "qwen3.5:4b")
 
-    # Kill any existing Locust process
-    ssh_cmd(user, master, "pkill -f 'locust' 2>/dev/null || true")
-    time.sleep(2)
+    print(f"\n🔥 Pre-warming LLM ({model} on {ollama_url})...")
+    url = f"{ollama_url}/api/generate"
+    payload = json.dumps({
+        "model": model,
+        "prompt": "Hi",
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0},
+    }).encode()
 
-    # Write a startup script on the master, then execute it
-    # This avoids all quoting issues with nested SSH commands
-    startup_script = (
-        f"#!/bin/bash\n"
-        f"source ~/locust-env/bin/activate\n"
-        f"cd ~\n"
-        f"locust -f ~/locustfile.py "
-        f"--host http://192.168.100.100:5001 "
-        f"-u {initial_users} -r {spawn_rate} "
-        f"--run-time {total_duration}s "
-        f"--web-port {LOCUST_WEB_PORT} "
-        f"--autostart "
-        f"--autoquit 30 "
-        f"--csv ~/locust_results "
-        f"--csv-full-history "
-        f"> ~/locust.log 2>&1\n"
-    )
+    try:
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp.read()
+        elapsed = time.time() - t0
+        print(f"  ✅ LLM warmed up in {elapsed:.1f}s (model loaded into VRAM)")
+    except Exception as e:
+        print(f"  ⚠️  LLM warm-up failed: {e} — continuing anyway")
 
-    # Write the script to master
-    write_cmd = f"cat > ~/start_locust.sh << 'SCRIPT_EOF'\n{startup_script}SCRIPT_EOF"
-    ssh_cmd(user, master, write_cmd, timeout=10)
-    ssh_cmd(user, master, "chmod +x ~/start_locust.sh", timeout=10)
 
-    # Launch the script in background using nohup + ssh -f
-    subprocess.Popen(
-        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-         "-f", f"{user}@{master}",
-         "nohup ~/start_locust.sh &"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(3)
+def start_locust_locally(config_path, initial_users, spawn_rate, total_duration, results_dir):
+    """
+    Start Locust locally on the SDN controller as a subprocess.
+    Locust runs with web UI enabled so load can be changed via REST API.
+    Uses DIRECT_CURL=1 so requests are sent without an SSH wrapper.
+    """
+    import yaml
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    app = cfg.get("application", {})
+    entry_point = app.get("entry_point", "http://10.56.1.209:5001/resize")
+    remote_image = app.get("test_image", "images/family.jpg")
+    webhooks = app.get("webhooks", "")
+    db_url = app.get("db_url", "")
+    logs_url = app.get("logs_url", "")
+
+    print(f"\n🦗 Starting Locust locally (entry: {entry_point})...")
+
+    # Kill any stale locust process
+    subprocess.run(["pkill", "-f", "locust"], capture_output=True)
+    time.sleep(1)
+
+    env = os.environ.copy()
+    env.update({
+        "DIRECT_CURL": "1",
+        "SDN_ENTRY_POINT": entry_point,
+        "REMOTE_IMAGE": remote_image,
+        "WEBHOOKS": webhooks,
+        "DB_URL": db_url,
+        "LOGS_URL": logs_url,
+    })
+
+    cmd = [
+        LOCUST_BIN, "-f", "locustfile.py",
+        "--host", entry_point,
+        "-u", str(initial_users), "-r", str(spawn_rate),
+        "--run-time", f"{total_duration}s",
+        "--web-port", str(LOCUST_WEB_PORT),
+        "--autostart",
+        "--autoquit", "30",
+        "--csv", os.path.join(results_dir, "locust_results"),
+        "--csv-full-history",
+    ]
+
+    log_file = open(os.path.join(results_dir, "locust.log"), "w")
+    proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
 
     # Wait for Locust web API to become available
-    locust_api = f"http://{master}:{LOCUST_WEB_PORT}/stats/requests"
+    locust_api = f"http://localhost:{LOCUST_WEB_PORT}/stats/requests"
     print(f"  ⏳ Waiting for Locust web API at {locust_api}...")
-    for attempt in range(30):
+    for _ in range(30):
         try:
             response = urllib.request.urlopen(locust_api, timeout=3)
             data = json.loads(response.read())
             print(f"  ✅ Locust web API ready (state: {data.get('state', 'unknown')})")
-            return True
+            return proc, log_file
         except Exception:
             time.sleep(1)
 
     print("  ❌ Locust web API not available after 30s")
-    return False
+    return None, log_file
 
 
-def change_locust_load(master, target_users, spawn_rate):
-    """Change the number of Locust users via REST API on the master node."""
+def change_locust_load(target_users, spawn_rate):
+    """Change the number of Locust users via the local Locust REST API."""
     payload = json.dumps({
         "user_count": target_users,
         "spawn_rate": spawn_rate,
     }).encode()
 
-    try:
-        req = urllib.request.Request(
-            f"http://{master}:{LOCUST_WEB_PORT}/swarm",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        response = urllib.request.urlopen(req, timeout=10)
-        return True
-    except Exception as e:
-        # Try PUT as fallback
+    for method in ("POST", "PUT"):
         try:
             req = urllib.request.Request(
-                f"http://{master}:{LOCUST_WEB_PORT}/swarm",
+                f"http://localhost:{LOCUST_WEB_PORT}/swarm",
                 data=payload,
                 headers={"Content-Type": "application/json"},
-                method="PUT"
+                method=method,
             )
-            response = urllib.request.urlopen(req, timeout=10)
+            urllib.request.urlopen(req, timeout=10)
             return True
-        except Exception as e2:
-            print(f"  ⚠️  Failed to change Locust load: POST={e}, PUT={e2}")
-            return False
-
-
-def stop_locust_on_master(user, master):
-    """Stop Locust on the master node."""
-    print("  🦗 Stopping Locust on master...")
-    ssh_cmd(user, master, "pkill -f 'locust' 2>/dev/null || true")
-    time.sleep(2)
-    print("  ✅ Locust stopped")
-
-
-def collect_locust_results(user, master, results_dir):
-    """Copy Locust CSV results from master to local results directory."""
-    print("  📥 Collecting Locust results from master...")
-    
-    # First, list what CSV files actually exist
-    result = ssh_cmd(user, master, "ls ~/locust_results*.csv 2>/dev/null || echo 'NO_FILES'", timeout=15)
-    if "NO_FILES" in result.stdout:
-        print("    ⚠️  No Locust CSV files found on master")
-        return
-    
-    files = result.stdout.strip().split("\n")
-    for remote_path in files:
-        remote_path = remote_path.strip()
-        if not remote_path:
-            continue
-        filename = os.path.basename(remote_path)
-        try:
-            subprocess.run(
-                ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                 f"{user}@{master}:{remote_path}", results_dir],
-                capture_output=True, timeout=60
-            )
-            print(f"    ✅ {filename}")
         except Exception as e:
-            print(f"    ⚠️  Failed to copy {filename}: {e}")
+            last_err = e
+    print(f"  ⚠️  Failed to change Locust load: {last_err}")
+    return False
 
-    # Also grab the locust log
+
+def stop_locust_locally(proc):
+    """Stop the local Locust subprocess."""
+    print("  🦗 Stopping Locust...")
+    proc.send_signal(signal.SIGINT)
     try:
-        subprocess.run(
-            ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-             f"{user}@{master}:~/locust.log", os.path.join(results_dir, "locust.log")],
-            capture_output=True, timeout=60
-        )
-        print("    ✅ locust.log")
-    except Exception:
-        pass
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    print("  ✅ Locust stopped")
 
 
 def start_intent_loop(config_path, duration_minutes, results_dir, debug_llm=False):
@@ -277,7 +380,7 @@ def start_intent_loop(config_path, duration_minutes, results_dir, debug_llm=Fals
     return intent_proc, log_file
 
 
-def run_load_schedule(master, load_pattern, interval, spawn_rate):
+def run_load_schedule(load_pattern, interval, spawn_rate):
     """Execute the staged load pattern by changing Locust user count at intervals."""
     print(f"\n📊 Load Schedule:")
     for i, users in enumerate(load_pattern):
@@ -295,7 +398,7 @@ def run_load_schedule(master, load_pattern, interval, spawn_rate):
             time.sleep(max(0, remaining))
         else:
             print(f"\n⏱️  Stage {i+1}/{len(load_pattern)}: changing to {users} users")
-            success = change_locust_load(master, users, spawn_rate)
+            success = change_locust_load(users, spawn_rate)
             if success:
                 print(f"  ✅ Load changed to {users} users")
             time.sleep(interval)
@@ -394,8 +497,8 @@ def main():
     print(f"  Interval: {args.interval}s between changes")
     print(f"  Spawn rate: {args.spawn_rate} user/s")
     print(f"  Total duration: {total_duration_s}s ({total_duration_min:.1f} min)")
-    print(f"  Master node: {user}@{master}")
-    print(f"  Locust: runs on master, controlled via REST API")
+    print(f"  Master node: {user}@{master} (for cluster reset only)")
+    print(f"  Locust: runs locally on SDN controller, controlled via REST API")
     print(f"  Results dir: {results_dir}/")
 
     if args.dry_run:
@@ -408,6 +511,9 @@ def main():
     else:
         print("\n⏭️  Skipping cluster reset")
 
+    # Step 1b: Warm up LLM (force model into GPU VRAM before first real decision)
+    warmup_llm(args.config)
+
     # Step 2: Start Intent Watch Loop (on SDN controller)
     intent_proc, intent_log = start_intent_loop(
         config_path=args.config,
@@ -419,36 +525,34 @@ def main():
     # Wait for intent loop to initialize
     time.sleep(5)
 
-    # Step 3: Start Locust on master node
-    locust_ok = start_locust_on_master(
-        user=user,
-        master=master,
+    # Step 3: Start Locust locally on SDN controller
+    locust_proc, locust_log = start_locust_locally(
+        config_path=args.config,
         initial_users=load_pattern[0],
         spawn_rate=args.spawn_rate,
         total_duration=total_duration_s,
+        results_dir=results_dir,
     )
 
-    if not locust_ok:
+    if locust_proc is None:
         print("❌ Failed to start Locust. Aborting experiment.")
         intent_proc.send_signal(signal.SIGINT)
         intent_proc.wait(timeout=15)
         intent_log.close()
+        locust_log.close()
         return
 
     # Step 4: Execute load schedule
     try:
-        run_load_schedule(master, load_pattern, args.interval, args.spawn_rate)
+        run_load_schedule(load_pattern, args.interval, args.spawn_rate)
     except KeyboardInterrupt:
         print("\n\n⚠️  Experiment interrupted by user")
     finally:
         # Step 5: Cleanup
         print("\n🛑 Stopping processes...")
 
-        # Stop Locust on master
-        stop_locust_on_master(user, master)
-
-        # Collect Locust results from master
-        collect_locust_results(user, master, results_dir)
+        stop_locust_locally(locust_proc)
+        locust_log.close()
 
         # Wait for Intent Loop to finish
         print("  ⏳ Waiting for Intent Watch Loop to finish...")
@@ -456,7 +560,11 @@ def main():
             intent_proc.wait(timeout=180)
         except subprocess.TimeoutExpired:
             intent_proc.send_signal(signal.SIGINT)
-            intent_proc.wait(timeout=15)
+            try:
+                intent_proc.wait(timeout=120)  # Allow graceful shutdown (may need to finish a 60s wait)
+            except subprocess.TimeoutExpired:
+                intent_proc.kill()
+                intent_proc.wait()
         print("  ✅ Intent Watch Loop stopped")
 
         intent_log.close()

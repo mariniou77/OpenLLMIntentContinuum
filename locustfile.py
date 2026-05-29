@@ -31,14 +31,18 @@ from locust import User, task, between, events, LoadTestShape
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────
-MASTER_HOST = os.environ.get("MASTER_HOST", "10.132.0.7")
-MASTER_USER = os.environ.get("MASTER_USER", "antonios-icontinuum")
-REMOTE_IMAGE = os.environ.get("REMOTE_IMAGE", "/home/antonios-icontinuum/test_converted.jpg")
+MASTER_HOST = os.environ.get("MASTER_HOST", "10.56.1.209")
+MASTER_USER = os.environ.get("MASTER_USER", "cc")
+REMOTE_IMAGE = os.environ.get("REMOTE_IMAGE", "/home/cc/test_converted.jpg")
 SDN_ENTRY_POINT = os.environ.get("SDN_ENTRY_POINT", "http://192.168.100.100:5001/resize")
 WEBHOOKS = os.environ.get("WEBHOOKS", "http://microservice2-service:5002/bw,http://microservice3-service:8081/,http://microservice4-service:5004/notify")
 DB_URL = os.environ.get("DB_URL", "http://db-service:5006/track_time")
 LOGS_URL = os.environ.get("LOGS_URL", "http://db-service:5006/log")
 REQUEST_TIMEOUT = 60  # seconds
+
+# When True, run curl directly (no SSH wrapper). Used when Locust runs on the
+# same machine that can reach the application endpoint directly.
+USE_DIRECT_CURL = os.environ.get("DIRECT_CURL", "0") == "1"
 
 # ── Staged Load Configuration ─────────────────────────────────────────────
 # Each tuple: (duration_seconds, num_users, spawn_rate)
@@ -74,31 +78,45 @@ class ImageProcessingUser(User):
         request_id = str(uuid.uuid4())
         start_time = time.time()
         
-        curl_command = (
-            f'curl -X POST '
-            f'-F "image=@{REMOTE_IMAGE}" '
-            f'-H "X-Request-ID: {request_id}" '
-            f'-H "X-Webhooks: {WEBHOOKS}" '
-            f'-H "X-Special-Object: person" '
-            f'-H "X-Central-DB-URL: {DB_URL}" '
-            f'-H "X-Logs-URL: {LOGS_URL}" '
-            f'{SDN_ENTRY_POINT} '
-            f'--max-time {REQUEST_TIMEOUT} '
-            f'-w "%{{time_total}}" '
-            f'-o /dev/null -s'
-        )
-        
-        ssh_command = [
-            "ssh",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=10",
-            f"{MASTER_USER}@{MASTER_HOST}",
-            curl_command
-        ]
-        
+        if USE_DIRECT_CURL:
+            command = [
+                "curl", "-X", "POST",
+                "-F", f"image=@{REMOTE_IMAGE}",
+                "-H", f"X-Request-ID: {request_id}",
+                "-H", f"X-Webhooks: {WEBHOOKS}",
+                "-H", "X-Special-Object: person",
+                "-H", f"X-Central-DB-URL: {DB_URL}",
+                "-H", f"X-Logs-URL: {LOGS_URL}",
+                SDN_ENTRY_POINT,
+                "--max-time", str(REQUEST_TIMEOUT),
+                "-w", "%{time_total}",
+                "-o", "/dev/null", "-s",
+            ]
+        else:
+            curl_command = (
+                f'curl -X POST '
+                f'-F "image=@{REMOTE_IMAGE}" '
+                f'-H "X-Request-ID: {request_id}" '
+                f'-H "X-Webhooks: {WEBHOOKS}" '
+                f'-H "X-Special-Object: person" '
+                f'-H "X-Central-DB-URL: {DB_URL}" '
+                f'-H "X-Logs-URL: {LOGS_URL}" '
+                f'{SDN_ENTRY_POINT} '
+                f'--max-time {REQUEST_TIMEOUT} '
+                f'-w "%{{time_total}}" '
+                f'-o /dev/null -s'
+            )
+            command = [
+                "ssh",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=10",
+                f"{MASTER_USER}@{MASTER_HOST}",
+                curl_command,
+            ]
+
         try:
             result = subprocess.run(
-                ssh_command,
+                command,
                 capture_output=True,
                 text=True,
                 timeout=REQUEST_TIMEOUT + 30
@@ -160,29 +178,27 @@ class ImageProcessingUser(User):
             )
 
 
-class StagesShape(LoadTestShape):
-    """
-    Staged load pattern matching the IntentContinuum paper.
-    
-    Varies user count over time: [10, 20, 15, 10, 5, 20, 10]
-    with 120-second intervals between changes.
-    
-    Only active when LOCUST_STAGED=1 environment variable is set.
-    """
-    
-    stages = LOAD_STAGES
-    
-    def tick(self):
-        if not USE_STAGED:
-            return None  # Fall back to --users flag
-        
-        run_time = self.get_run_time()
-        
-        elapsed = 0
-        for duration, users, spawn_rate in self.stages:
-            if run_time < elapsed + duration:
-                return (users, spawn_rate)
-            elapsed += duration
-        
-        # Past all stages — stop
-        return None
+if USE_STAGED:
+    class StagesShape(LoadTestShape):
+        """
+        Staged load pattern matching the IntentContinuum paper.
+
+        Varies user count over time: [10, 20, 15, 10, 5, 20, 10]
+        with 120-second intervals between changes.
+
+        Only active when LOCUST_STAGED=1 environment variable is set.
+        """
+
+        stages = LOAD_STAGES
+
+        def tick(self):
+            run_time = self.get_run_time()
+
+            elapsed = 0
+            for duration, users, spawn_rate in self.stages:
+                if run_time < elapsed + duration:
+                    return (users, spawn_rate)
+                elapsed += duration
+
+            # Past all stages — stop
+            return None

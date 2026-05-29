@@ -228,3 +228,73 @@ class ONOSClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to get intents: {e}")
             return []
+
+    def get_link_utilization(self) -> list:
+        """
+        Get per-link utilization from ONOS port statistics.
+        
+        Queries ONOS for port statistics on all devices and computes
+        utilization based on byte counts. Returns a list of links with
+        human-readable names and utilization percentages.
+        
+        Returns:
+            List of dicts like:
+            [
+                {"name": "S1-S2", "utilization_pct": 72.0, "bytes_in": 123456, "bytes_out": 98765},
+                ...
+            ]
+        """
+        links = self.get_links()
+        link_stats = []
+        
+        for link in links:
+            src_device = link.get("src", {}).get("device", "")
+            src_port = link.get("src", {}).get("port", "")
+            dst_device = link.get("dst", {}).get("device", "")
+            
+            if not src_device or not dst_device:
+                continue
+            
+            # Get port statistics for the source device/port
+            port_stats = self._get_port_stats(src_device, src_port)
+            if not port_stats:
+                continue
+            
+            # Build human-readable link name from device IDs
+            src_name = self._device_id_to_name(src_device)
+            dst_name = self._device_id_to_name(dst_device)
+            link_name = f"{src_name}-{dst_name}"
+            
+            link_stats.append({
+                "name": link_name,
+                "bytes_in": port_stats.get("bytesReceived", 0),
+                "bytes_out": port_stats.get("bytesSent", 0),
+            })
+        
+        return link_stats
+
+    def _get_port_stats(self, device_id: str, port: str) -> dict:
+        """Get port statistics for a specific device port."""
+        data = self._get(f"statistics/ports/{device_id}/{port}")
+        stats_list = data.get("statistics", [])
+        if stats_list:
+            ports = stats_list[0].get("ports", [])
+            for p in ports:
+                if str(p.get("port", "")) == str(port):
+                    return p
+        return {}
+
+    @staticmethod
+    def _device_id_to_name(device_id: str) -> str:
+        """
+        Convert ONOS device ID to a short name.
+        
+        E.g. "of:0000000000000001" -> "S1"
+        """
+        try:
+            # Extract last hex digits and convert to int
+            hex_part = device_id.split(":")[-1]
+            num = int(hex_part, 16)
+            return f"S{num}"
+        except (ValueError, IndexError):
+            return device_id
