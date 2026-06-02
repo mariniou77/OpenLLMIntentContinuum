@@ -23,6 +23,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -491,9 +492,6 @@ def main():
         print(f"   Results in: {RESULTS_ROOT}/")
         print("   Run:  python3 evaluation_results/plot_comparison.py")
 
-
-# Needed for type hint in stop_and_fetch_llm_monitor
-from typing import Optional
 
 if __name__ == "__main__":
     main()
