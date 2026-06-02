@@ -404,6 +404,10 @@ class DecisionHistory:
         """
         if not hasattr(self, '_structured_history') or not self._structured_history:
             return
+        # Never downgrade a resolved outcome — once resolved, it stays resolved
+        current = self._structured_history[-1].get("action_taken", {}).get("result", "")
+        if current == "violation_resolved" and result == "violation_persisted":
+            return
         self._structured_history[-1]["action_taken"]["result"] = result
 
     def reset(self):
