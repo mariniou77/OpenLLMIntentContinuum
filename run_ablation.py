@@ -346,9 +346,10 @@ def run_experiment(
     run_load_schedule(load_pattern, interval, spawn_rate)
 
     # 9. Wait for Locust and intent loop to finish
+    # Locust run-time equals total_duration; after schedule ends we give it 90s to autoquit
     print("\n  ⏳ Waiting for processes to complete...")
     try:
-        locust_proc.wait(timeout=total_duration + 120)
+        locust_proc.wait(timeout=90)
     except subprocess.TimeoutExpired:
         stop_locust_locally(locust_proc)
 

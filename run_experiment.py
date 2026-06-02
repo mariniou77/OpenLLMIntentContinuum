@@ -322,25 +322,24 @@ def start_locust_locally(config_path, initial_users, spawn_rate, total_duration,
 
 def change_locust_load(target_users, spawn_rate):
     """Change the number of Locust users via the local Locust REST API."""
-    payload = json.dumps({
+    # Locust /swarm reads request.form (form-encoded), not request.json
+    payload = urllib.parse.urlencode({
         "user_count": target_users,
         "spawn_rate": spawn_rate,
     }).encode()
 
-    for method in ("POST", "PUT"):
-        try:
-            req = urllib.request.Request(
-                f"http://localhost:{LOCUST_WEB_PORT}/swarm",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method=method,
-            )
-            urllib.request.urlopen(req, timeout=10)
-            return True
-        except Exception as e:
-            last_err = e
-    print(f"  ⚠️  Failed to change Locust load: {last_err}")
-    return False
+    try:
+        req = urllib.request.Request(
+            f"http://localhost:{LOCUST_WEB_PORT}/swarm",
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception as e:
+        print(f"  ⚠️  Failed to change Locust load: {e}")
+        return False
 
 
 def stop_locust_locally(proc):
