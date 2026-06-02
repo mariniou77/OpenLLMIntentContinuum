@@ -27,6 +27,7 @@ import json
 import logging
 import re
 import requests
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
@@ -80,6 +81,9 @@ class DecisionMaker:
 
         # Cache of last cluster data for action validation
         self._last_cluster_data = None
+
+        # Per-call telemetry log (prompt tokens, completion tokens, latency)
+        self.llm_calls_log: list = []
     
     def _load_system_prompt(self) -> str:
         """Load the 6-action system prompt from file."""
@@ -587,17 +591,27 @@ JSON:"""
             
             result = response.json()
             llm_response = result.get("message", {}).get("content", "")
-            
+
             total_duration = result.get("total_duration", 0)
             prompt_tokens = result.get("prompt_eval_count", 0)
             output_tokens = result.get("eval_count", 0)
+            latency_ms = round(total_duration / 1_000_000, 1) if total_duration else 0.0
             if total_duration:
                 logger.info(f"LLM response time: {total_duration / 1e9:.1f}s "
                            f"(prompt: {prompt_tokens}, output: {output_tokens} tokens)")
-            
+
+            # Accumulate per-call telemetry for experiment export
+            self.llm_calls_log.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": output_tokens,
+                "latency_ms": latency_ms,
+                "action_selected": None  # backfilled by analyze_and_recommend
+            })
+
             if self.debug_llm:
                 logger.info(f"LLM DEBUG - RESPONSE: {llm_response}")
-            
+
             return llm_response.strip()
             
         except requests.exceptions.Timeout:
@@ -1288,6 +1302,9 @@ JSON:"""
                     self._consecutive_failures = 0
                     logger.info(f"Valid action on attempt {attempt}: {action['action']}")
                     logger.info(f"Parameters: {action['parameters']}")
+                    # Backfill action_selected on the most recent log entry
+                    if self.llm_calls_log:
+                        self.llm_calls_log[-1]["action_selected"] = action["action"]
                     return action
                 else:
                     last_error = error_reason
@@ -1310,6 +1327,10 @@ JSON:"""
             logger.error("Too many consecutive failures, returning no-action")
             return self._get_fallback_response(f"All {MAX_LLM_RETRIES} attempts failed: {last_error}")
     
+    def get_llm_calls_log(self) -> list:
+        """Return all per-call telemetry records accumulated during this session."""
+        return list(self.llm_calls_log)
+
     def is_healthy(self) -> bool:
         """Check if Ollama is responding."""
         try:

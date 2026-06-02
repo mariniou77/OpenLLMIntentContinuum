@@ -47,7 +47,8 @@ class IntentWatchLoop:
             config: Configuration dictionary containing thresholds and settings
         """
         self.config = config
-        
+        self.monitor_only = config.get("monitor_only", False)
+
         # Intent thresholds
         intent_config = config["intent"]
         self.upper_threshold = intent_config["upper_threshold"]
@@ -55,41 +56,56 @@ class IntentWatchLoop:
         self.ema_alpha = intent_config["ema_alpha"]
         self.check_interval = intent_config["check_interval"]
         self.wait_after_action = intent_config["wait_after_action"]
-        
+
         # Application endpoint
         self.app_endpoint = config["application"]["entry_point"]
         self.test_image_path = config["application"].get("test_image")
-        
-        # Initialize components
+
+        # Data collector always initialized (needed for K8s client references)
         self.data_collector = DataCollector(config)
-        self.decision_maker = DecisionMaker(config)
-        self.candidate_generator = CandidateActionGenerator(config)
-        self.action_executor = ActionExecutor(
-            config, 
-            self.data_collector.k8s_client,
-            self.data_collector.onos_client
-        )
-        
+
+        # LLM and action components — skipped in monitor-only mode
+        if not self.monitor_only:
+            self.decision_maker = DecisionMaker(config)
+            self.candidate_generator = CandidateActionGenerator(config)
+            self.action_executor = ActionExecutor(
+                config,
+                self.data_collector.k8s_client,
+                self.data_collector.onos_client
+            )
+            self.candidate_filter = CandidateFilter(config)
+        else:
+            self.decision_maker = None
+            self.candidate_generator = None
+            self.action_executor = None
+            self.candidate_filter = None
+
         # Decision history
         max_history = config.get("history", {}).get("max_entries", 5)
         self.decision_history = DecisionHistory(max_entries=max_history)
 
-        # Hybrid filter: enforces Rule 3 in Python before LLM sees candidates
-        self.candidate_filter = CandidateFilter(config)
-        
         # EMA state
         self.ema_rt: Optional[float] = None
-        self.last_rt: Optional[float] = None  # Store last measured RT
-        
+        self.last_rt: Optional[float] = None
+
         # Loop control
         self.running = False
         self.paused = False
-        
+
+        # Tracks whether the previous violation is pending resolution
+        self._pending_violation = False
+
+        # Per-measurement EMA time-series (used for Figure 7 plots)
+        self.ema_timeline: list = []
+
         # Statistics
         self.stats = {
             "total_requests": 0,
             "violations_detected": 0,
+            "no_candidate_violations": 0,
             "actions_taken": 0,
+            "actions_succeeded": 0,
+            "violations_resolved": 0,
             "start_time": None,
             "end_time": None
         }
@@ -197,10 +213,17 @@ class IntentWatchLoop:
         logger.warning(f"VIOLATION DETECTED: {violation_type}")
         logger.warning(f"Current RT: {current_rt:.3f}s | EMA: {self.ema_rt:.3f}s")
         logger.warning(f"Thresholds: [{self.lower_threshold}s, {self.upper_threshold}s]")
-        logger.warning(f"History: {self.decision_history.get_history_count()} previous decisions")
         logger.warning("=" * 60)
-        
+
         self.stats["violations_detected"] += 1
+        self._pending_violation = True
+
+        # Monitor-only mode: record violation but skip all LLM and action logic
+        if self.monitor_only:
+            logger.info("[MONITOR-ONLY] Violation logged — no LLM query or action taken")
+            return
+
+        logger.warning(f"History: {self.decision_history.get_history_count()} previous decisions")
         
         # Step 1: Collect raw system data
         logger.info("Collecting system data...")
@@ -249,6 +272,13 @@ class IntentWatchLoop:
         filtered_candidates = self.candidate_filter.filter(
             candidate_actions, history_entries
         )
+
+        # No candidates at all (e.g. single-action ablation with trigger condition unmet)
+        if not filtered_candidates:
+            self.stats["no_candidate_violations"] += 1
+            logger.info("No valid candidates after filter — recording as 0 actions taken for this violation")
+            return
+
         if len(filtered_candidates) != len(candidate_actions):
             logger.info("Filtered candidate list (shown to LLM):")
             for c in filtered_candidates:
@@ -294,6 +324,7 @@ class IntentWatchLoop:
             if result["success"]:
                 logger.info(f"Action successful: {result['message']}")
                 self.stats["actions_taken"] += 1
+                self.stats["actions_succeeded"] += 1
                 action_executed = True
 
                 # Clear CLOSE_WAIT state on ms3 after any action that restarted another
@@ -424,30 +455,43 @@ class IntentWatchLoop:
         result["response_time"] = rt
         self.last_rt = rt
         self.stats["total_requests"] += 1
-        
+
         # Update EMA
         self._update_ema(rt)
         result["ema_rt"] = self.ema_rt
-        
+
+        # Record EMA timeline point (used for Figure 7 EMA response-time plots)
+        timeline_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "rt": round(rt, 3),
+            "ema": round(self.ema_rt, 3),
+            "violation": None
+        }
+
         # Add to data collector history
         self.data_collector.add_response_time(rt)
-        
+
         # Log current state
         logger.info(f"RT: {rt:.3f}s | EMA: {self.ema_rt:.3f}s | Thresholds: [{self.lower_threshold}, {self.upper_threshold}]")
-        
+
         # Check for violations
         violation = self._check_violation()
-        
+
         if violation:
+            timeline_entry["violation"] = violation
             result["violation"] = violation
             self._handle_violation(violation, rt)
             result["action_taken"] = True
         else:
-            # No violation - finalize outcome of previous decision if any
-            # This records that the previous action resolved the issue
+            # No violation — if a previous violation was pending resolution, count it
+            had_pending = self._pending_violation
             self.decision_history.finalize_pending_outcome(rt, self.ema_rt, is_violation=False)
-            # Also update structured history outcome to resolved
             self.decision_history.update_last_structured_outcome("violation_resolved")
+            if had_pending:
+                self.stats["violations_resolved"] += 1
+                self._pending_violation = False
+
+        self.ema_timeline.append(timeline_entry)
         
         return result
     
@@ -490,10 +534,15 @@ class IntentWatchLoop:
         self.decision_history.reset()
         self.ema_rt = None
         self.last_rt = None
+        self._pending_violation = False
+        self.ema_timeline = []
         self.stats = {
             "total_requests": 0,
             "violations_detected": 0,
+            "no_candidate_violations": 0,
             "actions_taken": 0,
+            "actions_succeeded": 0,
+            "violations_resolved": 0,
             "start_time": datetime.now().isoformat(),
             "end_time": None
         }
@@ -535,6 +584,7 @@ class IntentWatchLoop:
         return {
             "stats": self.stats.copy(),
             "history": self.decision_history.get_history(),
+            "ema_timeline": self.ema_timeline,
             "duration_minutes": duration_minutes,
             "iterations": iteration
         }
@@ -607,7 +657,10 @@ class IntentWatchLoop:
         logger.info("EXPERIMENT STATISTICS")
         logger.info(f"  Total requests: {self.stats['total_requests']}")
         logger.info(f"  Violations detected: {self.stats['violations_detected']}")
+        logger.info(f"  No-candidate violations: {self.stats.get('no_candidate_violations', 0)}")
         logger.info(f"  Actions taken: {self.stats['actions_taken']}")
+        logger.info(f"  Actions succeeded: {self.stats.get('actions_succeeded', 0)}")
+        logger.info(f"  Violations resolved: {self.stats.get('violations_resolved', 0)}")
         logger.info(f"  Start time: {self.stats['start_time']}")
         logger.info(f"  End time: {self.stats['end_time']}")
         

@@ -150,7 +150,12 @@ def main():
         action="store_true",
         help="Log full LLM prompts and responses for debugging"
     )
-    
+    parser.add_argument(
+        "--monitor-only",
+        action="store_true",
+        help="Measure EMA and log violations without querying LLM or executing actions (baseline mode)"
+    )
+
     args = parser.parse_args()
     
     # Setup logging
@@ -176,10 +181,13 @@ def main():
     if not args.quiet:
         print_config_summary(config)
     
-    # Add debug_llm flag to config
+    # Add runtime flags to config
     config["debug_llm"] = args.debug_llm
+    config["monitor_only"] = args.monitor_only
     if args.debug_llm:
         logger.info("LLM debugging enabled - will log full prompts and responses")
+    if args.monitor_only:
+        logger.info("Monitor-only mode enabled - EMA tracking active, LLM/actions disabled")
     
     # Initialize the Intent Watch Loop
     watch_loop = IntentWatchLoop(config)
@@ -203,7 +211,9 @@ def main():
         if not status:
             all_healthy = False
     
-    if not watch_loop.decision_maker.is_healthy():
+    if args.monitor_only:
+        logger.info("  ⏭️  Ollama (LLM): skipped (monitor-only mode)")
+    elif not watch_loop.decision_maker.is_healthy():
         logger.warning("  ❌ Ollama (LLM): not responding")
         all_healthy = False
     else:

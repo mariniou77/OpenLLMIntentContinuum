@@ -50,8 +50,10 @@ class DecisionHistory:
         # Pending outcome tracking - stores data needed to evaluate last decision
         self.pending_outcome: Optional[dict] = None
         
-        # Structured history for 8-message LLM format
+        # Structured history for 8-message LLM format (rolling window for prompt)
         self._structured_history = deque(maxlen=max_entries)
+        # Full unbounded history for experiment export (never truncated)
+        self._all_structured_history: list = []
         
         logger.info(f"DecisionHistory initialized with max_entries={max_entries}")
     
@@ -381,8 +383,17 @@ class DecisionHistory:
         """
         if not hasattr(self, '_structured_history'):
             self._structured_history = deque(maxlen=self.max_entries)
+        if not hasattr(self, '_all_structured_history'):
+            self._all_structured_history = []
         self._structured_history.append(entry)
+        self._all_structured_history.append(entry)
         logger.info(f"Added structured history entry (total: {len(self._structured_history)})")
+
+    def get_all_structured_history(self) -> list:
+        """Return the complete unbounded structured history for experiment export."""
+        if not hasattr(self, '_all_structured_history'):
+            return []
+        return list(self._all_structured_history)
 
     def update_last_structured_outcome(self, result: str):
         """
@@ -402,6 +413,8 @@ class DecisionHistory:
         self.history.clear()
         if hasattr(self, '_structured_history'):
             self._structured_history.clear()
+        if hasattr(self, '_all_structured_history'):
+            self._all_structured_history.clear()
         self.session_start = datetime.now()
         self.violation_counter = 0
         self.pending_outcome = None
