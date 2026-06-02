@@ -302,7 +302,7 @@ def start_locust_locally(config_path, initial_users, spawn_rate, total_duration,
     ]
 
     log_file = open(os.path.join(results_dir, "locust.log"), "w")
-    proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT, env=env)
 
     # Wait for Locust web API to become available
     locust_api = f"http://localhost:{LOCUST_WEB_PORT}/stats/requests"
