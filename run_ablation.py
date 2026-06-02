@@ -399,21 +399,29 @@ def _export_telemetry(
         with open(intent_log_path) as f:
             intent_data = json.load(f)
 
-        # Build a lightweight proxy that ExperimentTelemetry can read from
+        # Build lightweight proxies that ExperimentTelemetry can read from
         class _StatsProxy:
             def __init__(self, data):
                 self.stats = data.get("stats", {})
-                self._history_data = data.get("history", [])
+                self._structured = data.get("all_structured_history", [])
 
             def get_all_structured_history(self):
-                return self._history_data
+                return self._structured
 
         class _WatchLoopProxy:
             def __init__(self, data):
                 self.stats = data.get("stats", {})
                 self.decision_history = _StatsProxy(data)
 
+        class _DecisionMakerProxy:
+            def __init__(self, data):
+                self._calls = data.get("llm_calls_log", [])
+
+            def get_llm_calls_log(self):
+                return self._calls
+
         tel.attach_watch_loop(_WatchLoopProxy(intent_data))
+        tel.attach_decision_maker(_DecisionMakerProxy(intent_data))
 
     # Note: LLM calls log is embedded inside intent_loop_log.json via the
     # watch loop return dict in run_time_window().  For post-hoc export we

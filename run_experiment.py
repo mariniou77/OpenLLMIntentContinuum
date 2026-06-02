@@ -355,7 +355,7 @@ def stop_locust_locally(proc):
 
 def start_intent_loop(config_path, duration_minutes, results_dir, debug_llm=False):
     """Start main.py in background on the SDN controller."""
-    output_file = os.path.join(results_dir, "intent_results.json")
+    output_file = os.path.join(results_dir, "intent_loop_log.json")
 
     cmd = [
         "python3", "main.py",
@@ -410,7 +410,7 @@ def collect_summary(results_dir, load_pattern, interval):
     print("=" * 60)
 
     # Intent results
-    intent_file = os.path.join(results_dir, "intent_results.json")
+    intent_file = os.path.join(results_dir, "intent_loop_log.json")
     if os.path.exists(intent_file):
         with open(intent_file) as f:
             intent_data = json.load(f)

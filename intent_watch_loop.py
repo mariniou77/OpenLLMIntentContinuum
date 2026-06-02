@@ -584,6 +584,8 @@ class IntentWatchLoop:
         return {
             "stats": self.stats.copy(),
             "history": self.decision_history.get_history(),
+            "all_structured_history": self.decision_history.get_all_structured_history(),
+            "llm_calls_log": self.decision_maker.get_llm_calls_log() if self.decision_maker else [],
             "ema_timeline": self.ema_timeline,
             "duration_minutes": duration_minutes,
             "iterations": iteration
