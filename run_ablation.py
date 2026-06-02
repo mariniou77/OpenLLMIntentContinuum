@@ -132,7 +132,7 @@ RESULTS_ROOT = "evaluation_results"
 # llm-server SSH details for resource_monitor.sh
 LLM_SERVER_IP = "129.114.26.41"
 LLM_SERVER_USER = "cc"
-RESOURCE_MONITOR_REMOTE_PATH = "/home/cc/OpenLLMIntentContinuum/finetuning-prompt-testing/resource_monitor.sh"
+RESOURCE_MONITOR_REMOTE_PATH = "/home/cc/resource_monitor.sh"
 
 
 # ── SSH helper ───────────────────────────────────────────────────────────────
@@ -190,7 +190,7 @@ def stop_k8s_monitor(proc: subprocess.Popen) -> None:
 
 # ── LLM-server resource monitor ─────────────────────────────────────────────
 
-def start_llm_resource_monitor(output_dir: str) -> None:
+def start_llm_resource_monitor(output_dir: str) -> Optional[str]:
     """Start resource_monitor.sh on llm-server via SSH (background process)."""
     remote_csv = f"/tmp/llm_server_resources_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
     cmd = f"bash {RESOURCE_MONITOR_REMOTE_PATH} start {remote_csv}"
