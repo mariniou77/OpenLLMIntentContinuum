@@ -56,6 +56,7 @@ class IntentWatchLoop:
         self.ema_alpha = intent_config["ema_alpha"]
         self.check_interval = intent_config["check_interval"]
         self.wait_after_action = intent_config["wait_after_action"]
+        self.startup_grace_period = intent_config.get("startup_grace_period_seconds", 0)
 
         # Application endpoint
         self.app_endpoint = config["application"]["entry_point"]
@@ -94,6 +95,12 @@ class IntentWatchLoop:
 
         # Tracks whether the previous violation is pending resolution
         self._pending_violation = False
+
+        # Grace period flag — set True during startup_grace_period; suppresses violation handling
+        self._grace_period_active: bool = False
+
+        # Optional output file path for per-cycle checkpoint flushes
+        self._output_file: Optional[str] = None
 
         # Per-measurement EMA time-series (used for Figure 7 plots)
         self.ema_timeline: list = []
@@ -390,8 +397,26 @@ class IntentWatchLoop:
                 else:
                     logger.warning("ms3 warm-up request failed — SSD model may still be cold")
 
-                logger.info(f"Waiting {self.wait_after_action}s for system to stabilize...")
-                time.sleep(self.wait_after_action)
+                # For add_replica: wait for new pod Ready then use shorter graduated cooldown.
+                # This prevents klipper-LB from routing traffic to a cold pod before it
+                # has loaded its model (root cause of exp_03 4% failure rate).
+                action_name = recommendation.get("action", "")
+                if action_name == "add_replica":
+                    target_dep = recommendation.get("parameters", {}).get("deployment_name", "")
+                    logger.info(f"Waiting for {target_dep} to reach Ready state after add_replica...")
+                    self._wait_for_deployment_ready(target_dep, timeout=90)
+                    if "microservice3" in target_dep:
+                        logger.info("Sending ms3 warm-up for new replica pod...")
+                        wrt = self._measure_response_time()
+                        if wrt is not None:
+                            logger.info(f"New ms3 replica warm (RT={wrt:.3f}s, not counted)")
+                    effective_cooldown = 15  # pod is warm; short cooldown for horizontal scaling
+                    logger.info(f"Using graduated cooldown: {effective_cooldown}s (add_replica — pod warm)")
+                else:
+                    effective_cooldown = self.wait_after_action
+
+                logger.info(f"Waiting {effective_cooldown}s for system to stabilize...")
+                self._smart_cooldown(effective_cooldown)
             else:
                 logger.error(f"Action failed: {result['message']}")
         else:
@@ -480,8 +505,13 @@ class IntentWatchLoop:
         if violation:
             timeline_entry["violation"] = violation
             result["violation"] = violation
-            self._handle_violation(violation, rt)
-            result["action_taken"] = True
+            if self._grace_period_active:
+                # Suppress action during startup grace period; EMA still updates
+                timeline_entry["grace_period"] = True
+                logger.info(f"[GRACE PERIOD] Violation {violation} suppressed (EMA={self.ema_rt:.3f}s) — warming up")
+            else:
+                self._handle_violation(violation, rt)
+                result["action_taken"] = True
         else:
             # No violation — if a previous violation was pending resolution, count it
             had_pending = self._pending_violation
@@ -495,10 +525,15 @@ class IntentWatchLoop:
         
         return result
     
+    def set_output_file(self, path: str) -> None:
+        """Set the output file path for per-cycle checkpoint persistence."""
+        self._output_file = path
+
     def run_time_window(
         self,
         duration_minutes: int,
-        callback: Optional[Callable] = None
+        callback: Optional[Callable] = None,
+        output_file: Optional[str] = None
     ) -> dict:
         """
         Run the monitoring loop for a fixed time window.
@@ -512,6 +547,9 @@ class IntentWatchLoop:
         Returns:
             Dictionary with experiment results and statistics
         """
+        if output_file:
+            self._output_file = output_file
+
         logger.info("=" * 60)
         logger.info(f"STARTING TIME WINDOW EXPERIMENT")
         logger.info(f"Duration: {duration_minutes} minutes")
@@ -520,6 +558,8 @@ class IntentWatchLoop:
         logger.info(f"Check interval: {self.check_interval}s")
         logger.info(f"EMA alpha: {self.ema_alpha}")
         logger.info(f"Max history entries: {self.decision_history.max_entries}")
+        if self.startup_grace_period > 0:
+            logger.info(f"Startup grace period: {self.startup_grace_period}s (violations suppressed)")
         logger.info("=" * 60)
         
         # Warm-up request to avoid cold start affecting EMA
@@ -549,25 +589,35 @@ class IntentWatchLoop:
         
         # Calculate end time
         end_time = datetime.now() + timedelta(minutes=duration_minutes)
-        
+        loop_start = datetime.now()
+
         self.running = True
         iteration = 0
-        
+
         try:
             while self.running and datetime.now() < end_time:
                 if not self.paused:
+                    # Activate/deactivate grace period flag based on elapsed time
+                    elapsed = (datetime.now() - loop_start).total_seconds()
+                    self._grace_period_active = (self.startup_grace_period > 0
+                                                 and elapsed < self.startup_grace_period)
+
                     result = self.run_once()
-                    
+
                     if callback:
                         callback(result)
-                    
+
                     iteration += 1
-                    
+
                     # Log progress every 10 iterations
                     if iteration % 10 == 0:
                         remaining = (end_time - datetime.now()).total_seconds() / 60
                         logger.info(f"Progress: {iteration} iterations, {remaining:.1f} minutes remaining")
-                
+
+                    # Periodic checkpoint flush (every 5 iterations) for crash resilience
+                    if self._output_file and iteration % 5 == 0:
+                        self._flush_checkpoint()
+
                 # Wait before next check
                 time.sleep(self.check_interval)
                 
@@ -579,7 +629,17 @@ class IntentWatchLoop:
         
         # Print final statistics
         self._print_stats()
-        
+
+        # Remove checkpoint file on clean exit (full JSON saved by caller)
+        if self._output_file:
+            checkpoint_path = self._output_file + ".checkpoint.json"
+            try:
+                import os as _os
+                if _os.path.exists(checkpoint_path):
+                    _os.remove(checkpoint_path)
+            except Exception:
+                pass
+
         # Return experiment results
         return {
             "stats": self.stats.copy(),
@@ -591,6 +651,88 @@ class IntentWatchLoop:
             "iterations": iteration
         }
     
+    # ── New helper methods ────────────────────────────────────────────────────
+
+    def _smart_cooldown(self, max_seconds: int) -> None:
+        """
+        Cooldown that takes a passive RT measurement every 10s and exits early
+        if EMA re-enters the SLO band [lower_threshold, upper_threshold].
+        EMA measurements during cooldown are added to ema_timeline with cooldown=True.
+        """
+        cooldown_start = time.time()
+        check_interval = 10  # seconds between passive measurements
+
+        while True:
+            elapsed = time.time() - cooldown_start
+            if elapsed >= max_seconds:
+                break
+            time.sleep(min(check_interval, max_seconds - elapsed))
+
+            rt = self._measure_response_time()
+            if rt is not None:
+                self._update_ema(rt)
+                self.ema_timeline.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "rt": round(rt, 3),
+                    "ema": round(self.ema_rt, 3),
+                    "violation": None,
+                    "cooldown": True
+                })
+                if self.lower_threshold <= self.ema_rt <= self.upper_threshold:
+                    logger.info(
+                        f"[SMART COOLDOWN] EMA {self.ema_rt:.3f}s back in band after "
+                        f"{time.time() - cooldown_start:.0f}s — resuming monitoring early"
+                    )
+                    break
+            # If RT measurement failed, continue waiting
+
+    def _wait_for_deployment_ready(self, deployment_name: str, timeout: int = 90) -> None:
+        """
+        Poll until deployment readyReplicas == spec.replicas or timeout.
+        Used after add_replica to ensure the new pod is Ready before the cooldown ends.
+        """
+        if not deployment_name:
+            return
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ready_str = self.data_collector.k8s_client._run_kubectl(
+                f'get deployment {deployment_name} -o jsonpath="{{.status.readyReplicas}}"'
+            ).strip().strip('"') or "0"
+            desired_str = self.data_collector.k8s_client._run_kubectl(
+                f'get deployment {deployment_name} -o jsonpath="{{.spec.replicas}}"'
+            ).strip().strip('"') or "1"
+            try:
+                ready = int(ready_str)
+                desired = int(desired_str)
+            except (ValueError, TypeError):
+                ready, desired = 0, 1
+
+            if ready >= desired:
+                logger.info(f"{deployment_name} ready: {ready}/{desired}")
+                return
+            logger.info(f"Waiting for {deployment_name}: {ready}/{desired} ready...")
+            time.sleep(5)
+        logger.warning(f"{deployment_name} did not reach ready state within {timeout}s — proceeding")
+
+    def _flush_checkpoint(self) -> None:
+        """Write current stats + history + EMA timeline to a checkpoint file."""
+        if not self._output_file:
+            return
+        checkpoint_path = self._output_file + ".checkpoint.json"
+        data = {
+            "stats": self.stats.copy(),
+            "all_structured_history": self.decision_history.get_all_structured_history(),
+            "llm_calls_log": self.decision_maker.get_llm_calls_log() if self.decision_maker else [],
+            "ema_timeline": self.ema_timeline,
+            "_checkpoint": True,
+        }
+        try:
+            import json as _json
+            with open(checkpoint_path, "w") as f:
+                _json.dump(data, f)
+        except Exception as e:
+            logger.debug(f"Checkpoint flush failed: {e}")
+
     def run(self, max_iterations: Optional[int] = None, callback: Optional[Callable] = None):
         """
         Run the continuous monitoring loop (legacy method).

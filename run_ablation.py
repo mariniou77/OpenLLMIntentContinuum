@@ -18,6 +18,7 @@ import copy
 import json
 import os
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -124,6 +125,43 @@ EXPERIMENT_MATRIX = {
         },
     },
     # exp_09_cloud_llm_baseline: deferred — provider TBD
+
+    # ── Stress experiments — peak 80 users (≈2.7× normal) to push node CPU above 80%
+    # and saturate SDN links, activating service_placement and flow_scheduling triggers.
+    # These directly demonstrate the two action types that produce 0 candidates at normal load.
+    "exp_10_stress_service_placement_only": {
+        "label": "Stress Load: Service Placement Only",
+        "monitor_only": False,
+        "load_pattern": [20, 40, 60, 80, 60, 40, 20],
+        "actions": {
+            "horizontal_scaling": False,
+            "vertical_scaling": False,
+            "service_placement": True,
+            "flow_scheduling": False,
+        },
+    },
+    "exp_11_stress_flow_scheduling_only": {
+        "label": "Stress Load: Flow Scheduling Only",
+        "monitor_only": False,
+        "load_pattern": [20, 40, 60, 80, 60, 40, 20],
+        "actions": {
+            "horizontal_scaling": False,
+            "vertical_scaling": False,
+            "service_placement": False,
+            "flow_scheduling": True,
+        },
+    },
+    "exp_12_stress_full_system": {
+        "label": "Stress Load: Full System (All Actions)",
+        "monitor_only": False,
+        "load_pattern": [20, 40, 60, 80, 60, 40, 20],
+        "actions": {
+            "horizontal_scaling": True,
+            "vertical_scaling": True,
+            "service_placement": True,
+            "flow_scheduling": True,
+        },
+    },
 }
 
 BASE_CONFIG = "config.yaml"
@@ -144,6 +182,53 @@ def _ssh(host: str, user: str, cmd: str, timeout: int = 30) -> subprocess.Comple
          f"{user}@{host}", cmd],
         capture_output=True, text=True, timeout=timeout
     )
+
+
+# ── Cluster stabilisation wait ───────────────────────────────────────────────
+
+def _parse_cpu_millicores(value: str) -> int:
+    """Convert kubectl CPU strings like '372m', '1', '2500m' to millicores int."""
+    value = value.strip()
+    if value.endswith("m"):
+        return int(value[:-1])
+    try:
+        return int(float(value) * 1000)
+    except ValueError:
+        return 0
+
+
+def _get_cluster_total_cpu_m(master_ip: str, ssh_user: str) -> Optional[int]:
+    """SSH to master, run kubectl top nodes, return total CPU millicores across all nodes."""
+    result = _ssh(master_ip, ssh_user, "kubectl top nodes --no-headers 2>/dev/null", timeout=15)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    total = 0
+    for line in result.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            total += _parse_cpu_millicores(parts[1])
+    return total
+
+
+def wait_for_cluster_stable(
+    master_ip: str, ssh_user: str,
+    max_wait_s: int = 180, threshold_m: int = 500
+) -> None:
+    """
+    Block until total cluster CPU drops below threshold_m millicores (or timeout).
+    Called after reset_cluster() to ensure experiments start from a clean baseline.
+    """
+    print(f"  ⏳ Waiting for cluster CPU to stabilise (threshold: {threshold_m}m, max: {max_wait_s}s)...")
+    deadline = time.time() + max_wait_s
+    while time.time() < deadline:
+        total = _get_cluster_total_cpu_m(master_ip, ssh_user)
+        if total is not None and total < threshold_m:
+            print(f"  ✅ Cluster stable: {total}m total CPU")
+            return
+        used_str = f"{total}m" if total is not None else "unknown"
+        print(f"     CPU still at {used_str} — waiting 15s...")
+        time.sleep(15)
+    print(f"  ⚠️  Cluster did not stabilise within {max_wait_s}s — proceeding anyway")
 
 
 # ── K8s resource monitor (background SSH loop on sdn-controller) ─────────────
@@ -276,7 +361,8 @@ def run_experiment(
     output_dir = os.path.join(RESULTS_ROOT, name)
     os.makedirs(output_dir, exist_ok=True)
 
-    load_pattern = DEFAULT_LOAD_PATTERN
+    # Per-experiment load pattern override (e.g. stress experiments use higher user counts)
+    load_pattern = exp_def.get("load_pattern", DEFAULT_LOAD_PATTERN)
     interval = DEFAULT_INTERVAL
     spawn_rate = DEFAULT_SPAWN_RATE
     total_duration = len(load_pattern) * interval + 60  # extra 60s buffer
@@ -299,10 +385,16 @@ def run_experiment(
     print(f"  📝 Config written: {config_path}")
     _print_action_flags(exp_def["actions"])
 
-    # 2. Reset cluster to default state
+    # 2. Reset cluster to default state + wait for CPU to quiesce
     if not skip_reset:
         print("\n  🔄 Resetting cluster...")
         reset_cluster(BASE_CONFIG)
+        with open(BASE_CONFIG) as f:
+            _base_cfg_tmp = yaml.safe_load(f)
+        wait_for_cluster_stable(
+            master_ip=_base_cfg_tmp["endpoints"]["kubernetes_master"],
+            ssh_user=_base_cfg_tmp["endpoints"].get("kubernetes_user", "cc"),
+        )
     else:
         print("  ⏭️  Cluster reset skipped")
 
@@ -395,8 +487,14 @@ def _export_telemetry(
 
     # Load intent loop output and reconstruct stats/history for telemetry export
     intent_log_path = os.path.join(output_dir, "intent_loop_log.json")
-    if os.path.exists(intent_log_path):
-        with open(intent_log_path) as f:
+    checkpoint_path = intent_log_path + ".checkpoint.json"
+    _load_path = intent_log_path if os.path.exists(intent_log_path) else (
+        checkpoint_path if os.path.exists(checkpoint_path) else None
+    )
+    if _load_path:
+        if _load_path == checkpoint_path:
+            print(f"  ⚠️  Using checkpoint file (main JSON missing): {checkpoint_path}")
+        with open(_load_path) as f:
             intent_data = json.load(f)
 
         # Build lightweight proxies that ExperimentTelemetry can read from
@@ -423,6 +521,20 @@ def _export_telemetry(
         tel.attach_watch_loop(_WatchLoopProxy(intent_data))
         tel.attach_decision_maker(_DecisionMakerProxy(intent_data))
 
+        # Feed EMA timeline + SLO thresholds for time-in-band metric
+        ema_timeline = intent_data.get("ema_timeline", [])
+        exp_cfg_path = os.path.join(output_dir, "experiment_config.yaml")
+        lower_threshold, upper_threshold = 1.0, 2.0
+        if os.path.exists(exp_cfg_path):
+            try:
+                with open(exp_cfg_path) as cf:
+                    exp_cfg = yaml.safe_load(cf)
+                lower_threshold = exp_cfg.get("intent", {}).get("lower_threshold", 1.0)
+                upper_threshold = exp_cfg.get("intent", {}).get("upper_threshold", 2.0)
+            except Exception:
+                pass
+        tel.set_ema_data(ema_timeline, lower_threshold, upper_threshold)
+
     # Note: LLM calls log is embedded inside intent_loop_log.json via the
     # watch loop return dict in run_time_window().  For post-hoc export we
     # rely on the actions_log built from all_structured_history.
@@ -430,6 +542,83 @@ def _export_telemetry(
     # in-process (when run_ablation drives main.py in-process in future).
     # For now, write what we have.
     tel.export_all()
+
+
+def aggregate_runs(run_dirs: list, agg_dir: str, name: str, label: str) -> None:
+    """
+    Read summary.json from each run directory and write summary_aggregated.json
+    with mean ± std for every numeric field.
+    """
+    os.makedirs(agg_dir, exist_ok=True)
+
+    summaries = []
+    for d in run_dirs:
+        p = os.path.join(d, "summary.json")
+        if os.path.exists(p):
+            with open(p) as f:
+                summaries.append(json.load(f))
+        else:
+            print(f"  ⚠️  Missing summary.json in {d} — skipping this run")
+
+    if not summaries:
+        print(f"  ❌ No summary files found — aggregation skipped")
+        return
+
+    numeric_fields = [
+        "duration_seconds",
+        "total_locust_requests", "total_locust_failures",
+        "violations_detected", "no_candidate_violations",
+        "actions_executed", "actions_succeeded", "violations_resolved",
+        "intent_satisfaction_rate", "time_normalised_isr",
+        "ema_time_in_band_pct", "locust_p95_rt_ms",
+        "mean_inference_latency_ms", "p95_inference_latency_ms",
+        "mean_prompt_tokens", "mean_completion_tokens",
+        "total_prompt_tokens", "total_completion_tokens",
+    ]
+
+    agg = {
+        "experiment_name": name,
+        "experiment_label": label,
+        "n_runs": len(summaries),
+        "run_dirs": run_dirs,
+        "aggregated_at": datetime.utcnow().isoformat(),
+    }
+
+    for field in numeric_fields:
+        values = [s[field] for s in summaries if s.get(field) is not None]
+        if not values:
+            agg[f"{field}_mean"] = None
+            agg[f"{field}_std"] = None
+        elif len(values) == 1:
+            agg[f"{field}_mean"] = round(values[0], 4) if isinstance(values[0], float) else values[0]
+            agg[f"{field}_std"] = None
+        else:
+            agg[f"{field}_mean"] = round(statistics.mean(values), 4)
+            agg[f"{field}_std"] = round(statistics.stdev(values), 4)
+
+    # Average action_type_breakdown across runs
+    action_counts: dict = {}
+    for s in summaries:
+        for action, count in s.get("action_type_breakdown", {}).items():
+            action_counts[action] = action_counts.get(action, 0) + count
+    if action_counts:
+        agg["action_type_breakdown_mean"] = {
+            k: round(v / len(summaries), 1) for k, v in action_counts.items()
+        }
+
+    out_path = os.path.join(agg_dir, "summary_aggregated.json")
+    with open(out_path, "w") as f:
+        json.dump(agg, f, indent=2)
+
+    isr_m = agg.get("intent_satisfaction_rate_mean")
+    isr_s = agg.get("intent_satisfaction_rate_std")
+    p95_m = agg.get("locust_p95_rt_ms_mean")
+    p95_s = agg.get("locust_p95_rt_ms_std")
+    print(f"\n  📊 Aggregated {len(summaries)} run(s) → {out_path}")
+    print(f"     ISR:    {isr_m:.4f} ± {isr_s:.4f}" if isr_s is not None else
+          f"     ISR:    {isr_m}")
+    print(f"     P95 RT: {p95_m} ± {p95_s} ms" if p95_s is not None else
+          f"     P95 RT: {p95_m} ms")
 
 
 def _print_action_flags(actions: dict) -> None:
@@ -454,6 +643,8 @@ def parse_args():
                         help="Skip cluster reset before each experiment")
     parser.add_argument("--debug-llm", action="store_true",
                         help="Enable LLM debug logging in intent loop")
+    parser.add_argument("--repeat", type=int, default=1, metavar="N",
+                        help="Run each experiment N times and aggregate mean ± std (default: 1)")
     return parser.parse_args()
 
 
@@ -485,14 +676,40 @@ def main():
     os.makedirs(RESULTS_ROOT, exist_ok=True)
 
     for name, exp_def in experiments:
-        run_experiment(
-            name=name,
-            exp_def=exp_def,
-            dry_run=args.dry_run,
-            skip_reset=args.skip_reset,
-            debug_llm=args.debug_llm,
-        )
-        if args.all and not args.dry_run and len(experiments) > 1:
+        if args.repeat > 1:
+            # Multi-run mode: each run goes into exp_XX_run1/, _run2/, etc.
+            run_dirs = []
+            for run_idx in range(1, args.repeat + 1):
+                run_name = f"{name}_run{run_idx}"
+                print(f"\n{'='*70}")
+                print(f"  REPEAT {run_idx}/{args.repeat} for {name}")
+                print(f"{'='*70}")
+                run_experiment(
+                    name=run_name,
+                    exp_def=exp_def,
+                    dry_run=args.dry_run,
+                    skip_reset=args.skip_reset,
+                    debug_llm=args.debug_llm,
+                )
+                run_dirs.append(os.path.join(RESULTS_ROOT, run_name))
+                if run_idx < args.repeat and not args.dry_run:
+                    print("\n  ⏳ Cooling down 60s before next repeat...")
+                    time.sleep(60)
+
+            # Aggregate all runs into exp_XX_agg/
+            if not args.dry_run:
+                agg_dir = os.path.join(RESULTS_ROOT, f"{name}_agg")
+                aggregate_runs(run_dirs, agg_dir, name, exp_def["label"])
+        else:
+            run_experiment(
+                name=name,
+                exp_def=exp_def,
+                dry_run=args.dry_run,
+                skip_reset=args.skip_reset,
+                debug_llm=args.debug_llm,
+            )
+
+        if not args.dry_run and len(experiments) > 1:
             print("\n  ⏳ Cooling down 60s before next experiment...")
             time.sleep(60)
 

@@ -7,6 +7,7 @@ intent:
   ema_alpha: 0.5          # smoothing factor for Exponential Moving Average
   check_interval: 5       # seconds between checks
   wait_after_action: 60   # seconds to wait after taking an action
+  startup_grace_period_seconds: 30  # skip violation handling for first N seconds (avoids cold-start artefact)
 
 # Endpoints
 endpoints:
@@ -33,6 +34,7 @@ application:
 llm:
   model: "qwen3.5:4b"
   temperature: 0
+  max_tokens: 512  # max completion tokens; 200 caused truncation in ablation study exp_02-08
 
 # Decision History
 history:

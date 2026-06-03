@@ -38,6 +38,11 @@ class ExperimentTelemetry:
         self._decision_maker = None
         self._locust_csv_prefix = None  # path prefix used with --csv flag
 
+        # EMA timeline + SLO thresholds for time-in-band metric (set via set_ema_data)
+        self._ema_timeline: list = []
+        self._lower_threshold: float = 1.0
+        self._upper_threshold: float = 2.0
+
     # ── Attach live objects ──────────────────────────────────────────────────
 
     def attach_watch_loop(self, watch_loop) -> None:
@@ -48,6 +53,12 @@ class ExperimentTelemetry:
 
     def set_locust_csv_prefix(self, prefix: str) -> None:
         self._locust_csv_prefix = prefix
+
+    def set_ema_data(self, ema_timeline: list, lower_threshold: float, upper_threshold: float) -> None:
+        """Supply EMA timeline and SLO thresholds for the time-in-band metric."""
+        self._ema_timeline = ema_timeline or []
+        self._lower_threshold = lower_threshold
+        self._upper_threshold = upper_threshold
 
     # ── Export ───────────────────────────────────────────────────────────────
 
@@ -127,6 +138,20 @@ class ExperimentTelemetry:
             if violations_detected > 0 else None
         )
 
+        # Time-normalised ISR: resolutions per minute (corrects for cooldown suppression)
+        duration_s = self._compute_duration(stats) or 0
+        duration_min = duration_s / 60 if duration_s > 0 else 0
+        time_normalised_isr = (
+            round(violations_resolved / duration_min, 4)
+            if violations_resolved > 0 and duration_min > 0 else None
+        )
+
+        # EMA time-in-band: % of monitoring cycles with SLO-compliant EMA
+        ema_time_in_band_pct = self._compute_ema_time_in_band()
+
+        # Locust P95 response time from stats CSV
+        locust_p95_rt_ms = self._read_locust_p95()
+
         # LLM latency stats
         latencies = [c["latency_ms"] for c in llm_calls if c.get("latency_ms")]
         prompt_tokens_list = [c["prompt_tokens"] for c in llm_calls if c.get("prompt_tokens")]
@@ -160,6 +185,9 @@ class ExperimentTelemetry:
             "actions_succeeded": actions_succeeded,
             "violations_resolved": violations_resolved,
             "intent_satisfaction_rate": isr,
+            "time_normalised_isr": time_normalised_isr,
+            "ema_time_in_band_pct": ema_time_in_band_pct,
+            "locust_p95_rt_ms": locust_p95_rt_ms,
             "action_type_breakdown": action_breakdown,
             "mean_inference_latency_ms": mean_latency,
             "p95_inference_latency_ms": p95_latency,
@@ -209,3 +237,34 @@ class ExperimentTelemetry:
             return total_req, total_fail
         except Exception:
             return None, None
+
+    def _read_locust_p95(self) -> Optional[int]:
+        """Read the Locust P95 response time (ms) for the /resize endpoint."""
+        if not self._locust_csv_prefix:
+            return None
+        stats_file = f"{self._locust_csv_prefix}_stats.csv"
+        if not os.path.exists(stats_file):
+            return None
+        try:
+            with open(stats_file, newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get("Name") in ("/resize", "Aggregated"):
+                        val = row.get("95%", "") or row.get("95th Percentile Response Time", "")
+                        if val and val.strip():
+                            return int(float(val))
+            return None
+        except Exception:
+            return None
+
+    def _compute_ema_time_in_band(self) -> Optional[float]:
+        """Fraction (%) of EMA timeline points within the SLO band [lower, upper]."""
+        timeline = self._ema_timeline
+        if not timeline:
+            return None
+        lo, hi = self._lower_threshold, self._upper_threshold
+        in_band = sum(
+            1 for e in timeline
+            if isinstance(e, dict) and lo <= e.get("ema", -1) <= hi
+        )
+        return round(in_band / len(timeline) * 100, 1)

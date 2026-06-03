@@ -229,7 +229,10 @@ def main():
         if args.time_window:
             # Time window experiment mode
             logger.info(f"Starting time window experiment ({args.time_window} minutes)...")
-            results = watch_loop.run_time_window(duration_minutes=args.time_window)
+            results = watch_loop.run_time_window(
+                duration_minutes=args.time_window,
+                output_file=args.output if args.output else None
+            )
         else:
             # Continuous or iteration-limited mode
             logger.info("Starting Intent Watch Loop...")

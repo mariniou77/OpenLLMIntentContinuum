@@ -84,6 +84,9 @@ class DecisionMaker:
 
         # Per-call telemetry log (prompt tokens, completion tokens, latency)
         self.llm_calls_log: list = []
+
+        # Max completion tokens — configurable via llm.max_tokens, default 512
+        self.max_tokens = int(config.get("llm", {}).get("max_tokens", 512))
     
     def _load_system_prompt(self) -> str:
         """Load the 6-action system prompt from file."""
@@ -568,7 +571,7 @@ JSON:"""
             "think": False,
             "options": {
                 "temperature": self.temperature,
-                "num_predict": 200
+                "num_predict": self.max_tokens
             }
         }
         
