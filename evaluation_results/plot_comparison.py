@@ -50,6 +50,7 @@ ABLATION_ORDER = [
     "exp_07_vertical_horizontal_flow",
     "exp_08_full_system",
     "exp_09_cloud_llm_baseline",
+    "exp_hpa_baseline",
 ]
 
 # Stress-load experiments (2.7× peak users)
@@ -72,6 +73,7 @@ SHORT_LABELS = {
     "exp_07_vertical_horizontal_flow":        "V+H+Flow",
     "exp_08_full_system":                     "Full System",
     "exp_09_cloud_llm_baseline":              "Cloud LLM",
+    "exp_hpa_baseline":                       "HPA (K8s)",
     "exp_10_stress_service_placement_only":   "S: Placement",
     "exp_11_stress_flow_scheduling_only":     "S: Flow Sched.",
     "exp_12_stress_full_system":              "S: Full System",
@@ -201,6 +203,8 @@ def fig_intent_satisfaction_rate(summaries: dict) -> None:
             colors.append("#c0c0c0")
         elif n == "exp_09_cloud_llm_baseline":
             colors.append("#E377C2")
+        elif n == "exp_hpa_baseline":
+            colors.append("#E88C1F")
         elif n in STRESS_SET:
             colors.append("#8C8C8C")
         else:
@@ -506,6 +510,7 @@ def fig_time_normalised_isr(summaries: dict) -> None:
     errs   = [_std(summaries[n], "time_normalised_isr") or 0 for n in names]
     colors = ["#c0c0c0" if n == "exp_01_baseline"
               else "#E377C2" if n == "exp_09_cloud_llm_baseline"
+              else "#E88C1F" if n == "exp_hpa_baseline"
               else "#8C8C8C" if n in STRESS_SET
               else "#4C72B0"
               for n in names]
@@ -545,6 +550,7 @@ def fig_ema_time_in_band(summaries: dict) -> None:
     errs   = [_std(summaries[n], "ema_time_in_band_pct") or 0 for n in names]
     colors = ["#c0c0c0" if n == "exp_01_baseline"
               else "#E377C2" if n == "exp_09_cloud_llm_baseline"
+              else "#E88C1F" if n == "exp_hpa_baseline"
               else "#8C8C8C" if n in STRESS_SET
               else "#4C72B0"
               for n in names]

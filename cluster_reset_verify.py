@@ -125,6 +125,20 @@ def verify_cluster(config_path: str = "config.yaml") -> bool:
         f"  ({nodes_str})"
     )
 
+    # --- no stray HPA objects ---
+    r = ssh_cmd(user, master,
+                "kubectl get hpa --all-namespaces --no-headers 2>/dev/null | wc -l")
+    try:
+        hpa_count = int(r.stdout.strip())
+    except ValueError:
+        hpa_count = 0
+    hpa_ok = (hpa_count == 0)
+    if not hpa_ok:
+        all_pass = False
+    hpa_status = "PASS" if hpa_ok else "FAIL"
+    hpa_mark = "✓" if hpa_ok else "✗  (fix: kubectl delete hpa --all)"
+    print(f"  [{hpa_status}] No stray HPA objects: {hpa_count} found {hpa_mark}")
+
     print()
     if all_pass:
         print("=== VERIFICATION PASSED — READY FOR NEXT RUN ===")
@@ -154,6 +168,17 @@ def main() -> None:
     if not args.verify_only:
         print("=== CLUSTER RESET ===")
         reset_cluster(args.config)
+
+        # Always purge any leftover HPA objects so a previously failed HPA run
+        # cannot contaminate the next experiment's scaling behaviour.
+        user, master = get_master_info(args.config)
+        result = ssh_cmd(user, master,
+                         "kubectl delete hpa --all -n default 2>/dev/null || true")
+        leftover = result.stdout.strip()
+        if leftover:
+            print(f"  HPA purged: {leftover}")
+        else:
+            print("  No leftover HPA objects (clean)")
 
         with open(args.config) as f:
             cfg = yaml.safe_load(f)
