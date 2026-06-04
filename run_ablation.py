@@ -124,7 +124,21 @@ EXPERIMENT_MATRIX = {
             "flow_scheduling": True,
         },
     },
-    # exp_09_cloud_llm_baseline: deferred — provider TBD
+    "exp_09_cloud_llm_baseline": {
+        "label": "Cloud LLM Baseline (GPT-4o)",
+        "monitor_only": False,
+        "actions": {
+            "horizontal_scaling": True,
+            "vertical_scaling": True,
+            "service_placement": True,
+            "flow_scheduling": True,
+        },
+        "llm_override": {
+            "provider": "openai",
+            "model": "gpt-4o",
+            "max_tokens": 512,
+        },
+    },
 
     # ── Stress experiments — peak 80 users (≈2.7× normal) to push node CPU above 80%
     # and saturate SDN links, activating service_placement and flow_scheduling triggers.
@@ -339,6 +353,9 @@ def build_experiment_config(exp_def: dict, base_config_path: str, output_dir: st
 
     cfg["actions"] = copy.deepcopy(exp_def["actions"])
 
+    if "llm_override" in exp_def:
+        cfg.setdefault("llm", {}).update(exp_def["llm_override"])
+
     config_path = os.path.join(output_dir, "experiment_config.yaml")
     with open(config_path, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False)
@@ -398,9 +415,13 @@ def run_experiment(
     else:
         print("  ⏭️  Cluster reset skipped")
 
-    # 3. Warm up LLM (skip for baseline)
+    # 3. Warm up LLM (skip for baseline; skip for non-Ollama providers)
     if not monitor_only:
-        warmup_llm(BASE_CONFIG)
+        provider = exp_def.get("llm_override", {}).get("provider", "ollama")
+        if provider == "ollama":
+            warmup_llm(BASE_CONFIG)
+        else:
+            print(f"  ⏭️  LLM warm-up skipped (provider={provider})")
 
     # 4. Start LLM-server resource monitor
     remote_csv = start_llm_resource_monitor(output_dir) if not monitor_only else None

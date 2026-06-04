@@ -87,6 +87,14 @@ class DecisionMaker:
 
         # Max completion tokens — configurable via llm.max_tokens, default 512
         self.max_tokens = int(config.get("llm", {}).get("max_tokens", 512))
+
+        # Provider: "ollama" (default) or "openai"
+        self.provider = config.get("llm", {}).get("provider", "ollama")
+        if self.provider == "openai":
+            import os as _os
+            self.openai_api_key = _os.environ.get("OPENAI_API_KEY", "")
+            if not self.openai_api_key:
+                raise ValueError("OPENAI_API_KEY environment variable not set for provider=openai")
     
     def _load_system_prompt(self) -> str:
         """Load the 6-action system prompt from file."""
@@ -561,6 +569,78 @@ JSON:"""
         return self._send_chat(messages)
 
     def _send_chat(self, messages: list) -> Optional[str]:
+        """Dispatch to the configured LLM provider (ollama or openai)."""
+        if self.provider == "openai":
+            return self._send_chat_openai(messages)
+        return self._send_chat_ollama(messages)
+
+    def _send_chat_openai(self, messages: list) -> Optional[str]:
+        """Send a chat request to the OpenAI API and return the response text."""
+        import time as _time
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_completion_tokens": self.max_tokens,
+        }
+
+        if self.debug_llm:
+            logger.info("=" * 60)
+            logger.info("LLM DEBUG - OPENAI 8-MSG REQUEST:")
+            logger.info(f"  Model: {self.model}, Messages: {len(messages)}")
+            for i, m in enumerate(messages):
+                logger.info(f"  [{i+1}] {m['role']}: [{len(m['content'])} chars]")
+            logger.info("=" * 60)
+
+        t0 = _time.time()
+        try:
+            logger.info(f"Querying OpenAI ({self.model}) with {len(messages)} messages...")
+            response = requests.post(url, json=payload, headers=headers, timeout=120)
+            response.raise_for_status()
+
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            latency_ms = round((_time.time() - t0) * 1000, 1)
+
+            # GPT-4o pricing (standard tier): $2.50/1M input, $10.00/1M output
+            cost_usd = round(
+                prompt_tokens * 2.50 / 1_000_000 + output_tokens * 10.00 / 1_000_000, 6
+            )
+            logger.info(
+                f"OpenAI response: {latency_ms/1000:.1f}s "
+                f"(prompt={prompt_tokens}, output={output_tokens}, cost=${cost_usd:.4f})"
+            )
+
+            self.llm_calls_log.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": output_tokens,
+                "latency_ms": latency_ms,
+                "cost_usd": cost_usd,
+                "action_selected": None,
+            })
+
+            if self.debug_llm:
+                logger.info(f"LLM DEBUG - RESPONSE: {content}")
+
+            return content.strip()
+
+        except requests.exceptions.Timeout:
+            logger.error("OpenAI request timed out")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"OpenAI API error: {e}")
+            return None
+
+    def _send_chat_ollama(self, messages: list) -> Optional[str]:
         """Send a chat request to Ollama and return the response text."""
         url = f"{self.ollama_url}/api/chat"
         

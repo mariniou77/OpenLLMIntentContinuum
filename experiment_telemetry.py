@@ -84,7 +84,7 @@ class ExperimentTelemetry:
         path = os.path.join(self.output_dir, "llm_interactions.csv")
         fieldnames = [
             "timestamp", "prompt_tokens", "completion_tokens",
-            "latency_ms", "action_selected"
+            "latency_ms", "cost_usd", "action_selected"
         ]
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -168,6 +168,10 @@ class ExperimentTelemetry:
             atype = entry.get("action_taken", {}).get("type", "unknown")
             action_breakdown[atype] = action_breakdown.get(atype, 0) + 1
 
+        # Total API cost (non-null only for OpenAI experiments)
+        costs = [c["cost_usd"] for c in llm_calls if c.get("cost_usd") is not None]
+        total_api_cost_usd = round(sum(costs), 4) if costs else None
+
         # Locust aggregate from CSV if available (fail silently)
         locust_requests, locust_failures = self._read_locust_totals()
 
@@ -195,6 +199,7 @@ class ExperimentTelemetry:
             "mean_completion_tokens": round(statistics.mean(completion_tokens_list), 0) if completion_tokens_list else None,
             "total_prompt_tokens": sum(prompt_tokens_list),
             "total_completion_tokens": sum(completion_tokens_list),
+            "total_api_cost_usd": total_api_cost_usd,
         }
 
         path = os.path.join(self.output_dir, "summary.json")

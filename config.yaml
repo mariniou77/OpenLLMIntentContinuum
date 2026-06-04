@@ -35,6 +35,7 @@ llm:
   model: "qwen3.5:4b"
   temperature: 0
   max_tokens: 512  # max completion tokens; 200 caused truncation in ablation study exp_02-08
+  provider: "ollama"  # "ollama" (default) or "openai"
 
 # Decision History
 history:
