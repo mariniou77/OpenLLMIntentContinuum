@@ -666,11 +666,15 @@ def parse_args():
                         help="Enable LLM debug logging in intent loop")
     parser.add_argument("--repeat", type=int, default=1, metavar="N",
                         help="Run each experiment N times and aggregate mean ± std (default: 1)")
+    parser.add_argument("--results-root", default=RESULTS_ROOT, metavar="DIR",
+                        help="Root directory for experiment outputs (default: evaluation_results)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    global RESULTS_ROOT
+    RESULTS_ROOT = args.results_root
 
     if args.list:
         print("\nExperiment Matrix:")

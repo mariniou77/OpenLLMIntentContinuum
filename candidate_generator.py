@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 ACTION_IDS = ["A", "B", "C", "D"]
 
 # CPU step sizes (millicores)
-CPU_INCREASE_STEP = 200
+CPU_INCREASE_STEP = 300
 CPU_DECREASE_STEP = 100
 CPU_MIN = 100
-CPU_MAX = 1000
+CPU_MAX = 1500
 
 
 class CandidateActionGenerator:
