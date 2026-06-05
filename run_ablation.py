@@ -234,13 +234,21 @@ def wait_for_cluster_stable(
     """
     print(f"  ⏳ Waiting for cluster CPU to stabilise (threshold: {threshold_m}m, max: {max_wait_s}s)...")
     deadline = time.time() + max_wait_s
+    consecutive_ok = 0
     while time.time() < deadline:
         total = _get_cluster_total_cpu_m(master_ip, ssh_user)
         if total is not None and total < threshold_m:
-            print(f"  ✅ Cluster stable: {total}m total CPU")
-            return
-        used_str = f"{total}m" if total is not None else "unknown"
-        print(f"     CPU still at {used_str} — waiting 15s...")
+            consecutive_ok += 1
+            if consecutive_ok >= 2:
+                # Two consecutive sub-threshold readings guarantees the metrics-server
+                # (60s scrape interval) has produced at least one fresh sample.
+                print(f"  ✅ Cluster stable (confirmed twice): {total}m total CPU")
+                return
+            print(f"     Below threshold ({total}m) — confirming with one more check in 15s...")
+        else:
+            consecutive_ok = 0
+            used_str = f"{total}m" if total is not None else "unknown"
+            print(f"     CPU still at {used_str} — waiting 15s...")
         time.sleep(15)
     print(f"  ⚠️  Cluster did not stabilise within {max_wait_s}s — proceeding anyway")
 
@@ -265,7 +273,7 @@ while true; do
         awk -v ts="$TS" '{{print ts","$1","$2","$4}}' >> {node_csv}
     ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no {ssh_user}@{master_ip} \\
         "kubectl top pods --all-namespaces --no-headers 2>/dev/null" | \\
-        awk -v ts="$TS" '{{print ts","$1","$2","$3","$5}}' >> {pod_csv}
+        awk -v ts="$TS" '{{print ts","$1","$2","$3","$4}}' >> {pod_csv}
     sleep 15
 done
 """

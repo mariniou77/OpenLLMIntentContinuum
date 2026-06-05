@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 ACTION_IDS = ["A", "B", "C", "D"]
 
 # CPU step sizes (millicores)
-CPU_INCREASE_STEP = 200
+CPU_INCREASE_STEP = 500
 CPU_DECREASE_STEP = 100
 CPU_MIN = 100
-CPU_MAX = 1000
+CPU_MAX = 3500
 
 
 class CandidateActionGenerator:
@@ -126,7 +126,7 @@ class CandidateActionGenerator:
         # --- Priority 2: Node overload → service_placement ---
         target_node = target_svc.get("node", "")
         node_cpu = self._get_node_cpu(nodes, target_node)
-        if node_cpu > 80 and self.actions_enabled.get("service_placement", False):
+        if node_cpu > 40 and self.actions_enabled.get("service_placement", False):
             least_loaded = self._find_least_loaded_worker(nodes, exclude=target_node)
             if least_loaded:
                 candidates.append({

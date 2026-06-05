@@ -585,6 +585,445 @@ def fig_ema_time_in_band(summaries: dict) -> None:
     _save(fig, "fig_09_ema_time_in_band")
 
 
+# ── K8s Resource CSV helpers ─────────────────────────────────────────────────
+
+def _run_dirs(exp_name: str) -> list:
+    """
+    Return existing run directories for an experiment in priority order.
+    Handles both multi-run (_run1/_run2/_run3) and single-run ({exp_name}/) layouts.
+    """
+    dirs = []
+    for suffix in ("_run1", "_run2", "_run3"):
+        d = SCRIPT_DIR / f"{exp_name}{suffix}"
+        if d.exists():
+            dirs.append(d)
+    # Single-run layout (4th suite): results in {exp_name}/ directly
+    if not dirs:
+        d = SCRIPT_DIR / exp_name
+        if d.exists():
+            dirs.append(d)
+    return dirs
+
+
+def _load_pod_cpu(exp_name: str, service_prefix: str = "microservice3") -> list:
+    """
+    Load per-pod CPU data for a service across all available run directories.
+
+    Returns a list of dicts, one per run:
+        {"elapsed_min": [...], "cpu_m": [...]}
+    where cpu_m is the SUM of all matching pods at each timestamp (handles replicas).
+    Supports both multi-run (_run1/_run2/_run3) and single-run ({exp_name}/) layouts.
+    """
+    runs = []
+    for run_dir in _run_dirs(exp_name):
+        csv_path = run_dir / "k8s_pod_resources.csv"
+        if not csv_path.exists():
+            continue
+        # Aggregate CPU across all pods matching the service prefix at each timestamp
+        from collections import defaultdict
+        ts_cpu: dict = defaultdict(int)
+        with open(csv_path, newline="") as f:
+            for row in csv.DictReader(f):
+                pod = row.get("pod_name", "")
+                if not pod.startswith(service_prefix):
+                    continue
+                cpu_str = row.get("cpu_m", "0").strip()
+                if not cpu_str:
+                    continue
+                try:
+                    cpu_val = int(cpu_str.rstrip("m"))
+                except ValueError:
+                    continue
+                ts_cpu[row["timestamp"]] += cpu_val
+
+        if not ts_cpu:
+            continue
+        timestamps = sorted(ts_cpu.keys())
+        from datetime import datetime as _dt
+        t0 = _dt.fromisoformat(timestamps[0].replace("Z", "+00:00"))
+        elapsed = [(
+            (_dt.fromisoformat(ts.replace("Z", "+00:00")) - t0).total_seconds() / 60
+        ) for ts in timestamps]
+        cpu_vals = [ts_cpu[ts] for ts in timestamps]
+        runs.append({"elapsed_min": elapsed, "cpu_m": cpu_vals})
+    return runs
+
+
+def _load_pod_memory(exp_name: str, service_prefix: str = "microservice3") -> list:
+    """
+    Load per-pod memory data (MiB) for a service across all available run directories.
+
+    Returns a list of dicts, one per run:
+        {"elapsed_min": [...], "mem_mi": [...]}
+    where mem_mi is the SUM of all matching pods at each timestamp.
+    Supports both multi-run (_run1/_run2/_run3) and single-run ({exp_name}/) layouts.
+    """
+    runs = []
+    for run_dir in _run_dirs(exp_name):
+        csv_path = run_dir / "k8s_pod_resources.csv"
+        if not csv_path.exists():
+            continue
+        from collections import defaultdict
+        ts_mem: dict = defaultdict(int)
+        with open(csv_path, newline="") as f:
+            for row in csv.DictReader(f):
+                pod = row.get("pod_name", "")
+                if not pod.startswith(service_prefix):
+                    continue
+                mem_str = row.get("memory_mi", "0").strip()
+                if not mem_str:
+                    continue
+                try:
+                    mem_val = int(mem_str.rstrip("Mi"))
+                except ValueError:
+                    continue
+                ts_mem[row["timestamp"]] += mem_val
+
+        if not ts_mem:
+            continue
+        timestamps = sorted(ts_mem.keys())
+        from datetime import datetime as _dt
+        t0 = _dt.fromisoformat(timestamps[0].replace("Z", "+00:00"))
+        elapsed = [(
+            (_dt.fromisoformat(ts.replace("Z", "+00:00")) - t0).total_seconds() / 60
+        ) for ts in timestamps]
+        mem_vals = [ts_mem[ts] for ts in timestamps]
+        runs.append({"elapsed_min": elapsed, "mem_mi": mem_vals})
+    return runs
+
+
+def _load_node_cpu(exp_name: str) -> list:
+    """
+    Load per-node CPU data for a single run (run1 as representative).
+
+    Returns a dict: {node_name: {"elapsed_min": [...], "cpu_m": [...]}}
+    Supports both multi-run (_run1/_run2/_run3) and single-run ({exp_name}/) layouts.
+    """
+    run_dirs = _run_dirs(exp_name)
+    if not run_dirs:
+        return {}
+    run_dir = run_dirs[0]
+    csv_path = run_dir / "k8s_node_resources.csv"
+    if not csv_path.exists():
+        return {}
+
+    from collections import defaultdict
+    from datetime import datetime as _dt
+    node_data: dict = defaultdict(lambda: {"ts": [], "cpu": []})
+
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            node = row.get("node", "")
+            cpu_str = row.get("cpu_cores", "0").strip()
+            if not cpu_str:
+                continue
+            try:
+                cpu_m = int(cpu_str.rstrip("m")) if cpu_str.endswith("m") else int(float(cpu_str) * 1000)
+            except ValueError:
+                continue
+            node_data[node]["ts"].append(row["timestamp"])
+            node_data[node]["cpu"].append(cpu_m)
+
+    result = {}
+    for node, data in node_data.items():
+        if not data["ts"]:
+            continue
+        t0 = _dt.fromisoformat(data["ts"][0].replace("Z", "+00:00"))
+        elapsed = [(
+            (_dt.fromisoformat(ts.replace("Z", "+00:00")) - t0).total_seconds() / 60
+        ) for ts in data["ts"]]
+        result[node] = {"elapsed_min": elapsed, "cpu_m": data["cpu"]}
+    return result
+
+
+def _aggregate_runs(runs: list, grid_step: float = 0.25) -> tuple:
+    """
+    Interpolate runs onto a common time grid and return (grid, mean, std).
+    grid_step is in minutes.
+    """
+    if not runs:
+        return np.array([]), np.array([]), np.array([])
+    max_time = min(max(r["elapsed_min"]) for r in runs)
+    grid = np.arange(0, max_time, grid_step)
+    interp_runs = []
+    for r in runs:
+        interp_runs.append(np.interp(grid, r["elapsed_min"], r["cpu_m"]))
+    arr = np.array(interp_runs)
+    return grid, arr.mean(axis=0), arr.std(axis=0)
+
+
+# ── Figure 10 — Pod CPU Usage Over Time (all 4 services) ─────────────────────
+
+SERVICES = [
+    ("microservice1-deployment", "ms1"),
+    ("microservice2-deployment", "ms2"),
+    ("microservice3-deployment", "ms3"),
+    ("microservice4-deployment", "ms4"),
+]
+
+
+def fig_pod_cpu_over_time(summaries: dict) -> None:
+    """
+    2×2 grid of subplots — one per microservice (ms1–ms4).
+    Each subplot overlays all ablation experiments.
+    Multi-run experiments show mean ± shaded std band; single-run shows a line.
+    """
+    names = [n for n in ABLATION_ORDER if n in summaries]
+    if not names:
+        print("  No experiments available — skipping Figure 10")
+        return
+
+    cmap = plt.get_cmap("tab10")
+    exp_colors = {n: cmap(i % 10) for i, n in enumerate(names)}
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharey=False)
+    axes_flat = [axes[r][c] for r in range(2) for c in range(2)]
+
+    for ax, (svc_prefix, svc_short) in zip(axes_flat, SERVICES):
+        any_data = False
+        for name in names:
+            runs = _load_pod_cpu(name, service_prefix=svc_prefix)
+            if not runs:
+                continue
+            color = exp_colors[name]
+            if len(runs) >= 2:
+                grid, mean, std = _aggregate_runs(runs)
+                ax.plot(grid, mean, label=SHORT_LABELS.get(name, name),
+                        color=color, linewidth=1.5)
+                ax.fill_between(grid, mean - std, mean + std,
+                                alpha=0.18, color=color)
+            else:
+                r = runs[0]
+                ax.plot(r["elapsed_min"], r["cpu_m"],
+                        label=SHORT_LABELS.get(name, name),
+                        color=color, linewidth=1.5)
+            any_data = True
+
+        if not any_data:
+            ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center")
+
+        ax.set_title(svc_short)
+        ax.set_xlabel("Time (minutes)")
+        ax.set_ylabel(f"{svc_short} Pod CPU (millicores, sum of replicas)")
+        ax.legend(fontsize=7, loc="upper right")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+
+    fig.suptitle("Pod CPU Usage Over Time — All Services\n"
+                 "(shaded band = ±1 std across 3 runs)", fontsize=12)
+    plt.tight_layout()
+    _save(fig, "fig_10_pod_cpu_over_time")
+
+
+# ── Figure 11 — Node CPU Usage Over Time ─────────────────────────────────────
+
+def fig_node_cpu_over_time(summaries: dict) -> None:
+    """
+    Per-node CPU usage over time for the key comparison experiments.
+    Shows a horizontal dashed line at 800m (80% of 1000m node capacity assumed)
+    as the service_placement trigger threshold context.
+
+    One subplot per experiment (up to 4 key experiments).
+    Uses run1 as the representative run for each.
+    """
+    # Show only the most meaningful experiments for node-level view
+    priority = ["exp_01_baseline", "exp_08_full_system",
+                "exp_09_cloud_llm_baseline", "exp_hpa_baseline"]
+    names = [n for n in priority if n in summaries]
+    if not names:
+        print("  No experiments available — skipping Figure 11")
+        return
+
+    ncols = min(len(names), 2)
+    nrows = (len(names) + 1) // 2
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4 * nrows), squeeze=False)
+    axes_flat = [ax for row in axes for ax in row]
+
+    node_colors = {"master": "#4C72B0", "worker1": "#DD8452", "worker2": "#55A868"}
+
+    for i, name in enumerate(names):
+        ax = axes_flat[i]
+        node_data = _load_node_cpu(name)
+        any_data = False
+
+        for node, data in sorted(node_data.items()):
+            color = node_colors.get(node, "#8C8C8C")
+            ax.plot(data["elapsed_min"], data["cpu_m"],
+                    label=node, color=color, linewidth=1.3, alpha=0.85)
+            any_data = True
+
+        # service_placement fires when sFlow cpu_utilization > 40% of the node.
+        # Each node has 4 CPUs (4000m allocatable), so 40% = 1600m in millicores.
+        ax.axhline(1600, color="red", linestyle="--", linewidth=1,
+                   alpha=0.6, label="SP trigger: 40% of 4-core node (1600m)")
+
+        if not any_data:
+            ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center")
+
+        ax.set_title(SHORT_LABELS.get(name, name))
+        ax.set_xlabel("Time (minutes)")
+        ax.set_ylabel("Node CPU (millicores)")
+        ax.legend(fontsize=7, loc="upper right")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+
+    # Hide unused subplots
+    for j in range(len(names), len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle("Node CPU Usage Over Time (run 1)\n"
+                 "Red dashed = service_placement trigger (sFlow cpu_util > 40% = 1600m on 4-core nodes)", fontsize=11)
+    plt.tight_layout()
+    _save(fig, "fig_11_node_cpu_over_time")
+
+
+# ── Figure 12 — Node Memory Usage Over Time ───────────────────────────────────
+
+def fig_node_memory_over_time(summaries: dict) -> None:
+    """
+    Per-node RAM usage (MiB) over time for key comparison experiments.
+    Uses run1 as the representative run for each experiment.
+    Node capacity is 8192 MiB (8 GiB per node on Chameleon KVM).
+    """
+    priority = ["exp_01_baseline", "exp_08_full_system",
+                "exp_09_cloud_llm_baseline", "exp_hpa_baseline"]
+    names = [n for n in priority if n in summaries]
+    if not names:
+        print("  No experiments available — skipping Figure 12")
+        return
+
+    NODE_CAPACITY_MIB = 8192  # 8 GiB per node (Chameleon KVM @TACC)
+
+    ncols = min(len(names), 2)
+    nrows = (len(names) + 1) // 2
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4 * nrows), squeeze=False)
+    axes_flat = [ax for row in axes for ax in row]
+
+    node_colors = {"master": "#4C72B0", "worker1": "#DD8452", "worker2": "#55A868"}
+
+    for i, name in enumerate(names):
+        ax = axes_flat[i]
+        _rdirs = _run_dirs(name)
+        run_dir = _rdirs[0] if _rdirs else None
+        csv_path = run_dir / "k8s_node_resources.csv" if run_dir else None
+        any_data = False
+
+        if csv_path and csv_path.exists():
+            from collections import defaultdict
+            from datetime import datetime as _dt
+            node_data: dict = defaultdict(lambda: {"ts": [], "mem": []})
+
+            with open(csv_path, newline="") as f:
+                for row in csv.DictReader(f):
+                    node = row.get("node", "")
+                    mem_str = row.get("memory_mi", "").strip()
+                    if not mem_str:
+                        continue
+                    try:
+                        mem_mib = int(mem_str.rstrip("Mi"))
+                    except ValueError:
+                        continue
+                    node_data[node]["ts"].append(row["timestamp"])
+                    node_data[node]["mem"].append(mem_mib)
+
+            for node, data in sorted(node_data.items()):
+                if not data["ts"]:
+                    continue
+                t0 = _dt.fromisoformat(data["ts"][0].replace("Z", "+00:00"))
+                elapsed = [(
+                    (_dt.fromisoformat(ts.replace("Z", "+00:00")) - t0).total_seconds() / 60
+                ) for ts in data["ts"]]
+                color = node_colors.get(node, "#8C8C8C")
+                ax.plot(elapsed, data["mem"], label=node, color=color,
+                        linewidth=1.3, alpha=0.85)
+                any_data = True
+
+        # 80% memory capacity reference line
+        ax.axhline(NODE_CAPACITY_MIB * 0.8, color="orange", linestyle="--",
+                   linewidth=1, alpha=0.7, label=f"80% capacity ({int(NODE_CAPACITY_MIB*0.8):,} MiB)")
+
+        if not any_data:
+            ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center")
+
+        ax.set_ylim(0, NODE_CAPACITY_MIB * 1.05)
+        ax.set_title(SHORT_LABELS.get(name, name))
+        ax.set_xlabel("Time (minutes)")
+        ax.set_ylabel("Node RAM Usage (MiB)")
+        ax.legend(fontsize=7, loc="lower right")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+
+    for j in range(len(names), len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle("Node RAM Usage Over Time (run 1)\n"
+                 "Orange dashed = 80% of 8 GiB node capacity (6,554 MiB)", fontsize=11)
+    plt.tight_layout()
+    _save(fig, "fig_12_node_memory_over_time")
+
+
+# ── Figure 13 — Pod Memory Usage Over Time (all 4 services) ──────────────────
+
+def fig_pod_memory_over_time(summaries: dict) -> None:
+    """
+    2×2 grid of subplots — one per microservice (ms1–ms4).
+    Each subplot overlays all ablation experiments.
+    Multi-run experiments show mean ± shaded std band; single-run shows a line.
+    """
+    names = [n for n in ABLATION_ORDER if n in summaries]
+    if not names:
+        print("  No experiments available — skipping Figure 13")
+        return
+
+    cmap = plt.get_cmap("tab10")
+    exp_colors = {n: cmap(i % 10) for i, n in enumerate(names)}
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharey=False)
+    axes_flat = [axes[r][c] for r in range(2) for c in range(2)]
+
+    for ax, (svc_prefix, svc_short) in zip(axes_flat, SERVICES):
+        any_data = False
+        for name in names:
+            runs = _load_pod_memory(name, service_prefix=svc_prefix)
+            if not runs:
+                continue
+            color = exp_colors[name]
+            if len(runs) >= 2:
+                # Reuse _aggregate_runs by temporarily aliasing mem_mi → cpu_m key
+                runs_compat = [{"elapsed_min": r["elapsed_min"], "cpu_m": r["mem_mi"]}
+                               for r in runs]
+                grid, mean, std = _aggregate_runs(runs_compat)
+                ax.plot(grid, mean, label=SHORT_LABELS.get(name, name),
+                        color=color, linewidth=1.5)
+                ax.fill_between(grid, mean - std, mean + std,
+                                alpha=0.18, color=color)
+            else:
+                r = runs[0]
+                ax.plot(r["elapsed_min"], r["mem_mi"],
+                        label=SHORT_LABELS.get(name, name),
+                        color=color, linewidth=1.5)
+            any_data = True
+
+        if not any_data:
+            ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center")
+
+        ax.set_title(svc_short)
+        ax.set_xlabel("Time (minutes)")
+        ax.set_ylabel(f"{svc_short} Pod Memory (MiB, sum of replicas)")
+        ax.legend(fontsize=7, loc="upper right")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+
+    fig.suptitle("Pod Memory Usage Over Time — All Services\n"
+                 "(shaded band = ±1 std across 3 runs)", fontsize=12)
+    plt.tight_layout()
+    _save(fig, "fig_13_pod_memory_over_time")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -597,15 +1036,19 @@ def main():
     print(f"Loaded summaries for: {list(summaries.keys())}\n")
 
     steps = [
-        ("Figure 1  — Intent Satisfaction Rate",     fig_intent_satisfaction_rate),
-        ("Figure 2  — Violation Resolution",          fig_violation_resolution),
-        ("Figure 3  — Action Type Distribution",      fig_action_type_distribution),
-        ("Figure 4  — Inference Latency",             fig_inference_latency),
-        ("Figure 5  — Token Usage",                   fig_token_usage),
-        ("Figure 6  — Locust p95 Response Curve",     fig_locust_p95_curve),
-        ("Figure 7  — EMA Response Time Over Time",   fig_ema_response_time),
-        ("Figure 8  — Time-Normalised ISR",           fig_time_normalised_isr),
-        ("Figure 9  — EMA Time-in-Band",              fig_ema_time_in_band),
+        ("Figure 1  — Intent Satisfaction Rate",      fig_intent_satisfaction_rate),
+        ("Figure 2  — Violation Resolution",           fig_violation_resolution),
+        ("Figure 3  — Action Type Distribution",       fig_action_type_distribution),
+        ("Figure 4  — Inference Latency",              fig_inference_latency),
+        ("Figure 5  — Token Usage",                    fig_token_usage),
+        ("Figure 6  — Locust p95 Response Curve",      fig_locust_p95_curve),
+        ("Figure 7  — EMA Response Time Over Time",    fig_ema_response_time),
+        ("Figure 8  — Time-Normalised ISR",            fig_time_normalised_isr),
+        ("Figure 9  — EMA Time-in-Band",               fig_ema_time_in_band),
+        ("Figure 10 — Pod CPU Over Time (all services)", fig_pod_cpu_over_time),
+        ("Figure 11 — Node CPU Over Time",              fig_node_cpu_over_time),
+        ("Figure 12 — Node Memory Over Time",           fig_node_memory_over_time),
+        ("Figure 13 — Pod Memory Over Time (all services)", fig_pod_memory_over_time),
     ]
 
     for title, fn in steps:

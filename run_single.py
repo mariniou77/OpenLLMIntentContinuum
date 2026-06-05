@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Single-Run Launcher for the Targeted 3-Scenario Evaluation
+Single-Run Launcher for Targeted Scenario Evaluation
 
 Triggers exactly one experiment run. The cluster must already be reset and
 verified (via cluster_reset_verify.py) before calling this script.
 
-When --run-id 3 is passed, aggregation over run1/run2/run3 is performed
-automatically after the run completes, producing {exp_key}_agg/summary_aggregated.json
-identical to the --repeat 3 output from run_ablation.py.
-
 Usage:
-    python3 run_single.py --scenario baseline --run-id 1
-    python3 run_single.py --scenario full     --run-id 2
-    python3 run_single.py --scenario cloud    --run-id 3
-    python3 run_single.py --scenario hpa      --run-id 1
-    python3 run_single.py --scenario full     --run-id 1 \\
-        --results-root evaluation_results/3rd_experiment
+    python3 run_single.py --scenario baseline
+    python3 run_single.py --scenario full
+    python3 run_single.py --scenario cloud
+    python3 run_single.py --scenario hpa
+    python3 run_single.py --scenario full \\
+        --load-pattern 15,30,45,60,45,30,15 \\
+        --results-root evaluation_results/4th_experiment
 
 Scenarios:
     baseline  ->  exp_01_baseline              (monitor-only, no LLM)
@@ -25,7 +22,7 @@ Scenarios:
 
 For the 'cloud' scenario, export OPENAI_API_KEY before running:
     export OPENAI_API_KEY=sk-...
-    python3 run_single.py --scenario cloud --run-id 1
+    python3 run_single.py --scenario cloud
 """
 
 import argparse
@@ -34,7 +31,7 @@ import sys
 import time
 
 import run_ablation
-from run_ablation import EXPERIMENT_MATRIX, aggregate_runs
+from run_ablation import EXPERIMENT_MATRIX
 from run_experiment import get_master_info, ssh_cmd
 
 # ── Scenario registry ────────────────────────────────────────────────────────
@@ -60,7 +57,7 @@ HPA_EXP_DEF = {
     },
 }
 
-DEFAULT_RESULTS_ROOT = "evaluation_results/3rd_experiment"
+DEFAULT_RESULTS_ROOT = "evaluation_results/4th_experiment"
 
 
 # ── HPA lifecycle helpers ────────────────────────────────────────────────────
@@ -104,16 +101,20 @@ def main() -> None:
         help="Which scenario to run: baseline | full | cloud | hpa"
     )
     parser.add_argument(
-        "--run-id", type=int, choices=[1, 2, 3], required=True,
-        help="Run number (1, 2, or 3). Running id=3 auto-aggregates all three runs."
-    )
-    parser.add_argument(
         "--results-root", default=DEFAULT_RESULTS_ROOT,
         help=f"Root output directory (default: {DEFAULT_RESULTS_ROOT})"
     )
     parser.add_argument(
+        "--load-pattern", default=None,
+        help="Comma-separated Locust user counts per stage, e.g. 15,30,45,60,45,30,15"
+    )
+    parser.add_argument(
         "--debug-llm", action="store_true",
         help="Enable LLM debug logging in the intent loop."
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would run without executing."
     )
     args = parser.parse_args()
 
@@ -129,19 +130,29 @@ def main() -> None:
             print(f"ERROR: '{exp_key}' not found in EXPERIMENT_MATRIX.")
             sys.exit(1)
 
-    run_name = f"{exp_key}_run{args.run_id}"
+    # Inject custom load pattern if provided.
+    if args.load_pattern:
+        exp_def = dict(exp_def)
+        exp_def["load_pattern"] = [int(x) for x in args.load_pattern.split(",")]
+
+    run_name = exp_key   # one run per scenario — no run-id suffix
     results_root = args.results_root
 
     # Redirect all output paths inside run_ablation to the chosen results root.
     run_ablation.RESULTS_ROOT = results_root
     os.makedirs(results_root, exist_ok=True)
 
+    load_pattern = exp_def.get("load_pattern", run_ablation.DEFAULT_LOAD_PATTERN)
     print(f"\n{'='*70}")
-    print(f"  SCENARIO : {args.scenario}  ({exp_key})")
-    print(f"  RUN ID   : {args.run_id} / 3")
-    print(f"  OUTPUT   : {os.path.join(results_root, run_name)}/")
-    print(f"  NOTE     : Cluster reset must already be verified before this step.")
+    print(f"  SCENARIO     : {args.scenario}  ({exp_key})")
+    print(f"  LOAD PATTERN : {load_pattern}  (peak {max(load_pattern)} users)")
+    print(f"  OUTPUT       : {os.path.join(results_root, run_name)}/")
+    print(f"  NOTE         : Cluster reset must already be verified before this step.")
     print(f"{'='*70}")
+
+    if args.dry_run:
+        print("  [DRY RUN] — no experiment executed.")
+        return
 
     # For HPA: create objects before the run, delete them after.
     hpa_user = hpa_master = None
@@ -162,27 +173,8 @@ def main() -> None:
         print("\n  Removing HPA objects...")
         _delete_hpa(hpa_user, hpa_master)
 
-    # ── Auto-aggregate after the third run ───────────────────────────────────
-    if args.run_id == 3:
-        print(f"\n{'='*70}")
-        print(f"  Run 3 complete — aggregating all 3 runs for {exp_key} …")
-        print(f"{'='*70}")
-
-        run_dirs = [
-            os.path.join(results_root, f"{exp_key}_run{i}")
-            for i in [1, 2, 3]
-        ]
-        agg_dir = os.path.join(results_root, f"{exp_key}_agg")
-
-        # Warn about any missing run directories so the user knows what's included.
-        for d in run_dirs:
-            summary = os.path.join(d, "summary.json")
-            if not os.path.exists(summary):
-                print(f"  ⚠  Missing {summary} — that run will be excluded from aggregation.")
-
-        aggregate_runs(run_dirs, agg_dir, exp_key, exp_def["label"])
-        print(f"\n  ✅ Aggregated results → {agg_dir}/summary_aggregated.json")
-        print(f"     Run plot_comparison.py inside {results_root}/ to generate figures.")
+    print(f"\n  ✅ Run complete — results in {os.path.join(results_root, run_name)}/")
+    print(f"     Run plot_comparison.py inside {results_root}/ to generate figures.")
 
 
 if __name__ == "__main__":
