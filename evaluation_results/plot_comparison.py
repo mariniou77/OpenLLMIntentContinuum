@@ -171,7 +171,7 @@ def _action_breakdown(s: dict) -> dict:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _save(fig, stem: str) -> None:
-    for ext in ("pdf", "png"):
+    for ext in ("pdf",):
         path = SCRIPT_DIR / f"{stem}.{ext}"
         fig.savefig(path, bbox_inches="tight", dpi=150)
         print(f"  Saved {path}")
@@ -274,7 +274,7 @@ def fig_violation_resolution(summaries: dict) -> None:
 def fig_action_type_distribution(summaries: dict) -> None:
     # Exclude monitor-only conditions (no LLM actions to show) and the cloud LLM
     # baseline (handled separately in latency/token figures).
-    _no_actions = {"exp_01_baseline", "exp_hpa_baseline", "exp_09_cloud_llm_baseline"}
+    _no_actions = {"exp_01_baseline", "exp_hpa_baseline"}
     names = [n for n in EXPERIMENT_ORDER
              if n in summaries and n not in _no_actions]
     if not names:
@@ -428,80 +428,80 @@ def fig_locust_p95_curve(summaries: dict) -> None:
 # ── Figure 7 — EMA Response Time Over Time ───────────────────────────────────
 
 def fig_ema_response_time(summaries: dict) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5), sharey=False)
-    titles = ["Normal Load (Ablation Suite)", "Stress Load (exp_10–12)"]
-    groups = [ABLATION_ORDER, STRESS_ORDER]
+    """One PDF per non-stress scenario that has EMA timeline data."""
+    from datetime import datetime as _dt
 
-    for ax, group, title in zip(axes, groups, titles):
-        any_data = False
-        for name in group:
-            if name not in summaries:
-                continue
-            timeline = load_ema_timeline(name)
-            if not timeline:
-                continue
-            try:
-                from datetime import datetime as _dt
-                times, emas = [], []
-                viol_upper_t, viol_upper_v = [], []
-                viol_lower_t, viol_lower_v = [], []
-                t0 = None
+    names = [n for n in ABLATION_ORDER if n in summaries]
+    if not names:
+        print("  No EMA timeline data available — skipping Figure 7")
+        return
 
-                for point in timeline:
-                    ema = point.get("ema")
-                    if ema is None:
-                        continue
-                    ts = _dt.fromisoformat(point.get("timestamp", ""))
-                    if t0 is None:
-                        t0 = ts
-                    elapsed = (ts - t0).total_seconds() / 60
-                    times.append(elapsed)
-                    emas.append(ema)
+    generated = 0
+    for name in names:
+        timeline = load_ema_timeline(name)
+        if not timeline:
+            continue
+        try:
+            times, emas = [], []
+            viol_upper_t, viol_upper_v = [], []
+            viol_lower_t, viol_lower_v = [], []
+            t0 = None
 
-                    vtype = point.get("violation")
-                    if not point.get("grace_period") and not point.get("cooldown"):
-                        if vtype == "UPPER_THRESHOLD_EXCEEDED":
-                            viol_upper_t.append(elapsed)
-                            viol_upper_v.append(ema)
-                        elif vtype == "LOWER_THRESHOLD_EXCEEDED":
-                            viol_lower_t.append(elapsed)
-                            viol_lower_v.append(ema)
+            for point in timeline:
+                ema = point.get("ema")
+                if ema is None:
+                    continue
+                ts = _dt.fromisoformat(point.get("timestamp", ""))
+                if t0 is None:
+                    t0 = ts
+                elapsed = (ts - t0).total_seconds() / 60
+                times.append(elapsed)
+                emas.append(ema)
 
-                if times:
-                    line, = ax.plot(times, emas, label=SHORT_LABELS[name],
-                                    alpha=0.75, linewidth=1.3)
-                    if viol_upper_t:
-                        ax.scatter(viol_upper_t, viol_upper_v, color=line.get_color(),
-                                   marker="^", s=25, alpha=0.8, zorder=5)
-                    if viol_lower_t:
-                        ax.scatter(viol_lower_t, viol_lower_v, color=line.get_color(),
-                                   marker="v", s=25, alpha=0.8, zorder=5)
-                    any_data = True
-            except Exception:
+                vtype = point.get("violation")
+                if not point.get("grace_period") and not point.get("cooldown"):
+                    if vtype == "UPPER_THRESHOLD_EXCEEDED":
+                        viol_upper_t.append(elapsed)
+                        viol_upper_v.append(ema)
+                    elif vtype == "LOWER_THRESHOLD_EXCEEDED":
+                        viol_lower_t.append(elapsed)
+                        viol_lower_v.append(ema)
+
+            if not times:
                 continue
 
-        if not any_data:
-            ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center")
-        ax.axhline(UPPER_THRESHOLD, color="red",  linestyle="--", linewidth=1.2, alpha=0.8)
-        ax.axhline(LOWER_THRESHOLD, color="blue", linestyle="--", linewidth=1.2, alpha=0.8)
-        xlim = ax.get_xlim()
-        ax.fill_between([xlim[0], xlim[1] if xlim[1] > 0 else 20],
-                        LOWER_THRESHOLD, UPPER_THRESHOLD, alpha=0.06, color="green")
-        ax.set_xlabel("Time (minutes)")
-        ax.set_ylabel("EMA Response Time (s)")
-        ax.set_title(title)
-        upper_m = mpatches.Patch(color="grey", label="▲ Upper violation")
-        lower_m = mpatches.Patch(color="grey", label="▼ Lower violation")
-        handles, _ = ax.get_legend_handles_labels()
-        ax.legend(handles=handles + [upper_m, lower_m], fontsize=7,
-                  loc="upper right", ncol=2)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+            fig, ax = plt.subplots(figsize=(10, 4))
+            line, = ax.plot(times, emas, color="#4C72B0", linewidth=1.5, alpha=0.9)
+            if viol_upper_t:
+                ax.scatter(viol_upper_t, viol_upper_v, color="#C44E52",
+                           marker="^", s=40, alpha=0.9, zorder=5, label="▲ Upper violation")
+            if viol_lower_t:
+                ax.scatter(viol_lower_t, viol_lower_v, color="#4878CF",
+                           marker="v", s=40, alpha=0.9, zorder=5, label="▼ Lower violation")
 
-    fig.suptitle("EMA Response Time Over Time (▲ upper violation  ▼ lower violation)", fontsize=12)
-    plt.tight_layout()
-    _save(fig, "fig_07_ema_response_time")
+            ax.axhline(UPPER_THRESHOLD, color="red",  linestyle="--", linewidth=1.2,
+                       alpha=0.8, label=f"Upper threshold ({UPPER_THRESHOLD}s)")
+            ax.axhline(LOWER_THRESHOLD, color="blue", linestyle="--", linewidth=1.2,
+                       alpha=0.8, label=f"Lower threshold ({LOWER_THRESHOLD}s)")
+            x_end = max(times) if times else 30
+            ax.fill_between([0, x_end], LOWER_THRESHOLD, UPPER_THRESHOLD,
+                            alpha=0.07, color="green", label="Target band")
+            ax.set_xlabel("Time (minutes)")
+            ax.set_ylabel("EMA Response Time (s)")
+            ax.set_title(f"EMA Response Time — {SHORT_LABELS.get(name, name)}\n"
+                         f"(▲ upper violation  ▼ lower violation)")
+            ax.legend(fontsize=8, loc="upper right")
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+            plt.tight_layout()
+            _save(fig, f"fig_07_{name}_ema_response_time")
+            generated += 1
+        except Exception:
+            continue
+
+    if generated == 0:
+        print("  No EMA timeline files produced any data — skipping Figure 7")
 
 
 # ── Figure 8 — Time-Normalised ISR ───────────────────────────────────────────
@@ -692,7 +692,7 @@ def _load_pod_memory(exp_name: str, service_prefix: str = "microservice3") -> li
     return runs
 
 
-def _load_node_cpu(exp_name: str) -> list:
+def _load_node_cpu(exp_name: str) -> dict:
     """
     Load per-node CPU data for a single run (run1 as representative).
 
@@ -1036,18 +1036,16 @@ def main():
     print(f"Loaded summaries for: {list(summaries.keys())}\n")
 
     steps = [
-        ("Figure 1  — Intent Satisfaction Rate",      fig_intent_satisfaction_rate),
-        ("Figure 2  — Violation Resolution",           fig_violation_resolution),
-        ("Figure 3  — Action Type Distribution",       fig_action_type_distribution),
-        ("Figure 4  — Inference Latency",              fig_inference_latency),
-        ("Figure 5  — Token Usage",                    fig_token_usage),
-        ("Figure 6  — Locust p95 Response Curve",      fig_locust_p95_curve),
-        ("Figure 7  — EMA Response Time Over Time",    fig_ema_response_time),
-        ("Figure 8  — Time-Normalised ISR",            fig_time_normalised_isr),
-        ("Figure 9  — EMA Time-in-Band",               fig_ema_time_in_band),
+        ("Figure 1  — Intent Satisfaction Rate",        fig_intent_satisfaction_rate),
+        ("Figure 2  — Violation Resolution",             fig_violation_resolution),
+        ("Figure 3  — Action Type Distribution",         fig_action_type_distribution),
+        ("Figure 4  — Inference Latency",                fig_inference_latency),
+        ("Figure 5  — Token Usage",                      fig_token_usage),
+        ("Figure 7  — EMA Response Time (per scenario)", fig_ema_response_time),
+        ("Figure 9  — EMA Time-in-Band",                 fig_ema_time_in_band),
         ("Figure 10 — Pod CPU Over Time (all services)", fig_pod_cpu_over_time),
-        ("Figure 11 — Node CPU Over Time",              fig_node_cpu_over_time),
-        ("Figure 12 — Node Memory Over Time",           fig_node_memory_over_time),
+        ("Figure 11 — Node CPU Over Time",               fig_node_cpu_over_time),
+        ("Figure 12 — Node Memory Over Time",            fig_node_memory_over_time),
         ("Figure 13 — Pod Memory Over Time (all services)", fig_pod_memory_over_time),
     ]
 
