@@ -272,8 +272,11 @@ def fig_violation_resolution(summaries: dict) -> None:
 # ── Figure 3 — Action Type Distribution ──────────────────────────────────────
 
 def fig_action_type_distribution(summaries: dict) -> None:
+    # Exclude monitor-only conditions (no LLM actions to show) and the cloud LLM
+    # baseline (handled separately in latency/token figures).
+    _no_actions = {"exp_01_baseline", "exp_hpa_baseline", "exp_09_cloud_llm_baseline"}
     names = [n for n in EXPERIMENT_ORDER
-             if n in summaries and n not in ("exp_01_baseline", "exp_09_cloud_llm_baseline")]
+             if n in summaries and n not in _no_actions]
     if not names:
         print("  No action-type data available yet — skipping Figure 3")
         return
@@ -375,7 +378,7 @@ def fig_token_usage(summaries: dict) -> None:
 
 def fig_locust_p95_curve(summaries: dict) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(16, 5), sharey=False)
-    titles = ["Normal Load (exp_01–09)", "Stress Load (exp_10–12)"]
+    titles = ["Normal Load (Ablation Suite)", "Stress Load (exp_10–12)"]
     groups = [ABLATION_ORDER, STRESS_ORDER]
 
     for ax, group, title in zip(axes, groups, titles):
@@ -426,7 +429,7 @@ def fig_locust_p95_curve(summaries: dict) -> None:
 
 def fig_ema_response_time(summaries: dict) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(16, 5), sharey=False)
-    titles = ["Normal Load (exp_01–09)", "Stress Load (exp_10–12)"]
+    titles = ["Normal Load (Ablation Suite)", "Stress Load (exp_10–12)"]
     groups = [ABLATION_ORDER, STRESS_ORDER]
 
     for ax, group, title in zip(axes, groups, titles):
