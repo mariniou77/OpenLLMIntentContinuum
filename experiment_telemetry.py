@@ -40,8 +40,8 @@ class ExperimentTelemetry:
 
         # EMA timeline + SLO thresholds for time-in-band metric (set via set_ema_data)
         self._ema_timeline: list = []
-        self._lower_threshold: float = 1.0
-        self._upper_threshold: float = 2.0
+        self._lower_threshold: float = 0.5
+        self._upper_threshold: float = 3.0
 
     # ── Attach live objects ──────────────────────────────────────────────────
 

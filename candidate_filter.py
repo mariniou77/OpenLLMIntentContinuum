@@ -21,6 +21,7 @@ reasoning names one service but the selected letter maps to a different one.
 """
 
 import logging
+import random
 from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -158,6 +159,9 @@ class CandidateFilter:
                 "returning full list as fallback to avoid empty decision"
             )
             return candidates
+
+        # Shuffle before re-lettering to eliminate residual position bias
+        random.shuffle(valid)
 
         # Re-assign sequential IDs so the LLM sees a compact A/B/C list
         filtered = []

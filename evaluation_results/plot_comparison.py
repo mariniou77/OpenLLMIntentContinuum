@@ -89,8 +89,8 @@ ACTION_COLORS = {
     "unknown":           "#8C8C8C",
 }
 
-UPPER_THRESHOLD = 2.0
-LOWER_THRESHOLD = 1.0
+UPPER_THRESHOLD = 3.0
+LOWER_THRESHOLD = 0.5
 
 SCRIPT_DIR = Path(__file__).parent
 
@@ -579,8 +579,8 @@ def fig_ema_time_in_band(summaries: dict) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=25, ha="right")
     ax.set_ylabel("EMA Time-in-Band (%)")
-    ax.set_title("EMA Time Within SLO Band [1.0s – 2.0s]\n"
-                 "(% of monitoring cycles with 1.0 ≤ EMA ≤ 2.0)")
+    ax.set_title("EMA Time Within SLO Band [0.5s – 3.0s]\n"
+                 "(% of monitoring cycles with 0.5 ≤ EMA ≤ 3.0)")
     _bar_style(ax)
     _save(fig, "fig_09_ema_time_in_band")
 

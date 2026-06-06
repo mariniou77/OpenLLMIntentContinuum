@@ -39,6 +39,20 @@ def _to_millicores(cpu_str: str) -> int:
         return -1
 
 
+# Expected pod-to-node placement (locked via nodeSelector in deployment.yml.j2)
+EXPECTED_POD_PLACEMENT = {
+    "microservice1-deployment": "worker2",
+    "microservice2-deployment": "worker1",
+    "microservice3-deployment": "worker1",
+    "microservice4-deployment": "worker2",
+    "db-deployment":            "master",
+}
+
+# Pod idle threshold: all microservice + db pods must be below this CPU (millicores)
+# before an experiment run starts.
+POD_IDLE_CPU_THRESHOLD_M = 20
+
+
 # ── Verification ─────────────────────────────────────────────────────────────
 
 def verify_cluster(config_path: str = "config.yaml") -> bool:
@@ -103,27 +117,88 @@ def verify_cluster(config_path: str = "config.yaml") -> bool:
             f"  pods_running={running_pods} {p_mark}"
         )
 
-    # --- node CPU total ---
+    # --- pod placement ---
+    # Verify each deployment's running pod is on its expected node (locked by nodeSelector).
+    # A mismatch means the nodeSelector was removed or the scheduler placed the pod elsewhere.
+    print()
+    placement_all_ok = True
+    r = ssh_cmd(user, master, "kubectl get pods -o wide --no-headers 2>/dev/null")
+    pod_nodes: dict = {}
+    for line in r.stdout.strip().splitlines():
+        parts = line.split()
+        # columns: NAME READY STATUS RESTARTS AGE IP NODE ...
+        if len(parts) >= 7:
+            pod_name = parts[0]
+            node_name = parts[6]
+            for dep_name in EXPECTED_POD_PLACEMENT:
+                app = dep_name.replace("-deployment", "")
+                if pod_name.startswith(app + "-") or pod_name.startswith(
+                    dep_name.replace("-deployment", "-dep")
+                ):
+                    pod_nodes[dep_name] = node_name
+
+    for dep_name, expected_node in EXPECTED_POD_PLACEMENT.items():
+        actual_node = pod_nodes.get(dep_name, "?")
+        ok = actual_node == expected_node
+        if not ok:
+            all_pass = False
+            placement_all_ok = False
+        mark = "✓" if ok else "✗"
+        status = "PASS" if ok else "FAIL"
+        print(
+            f"  [{status}] {dep_name:<40}  node={actual_node} "
+            f"(exp {expected_node}) {mark}"
+        )
+
+    if not placement_all_ok:
+        print("  ⚠  Pod placement mismatch — re-apply nodeSelectors and rollout restart.")
+
+    # --- pod CPU idle gate (replaces unreliable total-node-CPU check) ---
+    # All microservice and db pods must be idle (< POD_IDLE_CPU_THRESHOLD_M)
+    # before we declare the cluster ready.  Node CPU is logged for information
+    # but does NOT gate the pass/fail — master idles at 250–300m from K3s
+    # control-plane overhead regardless of application load.
+    print()
+    r = ssh_cmd(user, master, "kubectl top pods -n default --no-headers 2>/dev/null")
+    pod_cpu_ok = True
+    pod_cpu_lines = []
+    for line in r.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        pod_name, cpu_str, _ = parts[0], parts[1], parts[2]
+        cpu_m = _to_millicores(cpu_str)
+        is_app_pod = any(
+            pod_name.startswith(dep.replace("-deployment", ""))
+            for dep in EXPECTED_POD_PLACEMENT
+        )
+        if not is_app_pod:
+            continue
+        idle = cpu_m < POD_IDLE_CPU_THRESHOLD_M
+        if not idle:
+            pod_cpu_ok = False
+            all_pass = False
+        mark = "✓" if idle else "⚠"
+        pod_cpu_lines.append(f"{pod_name}={cpu_str}{mark}")
+
+    idle_status = "PASS" if pod_cpu_ok else "WARN"
+    idle_summary = "  ".join(pod_cpu_lines) if pod_cpu_lines else "no data"
+    print(
+        f"  [{idle_status}] Pod CPU idle (< {POD_IDLE_CPU_THRESHOLD_M}m): "
+        f"{idle_summary}"
+    )
+    if not pod_cpu_ok:
+        print(f"  ⚠  Some pods are still active — wait and re-verify before starting run.")
+
+    # --- node CPU (informational only, does not gate pass/fail) ---
     r = ssh_cmd(user, master, "kubectl top nodes --no-headers 2>/dev/null")
-    total_cpu = 0
     node_lines = []
     for line in r.stdout.strip().splitlines():
         parts = line.split()
         if len(parts) >= 2:
-            m = _to_millicores(parts[1])
-            total_cpu += m
             node_lines.append(f"{parts[0]}={parts[1]}")
-
-    cpu_stable = total_cpu < 500
-    if not cpu_stable:
-        all_pass = False
-    cpu_status = "PASS" if cpu_stable else "WARN"
-    cpu_mark = "✓" if cpu_stable else "⚠"
     nodes_str = "  ".join(node_lines) if node_lines else "unavailable"
-    print(
-        f"  [{cpu_status}] Node CPU total: {total_cpu}m < 500m threshold {cpu_mark}"
-        f"  ({nodes_str})"
-    )
+    print(f"  [INFO] Node CPU (informational): {nodes_str}")
 
     # --- no stray HPA objects ---
     r = ssh_cmd(user, master,

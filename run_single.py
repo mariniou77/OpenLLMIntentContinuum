@@ -60,7 +60,7 @@ HPA_EXP_DEF = {
     },
 }
 
-DEFAULT_RESULTS_ROOT = "evaluation_results/5th_experiment"
+DEFAULT_RESULTS_ROOT = "evaluation_results/6th_experiment"
 
 
 # ── HPA lifecycle helpers ────────────────────────────────────────────────────
@@ -125,7 +125,7 @@ def main() -> None:
              "When run-id == total-runs, auto-aggregates all runs into {exp_key}_agg/."
     )
     parser.add_argument(
-        "--total-runs", type=int, default=2, metavar="N",
+        "--total-runs", type=int, default=3, metavar="N",
         help="Total number of repeats planned for this scenario. "
              "Aggregation fires automatically when run-id == total-runs (default: 2)."
     )
