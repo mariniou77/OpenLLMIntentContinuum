@@ -60,24 +60,24 @@ HPA_EXP_DEF = {
     },
 }
 
-DEFAULT_RESULTS_ROOT = "evaluation_results/6th_experiment"
+DEFAULT_RESULTS_ROOT = "evaluation_results/7th_experiment"
 
 
 # ── HPA lifecycle helpers ────────────────────────────────────────────────────
 
 def _create_hpa(user: str, master: str) -> None:
-    """Create HPA objects (40% CPU target) for all 4 deployments on the K8s master."""
+    """Create HPA objects (20% CPU target) for all 4 deployments on the K8s master."""
     hpa_specs = [
         ("microservice1-deployment", 1, 5),
         ("microservice2-deployment", 1, 5),
         ("microservice3-deployment", 1, 5),
         ("microservice4-deployment", 1, 3),
     ]
-    print("  Creating HPA objects (40% CPU target)...")
+    print("  Creating HPA objects (20% CPU target)...")
     for dep, min_rep, max_rep in hpa_specs:
         cmd = (
             f"kubectl autoscale deployment {dep}"
-            f" --cpu-percent=40 --min={min_rep} --max={max_rep}"
+            f" --cpu-percent=20 --min={min_rep} --max={max_rep}"
         )
         result = ssh_cmd(user, master, cmd)
         status = "created" if result.returncode == 0 else f"FAILED: {result.stderr.strip()}"
