@@ -23,10 +23,10 @@ from datetime import datetime, timedelta
 
 from data_collector import DataCollector
 from decision_maker import DecisionMaker
-from decision_history import DecisionHistory
+
 from action_executor import ActionExecutor
 from candidate_generator import CandidateActionGenerator
-from candidate_filter import CandidateFilter
+
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +74,10 @@ class IntentWatchLoop:
                 self.data_collector.k8s_client,
                 self.data_collector.onos_client
             )
-            self.candidate_filter = CandidateFilter(config)
         else:
             self.decision_maker = None
             self.candidate_generator = None
             self.action_executor = None
-            self.candidate_filter = None
-
-        # Decision history
-        max_history = config.get("history", {}).get("max_entries", 5)
-        self.decision_history = DecisionHistory(max_entries=max_history)
 
         # EMA state
         self.ema_rt: Optional[float] = None
@@ -232,12 +226,9 @@ class IntentWatchLoop:
 
         assert self.ema_rt is not None
         assert self.candidate_generator is not None
-        assert self.candidate_filter is not None
         assert self.decision_maker is not None
         assert self.action_executor is not None
 
-        logger.warning(f"History: {self.decision_history.get_history_count()} previous decisions")
-        
         # Step 1: Collect raw system data
         logger.info("Collecting system data...")
         system_state = self.data_collector.collect_all()
@@ -266,25 +257,8 @@ class IntentWatchLoop:
         for c in candidate_actions:
             logger.info(f"  [{c['id']}] {c['type']} → {c.get('target', c.get('description', 'n/a'))}")
         
-        # Step 4: Update outcome of previous decision and get history
-        self.decision_history.update_pending_outcome_before_prompt(
-            current_rt=current_rt,
-            current_ema=self.ema_rt,
-            violation_type=violation_type
-        )
-        # Also update structured history outcome
-        self.decision_history.update_last_structured_outcome("violation_persisted")
-
-        history_entries = self.decision_history.get_structured_history()
-
-        # Step 4b: Hybrid filter — enforce Rule 3 in Python before the LLM
-        # sees the candidates.  Removes (action_type, target) pairs that
-        # already appeared in history with result=violation_persisted.
-        # Re-letters the remaining candidates A/B/C/... so the LLM sees a
-        # compact list without gaps.
-        filtered_candidates = self.candidate_filter.filter(
-            candidate_actions, history_entries
-        )
+        # Step 4: Pass candidates directly to LLM (stateless — no history)
+        filtered_candidates = candidate_actions
 
         # No candidates at all (e.g. single-action ablation with trigger condition unmet)
         if not filtered_candidates:
@@ -300,25 +274,15 @@ class IntentWatchLoop:
                     f"{c.get('target', c.get('description', 'n/a'))}"
                 )
 
-        # Step 5: Query LLM with 8-message format (filtered candidates)
-        logger.info("Querying LLM for recommendation (8-msg format)...")
+        # Step 5: Query LLM (stateless snapshot — no history injected)
+        logger.info("Querying LLM for recommendation...")
         recommendation = self.decision_maker.analyze_and_recommend(
             violation_type=violation_type,
             current_rt=current_rt,
             ema_rt=self.ema_rt,
             structured_state=structured_state,
             candidate_actions=filtered_candidates,
-            history_entries=history_entries
         )
-
-        # Step 5b: Post-selection validation — catch position bias where the
-        # LLM's reasoning identified a valid service but the selected letter
-        # resolved to a candidate outside the filtered set.
-        recommendation, was_overridden = self.candidate_filter.validate_selection(
-            recommendation, filtered_candidates
-        )
-        if was_overridden:
-            logger.warning("Hybrid filter: position-bias correction applied")
 
         logger.info(f"Recommended Action: {recommendation.get('action', 'none')}")
         if recommendation.get('parameters'):
@@ -428,36 +392,6 @@ class IntentWatchLoop:
         else:
             logger.info("No action recommended by LLM")
         
-        # Step 7: Save to both legacy and structured history
-        self.decision_history.add_entry(
-            violation_type=violation_type,
-            response_time=current_rt,
-            ema_response_time=self.ema_rt if self.ema_rt else current_rt,
-            monitoring_summary=monitoring_str,
-            deployments_summary=deployments_str,
-            decision={
-                "action": recommendation.get("action", "none"),
-                "parameters": recommendation.get("parameters", {})
-            }
-        )
-        
-        # Build and save structured history entry for 8-msg format.
-        # Match against filtered_candidates (what the LLM actually saw).
-        selected_candidate = filtered_candidates[0] if filtered_candidates else {}
-        for c in filtered_candidates:
-            executor_action = self.decision_maker._candidate_to_executor_action(c)
-            if (executor_action.get("action") == recommendation.get("action") and
-                executor_action.get("parameters", {}).get("deployment_name") ==
-                recommendation.get("parameters", {}).get("deployment_name")):
-                selected_candidate = c
-                break
-        
-        structured_entry = self.decision_history.build_structured_entry(
-            structured_state=structured_state,
-            selected_candidate=selected_candidate,
-            candidate_actions=candidate_actions
-        )
-        self.decision_history.add_structured_entry(structured_entry)
     
     def run_once(self) -> dict:
         """
@@ -521,10 +455,7 @@ class IntentWatchLoop:
                 result["action_taken"] = True
         else:
             # No violation — if a previous violation was pending resolution, count it
-            had_pending = self._pending_violation
-            self.decision_history.finalize_pending_outcome(rt, self.ema_rt, is_violation=False)
-            self.decision_history.update_last_structured_outcome("violation_resolved")
-            if had_pending:
+            if self._pending_violation:
                 self.stats["violations_resolved"] += 1
                 self._pending_violation = False
 
@@ -564,7 +495,6 @@ class IntentWatchLoop:
         logger.info(f"Lower threshold: {self.lower_threshold}s")
         logger.info(f"Check interval: {self.check_interval}s")
         logger.info(f"EMA alpha: {self.ema_alpha}")
-        logger.info(f"Max history entries: {self.decision_history.max_entries}")
         if self.startup_grace_period > 0:
             logger.info(f"Startup grace period: {self.startup_grace_period}s (violations suppressed)")
         logger.info("=" * 60)
@@ -578,7 +508,6 @@ class IntentWatchLoop:
             logger.warning("Warm-up request failed, continuing anyway...")
         
         # Reset state for new experiment
-        self.decision_history.reset()
         self.ema_rt = None
         self.last_rt = None
         self._pending_violation = False
@@ -650,8 +579,8 @@ class IntentWatchLoop:
         # Return experiment results
         return {
             "stats": self.stats.copy(),
-            "history": self.decision_history.get_history(),
-            "all_structured_history": self.decision_history.get_all_structured_history(),
+            "history": [],
+            "all_structured_history": [],
             "llm_calls_log": self.decision_maker.get_llm_calls_log() if self.decision_maker else [],
             "ema_timeline": self.ema_timeline,
             "duration_minutes": duration_minutes,
@@ -729,7 +658,7 @@ class IntentWatchLoop:
         checkpoint_path = self._output_file + ".checkpoint.json"
         data = {
             "stats": self.stats.copy(),
-            "all_structured_history": self.decision_history.get_all_structured_history(),
+            "all_structured_history": [],
             "llm_calls_log": self.decision_maker.get_llm_calls_log() if self.decision_maker else [],
             "ema_timeline": self.ema_timeline,
             "_checkpoint": True,
@@ -756,9 +685,6 @@ class IntentWatchLoop:
         logger.info(f"Check interval: {self.check_interval}s")
         logger.info(f"EMA alpha: {self.ema_alpha}")
         logger.info("=" * 60)
-        
-        # Reset history for new run
-        self.decision_history.reset()
         
         self.running = True
         self.stats["start_time"] = datetime.now().isoformat()
@@ -816,12 +742,6 @@ class IntentWatchLoop:
         logger.info(f"  Start time: {self.stats['start_time']}")
         logger.info(f"  End time: {self.stats['end_time']}")
         
-        # Print decision history summary
-        if self.decision_history.has_history():
-            logger.info("  Decision History:")
-            for entry in self.decision_history.get_history():
-                logger.info(f"    - Violation #{entry['violation_number']}: {entry['decision']['action']}")
-        
         logger.info("=" * 60)
     
     def get_status(self) -> dict:
@@ -839,7 +759,6 @@ class IntentWatchLoop:
             "upper_threshold": self.upper_threshold,
             "lower_threshold": self.lower_threshold,
             "stats": self.stats.copy(),
-            "history_count": self.decision_history.get_history_count()
         }
     
     def get_decision_history(self) -> list:
@@ -849,4 +768,4 @@ class IntentWatchLoop:
         Returns:
             List of decision history entries
         """
-        return self.decision_history.get_history()
+        return []
