@@ -230,6 +230,12 @@ class IntentWatchLoop:
             logger.info("[MONITOR-ONLY] Violation logged — no LLM query or action taken")
             return
 
+        assert self.ema_rt is not None
+        assert self.candidate_generator is not None
+        assert self.candidate_filter is not None
+        assert self.decision_maker is not None
+        assert self.action_executor is not None
+
         logger.warning(f"History: {self.decision_history.get_history_count()} previous decisions")
         
         # Step 1: Collect raw system data
@@ -323,7 +329,7 @@ class IntentWatchLoop:
         if recommendation.get("action") != "none":
             logger.info("Executing recommended action...")
             result = self.action_executor.execute(
-                action=recommendation.get("action"),
+                action=recommendation["action"],
                 parameters=recommendation.get("parameters", {}),
                 analysis=""
             )
@@ -483,6 +489,7 @@ class IntentWatchLoop:
 
         # Update EMA
         self._update_ema(rt)
+        assert self.ema_rt is not None
         result["ema_rt"] = self.ema_rt
 
         # Record EMA timeline point (used for Figure 7 EMA response-time plots)
@@ -671,6 +678,7 @@ class IntentWatchLoop:
             rt = self._measure_response_time()
             if rt is not None:
                 self._update_ema(rt)
+                assert self.ema_rt is not None
                 self.ema_timeline.append({
                     "timestamp": datetime.now().isoformat(),
                     "rt": round(rt, 3),

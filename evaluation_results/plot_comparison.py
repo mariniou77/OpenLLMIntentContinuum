@@ -1024,6 +1024,227 @@ def fig_pod_memory_over_time(summaries: dict) -> None:
     _save(fig, "fig_13_pod_memory_over_time")
 
 
+# ── Paper-Style Figures (IntentContinuum paper replication) ──────────────────
+
+LOAD_STAGES_SEQ = [10, 20, 15, 10, 5, 20, 10]
+_STAGE_DUR_S = 120
+_STAGE_BOUNDS_S = [i * _STAGE_DUR_S for i in range(len(LOAD_STAGES_SEQ))]
+_EXP_TOTAL_S = 900
+_STAGE_CENTERS_S = [
+    (_STAGE_BOUNDS_S[i] + (_STAGE_BOUNDS_S[i + 1] if i + 1 < len(_STAGE_BOUNDS_S) else _EXP_TOTAL_S)) / 2
+    for i in range(len(LOAD_STAGES_SEQ))
+]
+
+# Line styles matching paper Fig 7 (drawn worst→best so Full System lands on top)
+_FIG7_SCENARIO_STYLES = [
+    ("exp_01_baseline", dict(
+        color="#1f77b4", linestyle=":", linewidth=1.3,
+        label="Baseline (No Management)")),
+    ("exp_hpa_baseline", dict(
+        color="#ff7f0e", linestyle="--", linewidth=1.3,
+        marker="x", markersize=5, markevery=15,
+        label="HPA (K8s, 40%)")),
+    ("exp_09_cloud_llm_baseline", dict(
+        color="#2ca02c", linestyle="--", linewidth=1.3,
+        marker="D", markersize=4, markevery=15,
+        label="Cloud LLM (GPT-4o)")),
+    ("exp_08_full_system", dict(
+        color="red", linestyle="-", linewidth=1.5,
+        marker="o", markersize=3, markevery=15,
+        label="Full System (Qwen 3.5:4b)")),
+]
+
+
+def _load_ema_seconds(exp_name: str) -> tuple:
+    """Load EMA timeline → (times_s, emas) with x-axis in seconds. Returns ([], []) if unavailable."""
+    from datetime import datetime as _dt
+    timeline = load_ema_timeline(exp_name)
+    times, emas = [], []
+    t0 = None
+    for pt in timeline:
+        ema = pt.get("ema")
+        if ema is None:
+            continue
+        try:
+            ts = _dt.fromisoformat(pt.get("timestamp", ""))
+        except ValueError:
+            continue
+        if t0 is None:
+            t0 = ts
+        times.append((ts - t0).total_seconds())
+        emas.append(ema)
+    return times, emas
+
+
+def _draw_load_stage_markers(ax) -> None:
+    """Green vertical lines at stage boundaries + load-count numbers above the plot (paper style)."""
+    trans = ax.get_xaxis_transform()
+    for bnd in _STAGE_BOUNDS_S[1:]:
+        ax.axvline(bnd, color="green", linestyle="-", linewidth=0.8, alpha=0.8, zorder=1)
+    for center, load in zip(_STAGE_CENTERS_S, LOAD_STAGES_SEQ):
+        ax.text(center, 1.03, str(load), transform=trans,
+                ha="center", va="bottom", color="green",
+                fontsize=9, fontweight="bold", clip_on=False)
+
+
+def fig_paper_ema_single_run(summaries: dict) -> None:
+    """
+    Paper Fig 5 style: EMA_RT over time for the Full System run 1 only.
+    Red EMA_RT line, blue Max/Min threshold lines, green load-stage markers at top.
+    """
+    times, emas = _load_ema_seconds("exp_08_full_system")
+    if not times:
+        print("  No EMA data for exp_08_full_system — skipping Paper Fig A (EMA single run)")
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    _draw_load_stage_markers(ax)
+
+    ax.plot(times, emas, color="red", linewidth=1.5, label="EMA_RT", zorder=3)
+    ax.axhline(UPPER_THRESHOLD, color="blue", linewidth=1.5, zorder=2)
+    ax.axhline(LOWER_THRESHOLD, color="blue", linewidth=1.5, zorder=2)
+    ax.text(_EXP_TOTAL_S, UPPER_THRESHOLD, "  Max", color="blue",
+            ha="left", va="center", fontsize=8, clip_on=False)
+    ax.text(_EXP_TOTAL_S, LOWER_THRESHOLD, "  Min", color="blue",
+            ha="left", va="center", fontsize=8, clip_on=False)
+
+    ax.set_xlim(0, _EXP_TOTAL_S)
+    ax.set_ylim(0, max(max(emas) * 1.2, UPPER_THRESHOLD * 1.5))
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Response Time (s)")
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    _save(fig, "fig_paper_A_ema_single_run")
+
+
+def fig_paper_ema_all_scenarios(summaries: dict) -> None:
+    """
+    Paper Fig 7 style: EMA_RT for all 4 scenarios overlaid on one plot.
+    Line colors and styles match IntentContinuum paper Fig 7 exactly.
+    Full System (red solid) is drawn last so it appears on top.
+    """
+    fig, ax = plt.subplots(figsize=(7, 4))
+    _draw_load_stage_markers(ax)
+
+    any_data = False
+    y_max = UPPER_THRESHOLD * 1.5
+    for exp_name, style in _FIG7_SCENARIO_STYLES:
+        if exp_name not in summaries:
+            continue
+        times, emas = _load_ema_seconds(exp_name)
+        if not times:
+            continue
+        ax.plot(times, emas, **style)  # type: ignore[arg-type]
+        y_max = max(y_max, max(emas) * 1.1)
+        any_data = True
+
+    if not any_data:
+        print("  No EMA timeline data — skipping Paper Fig B (EMA all scenarios)")
+        plt.close(fig)
+        return
+
+    ax.axhline(UPPER_THRESHOLD, color="blue", linewidth=1.5, zorder=1)
+    ax.axhline(LOWER_THRESHOLD, color="blue", linewidth=1.5, zorder=1)
+    ax.text(_EXP_TOTAL_S, UPPER_THRESHOLD, "  Max", color="blue",
+            ha="left", va="center", fontsize=8, clip_on=False)
+    ax.text(_EXP_TOTAL_S, LOWER_THRESHOLD, "  Min", color="blue",
+            ha="left", va="center", fontsize=8, clip_on=False)
+
+    ax.set_xlim(0, _EXP_TOTAL_S)
+    ax.set_ylim(0, y_max)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Response Time (s)")
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    _save(fig, "fig_paper_B_ema_all_scenarios")
+
+
+def _total_mean_resources(exp_name: str) -> tuple:
+    """
+    Time-averaged CPU (cores) and Memory (MiB) summed across all 4 microservice pods.
+    Returns (cpu_cores, mem_mib) or (None, None) if k8s_pod_resources.csv is unavailable.
+    """
+    total_cpu, total_mem, has_data = 0.0, 0.0, False
+    for svc_prefix, _ in SERVICES:
+        cpu_runs = _load_pod_cpu(exp_name, service_prefix=svc_prefix)
+        mem_runs = _load_pod_memory(exp_name, service_prefix=svc_prefix)
+        if cpu_runs:
+            total_cpu += np.mean([np.mean(r["cpu_m"]) for r in cpu_runs]) / 1000
+            has_data = True
+        if mem_runs:
+            total_mem += np.mean([np.mean(r["mem_mi"]) for r in mem_runs])
+    return (total_cpu, total_mem) if has_data else (None, None)
+
+
+def fig_paper_resource_usage(summaries: dict) -> None:
+    """
+    Paper Fig 8 style: total normalised CPU (cores) + Memory (MiB) per scenario.
+    Dual y-axis. CPU = red dotted-hatch bars (left axis).
+    Memory = teal diagonal-hatch bars (right axis).
+    Order: Baseline → HPA → Cloud LLM → Full System (worst to best, matching paper direction).
+    """
+    order = [
+        ("exp_01_baseline",          "Baseline\n(No Mgmt)"),
+        ("exp_hpa_baseline",          "HPA\n(K8s, 40%)"),
+        ("exp_09_cloud_llm_baseline", "Cloud LLM\n(GPT-4o)"),
+        ("exp_08_full_system",        "Full System\n(Qwen 3.5:4b)"),
+    ]
+    labels, cpu_vals, mem_vals = [], [], []
+    for exp_name, label in order:
+        if exp_name not in summaries:
+            continue
+        cpu, mem = _total_mean_resources(exp_name)
+        if cpu is None:
+            continue
+        labels.append(label)
+        cpu_vals.append(cpu)
+        mem_vals.append(mem)
+
+    if not labels:
+        print("  No k8s resource data (k8s_pod_resources.csv) — skipping Paper Fig C (resource usage)")
+        return
+
+    x = np.arange(len(labels))
+    width = 0.35
+    fig, ax1 = plt.subplots(figsize=(7, 4))
+    ax2 = ax1.twinx()
+
+    bars1 = ax1.bar(x - width / 2, cpu_vals, width,
+                    facecolor="#E05C40", hatch="..", edgecolor="black", linewidth=0.5,
+                    label="CPU (core)", zorder=3)
+    bars2 = ax2.bar(x + width / 2, mem_vals, width,
+                    facecolor="#3DBFBF", hatch="//", edgecolor="black", linewidth=0.5,
+                    label="Mem (MiB)", zorder=3)
+
+    for val, bar in zip(cpu_vals, bars1):
+        ax1.text(bar.get_x() + bar.get_width() / 2,
+                 val + max(cpu_vals) * 0.02,
+                 f"{val:.2f}", ha="center", va="bottom", fontsize=9)
+    for val, bar in zip(mem_vals, bars2):
+        ax2.text(bar.get_x() + bar.get_width() / 2,
+                 val + max(mem_vals) * 0.02,
+                 f"{int(val)}", ha="center", va="bottom", fontsize=9)
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, fontsize=8)
+    ax1.set_ylabel("CPU (core)", color="#E05C40")
+    ax1.tick_params(axis="y", labelcolor="#E05C40")
+    ax2.set_ylabel("Mem (MiB)", color="#1A9A9A")
+    ax2.tick_params(axis="y", labelcolor="#1A9A9A")
+    ax1.set_ylim(0, max(cpu_vals) * 1.3)
+    ax2.set_ylim(0, max(mem_vals) * 1.3)
+
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=8)
+    ax1.yaxis.grid(True, linestyle="--", alpha=0.4, zorder=0)
+    ax1.set_axisbelow(True)
+    plt.tight_layout()
+    _save(fig, "fig_paper_C_resource_usage")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1047,6 +1268,9 @@ def main():
         ("Figure 11 — Node CPU Over Time",               fig_node_cpu_over_time),
         ("Figure 12 — Node Memory Over Time",            fig_node_memory_over_time),
         ("Figure 13 — Pod Memory Over Time (all services)", fig_pod_memory_over_time),
+        ("Paper Fig A — EMA Single Run, Full System (paper Fig 5 style)",  fig_paper_ema_single_run),
+        ("Paper Fig B — EMA All Scenarios overlaid (paper Fig 7 style)",   fig_paper_ema_all_scenarios),
+        ("Paper Fig C — Normalised Resource Usage (paper Fig 8 style)",    fig_paper_resource_usage),
     ]
 
     for title, fn in steps:

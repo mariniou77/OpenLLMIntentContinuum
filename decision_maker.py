@@ -856,7 +856,7 @@ JSON:"""
         )
         return base_messages + [{"role": "user", "content": retry_msg}]
     
-    def _validate_action(self, action: dict, cluster_data: dict = None) -> tuple:
+    def _validate_action(self, action: dict, cluster_data: Optional[dict] = None) -> tuple:
         """
         Validate a parsed action against known constraints.
         Rejects actions that would set the same values as currently applied.
@@ -962,7 +962,7 @@ JSON:"""
         
         return True, ""
     
-    def _get_current_deployment_state(self, dep_name: str, cluster_data: dict = None) -> dict:
+    def _get_current_deployment_state(self, dep_name: str, cluster_data: Optional[dict] = None) -> dict:
         """Get current replicas and cpu_limit for a deployment from cluster data."""
         if not cluster_data:
             cluster_data = self._last_cluster_data or {}
@@ -1287,13 +1287,13 @@ JSON:"""
         violation_type: str,
         current_rt: float,
         ema_rt: float,
-        structured_state: dict = None,
-        candidate_actions: list = None,
-        history_entries: list = None,
+        structured_state: Optional[dict] = None,
+        candidate_actions: Optional[list] = None,
+        history_entries: Optional[list] = None,
         # Legacy parameters (kept for backward compat, unused in 8-msg mode)
-        cluster_data: dict = None,
-        network_data: dict = None,
-        monitoring_data: dict = None,
+        cluster_data: Optional[dict] = None,
+        network_data: Optional[dict] = None,
+        monitoring_data: Optional[dict] = None,
         history: str = "",
         monitoring_data_str: str = "",
         deployments_data: str = "",

@@ -201,6 +201,7 @@ def main() -> None:
 
     if is_hpa:
         print("\n  Removing HPA objects...")
+        assert hpa_user is not None and hpa_master is not None
         _delete_hpa(hpa_user, hpa_master)
 
     print(f"\n  ✅ Run complete — results in {os.path.join(results_root, run_name)}/")

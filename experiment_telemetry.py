@@ -159,7 +159,7 @@ class ExperimentTelemetry:
 
         mean_latency = round(statistics.mean(latencies), 1) if latencies else None
         p95_latency = round(
-            sorted(latencies)[int(len(latencies) * 0.95)] if len(latencies) >= 2 else (latencies[0] if latencies else None), 1
+            sorted(latencies)[int(len(latencies) * 0.95)] if len(latencies) >= 2 else latencies[0], 1
         ) if latencies else None
 
         # Action type breakdown from structured history
