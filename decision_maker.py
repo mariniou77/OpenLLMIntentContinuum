@@ -649,6 +649,11 @@ JSON:"""
             "messages": messages,
             "stream": False,
             "think": False,
+            # Pin the model in VRAM for the whole run. Ollama's default 5-min keep_alive evicts
+            # the model during idle gaps (e.g. the warm/low load phase), and the next decision then
+            # pays a ~13 s SSD->VRAM reload (observed: 14.5 s for a 128-token call after a 5-min gap),
+            # which both wrecks p95 inference latency AND leaves the system unmanaged while RT climbs.
+            "keep_alive": -1,
             "options": {
                 "temperature": self.temperature,
                 "num_predict": self.max_tokens,

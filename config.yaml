@@ -77,7 +77,7 @@ kubernetes:
       default_cpu: "300m"
       default_memory: "312Mi"
     - name: "microservice3-deployment"
-      min_replicas: 1
+      min_replicas: 2   # warm standby: never drop ms3 below 1 serving pod during a rollout/scale (SSD cold-start safety)
       max_replicas: 5
       default_cpu: "500m"
       default_memory: "1024Mi"
