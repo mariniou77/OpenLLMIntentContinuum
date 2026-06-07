@@ -21,7 +21,7 @@ Scenarios:
     baseline  ->  exp_01_baseline              (monitor-only, no LLM)
     full      ->  exp_08_full_system            (all actions, local Qwen3.5:4b)
     cloud     ->  exp_09_cloud_llm_baseline     (all actions, GPT-4o via OpenAI API)
-    hpa       ->  exp_hpa_baseline              (K8s HPA @ 40% CPU, no intent loop)
+    hpa       ->  exp_hpa_baseline              (K8s HPA @ 20% CPU, no intent loop)
 
 For the 'cloud' scenario, export OPENAI_API_KEY before running:
     export OPENAI_API_KEY=sk-...
@@ -60,7 +60,7 @@ HPA_EXP_DEF = {
     },
 }
 
-DEFAULT_RESULTS_ROOT = "evaluation_results/7th_experiment"
+DEFAULT_RESULTS_ROOT = "evaluation_results/9th_experiment"
 
 
 # ── HPA lifecycle helpers ────────────────────────────────────────────────────

@@ -4,10 +4,19 @@
 intent:
   upper_threshold: 3.0    # seconds - trigger scale UP if response time exceeds this
   lower_threshold: 0.5    # seconds - trigger scale DOWN if response time below this
-  ema_alpha: 0.2          # smoothing factor for Exponential Moving Average
+  ema_alpha: 0.1          # smoothing factor for Exponential Moving Average
   check_interval: 5       # seconds between checks
   wait_after_action: 60   # seconds to wait after taking an action (matches IntentContinuum paper)
   startup_grace_period_seconds: 30  # skip violation handling for first N seconds (avoids cold-start artefact)
+
+# Warm-up gate after add_replica (prevents the cold-pod cascade — see
+# intent_watch_loop._warm_new_replica_until_hot). A freshly added ms3 pod is marked Ready
+# 15-30s before its SSD model finishes loading (30-60s); a single LB warm-up usually hits the
+# OLD pod. We send several chain warm-ups and resume only once the new pod is provably hot.
+warmup:
+  warm_threshold_s: 2.0        # a replica is "hot" when a warm-up request returns faster than this
+  warm_min_requests_factor: 3  # send >= max(6, factor * replicas) warm-up requests
+  warm_max_seconds: 120        # hard cap so a genuinely stuck pod can't hang the loop
 
 # Endpoints
 endpoints:

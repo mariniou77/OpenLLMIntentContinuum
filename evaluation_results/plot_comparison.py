@@ -443,6 +443,7 @@ def fig_ema_response_time(summaries: dict) -> None:
             continue
         try:
             times, emas = [], []
+            rt_times, rts = [], []
             viol_upper_t, viol_upper_v = [], []
             viol_lower_t, viol_lower_v = [], []
             t0 = None
@@ -457,6 +458,10 @@ def fig_ema_response_time(summaries: dict) -> None:
                 elapsed = (ts - t0).total_seconds() / 60
                 times.append(elapsed)
                 emas.append(ema)
+                rt_val = point.get("rt")
+                if rt_val is not None:
+                    rt_times.append(elapsed)
+                    rts.append(rt_val)
 
                 vtype = point.get("violation")
                 if not point.get("grace_period") and not point.get("cooldown"):
@@ -471,7 +476,12 @@ def fig_ema_response_time(summaries: dict) -> None:
                 continue
 
             fig, ax = plt.subplots(figsize=(10, 4))
-            line, = ax.plot(times, emas, color="#4C72B0", linewidth=1.5, alpha=0.9)
+            # Raw per-request RT drawn faintly underneath the smoothed EMA line (independent series).
+            if rts:
+                ax.plot(rt_times, rts, color="#AAAAAA", linewidth=0.8, alpha=0.55,
+                        zorder=1, label="Raw RT (per request)")
+            line, = ax.plot(times, emas, color="#4C72B0", linewidth=1.5, alpha=0.9,
+                            zorder=3, label="EMA RT")
             if viol_upper_t:
                 ax.scatter(viol_upper_t, viol_upper_v, color="#C44E52",
                            marker="^", s=40, alpha=0.9, zorder=5, label="▲ Upper violation")
@@ -487,8 +497,8 @@ def fig_ema_response_time(summaries: dict) -> None:
             ax.fill_between([0, x_end], LOWER_THRESHOLD, UPPER_THRESHOLD,
                             alpha=0.07, color="green", label="Target band")
             ax.set_xlabel("Time (minutes)")
-            ax.set_ylabel("EMA Response Time (s)")
-            ax.set_title(f"EMA Response Time — {SHORT_LABELS.get(name, name)}\n"
+            ax.set_ylabel("Response Time (s)")
+            ax.set_title(f"Raw + EMA Response Time — {SHORT_LABELS.get(name, name)}\n"
                          f"(▲ upper violation  ▼ lower violation)")
             ax.legend(fontsize=8, loc="upper right")
             ax.spines["top"].set_visible(False)
@@ -583,6 +593,48 @@ def fig_ema_time_in_band(summaries: dict) -> None:
                  "(% of monitoring cycles with 0.5 ≤ EMA ≤ 3.0)")
     _bar_style(ax)
     _save(fig, "fig_09_ema_time_in_band")
+
+
+# ── Figure 14 — Mean Time-to-Recovery (MTTR) ─────────────────────────────────
+
+def fig_mttr(summaries: dict) -> None:
+    """Mean seconds to recover from an upper-threshold violation (headline responsiveness; lower is better)."""
+    names  = [n for n in EXPERIMENT_ORDER if n in summaries]
+    labels = [SHORT_LABELS[n] for n in names]
+    values = [_val(summaries[n], "mttr_mean_s") or 0 for n in names]
+    errs   = [_std(summaries[n], "mttr_mean_s") or 0 for n in names]
+    colors = ["#c0c0c0" if n == "exp_01_baseline"
+              else "#E377C2" if n == "exp_09_cloud_llm_baseline"
+              else "#E88C1F" if n == "exp_hpa_baseline"
+              else "#8C8C8C" if n in STRESS_SET
+              else "#4C72B0"
+              for n in names]
+
+    x = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(x, values, color=colors, edgecolor="white", width=0.6,
+           hatch=[_stress_hatch(n) for n in names])
+    if any(e > 0 for e in errs):
+        ax.errorbar(x, values, yerr=errs, fmt="none", color="black",
+                    capsize=4, linewidth=1.2)
+
+    ymax = max(values) if any(v > 0 for v in values) else 1
+    for i, (val, err) in enumerate(zip(values, errs)):
+        if val > 0:
+            label = f"{val:.0f}s" if err == 0 else f"{val:.0f}s\n±{err:.0f}s"
+            ax.text(x[i], val + ymax * 0.02, label, ha="center", va="bottom", fontsize=8)
+
+    if any(n in STRESS_SET for n in names):
+        sep_idx = next(i for i, n in enumerate(names) if n in STRESS_SET)
+        ax.axvline(sep_idx - 0.5, color="gray", linestyle=":", linewidth=1)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.set_ylabel("Mean Time-to-Recovery (s)")
+    ax.set_title("MTTR — Mean Time to Recover from an Upper-Threshold Violation\n"
+                 "(EMA > 3.0s → EMA ≤ 3.0s; lower is better)")
+    _bar_style(ax)
+    _save(fig, "fig_14_mttr")
 
 
 # ── K8s Resource CSV helpers ─────────────────────────────────────────────────
@@ -1026,10 +1078,10 @@ def fig_pod_memory_over_time(summaries: dict) -> None:
 
 # ── Paper-Style Figures (IntentContinuum paper replication) ──────────────────
 
-LOAD_STAGES_SEQ = [10, 20, 15, 10, 5, 20, 10]
-_STAGE_DUR_S = 120
+LOAD_STAGES_SEQ = [10, 25, 15, 10, 5, 25, 10]
+_STAGE_DUR_S = 180
 _STAGE_BOUNDS_S = [i * _STAGE_DUR_S for i in range(len(LOAD_STAGES_SEQ))]
-_EXP_TOTAL_S = 900
+_EXP_TOTAL_S = 1260
 _STAGE_CENTERS_S = [
     (_STAGE_BOUNDS_S[i] + (_STAGE_BOUNDS_S[i + 1] if i + 1 < len(_STAGE_BOUNDS_S) else _EXP_TOTAL_S)) / 2
     for i in range(len(LOAD_STAGES_SEQ))
@@ -1043,7 +1095,7 @@ _FIG7_SCENARIO_STYLES = [
     ("exp_hpa_baseline", dict(
         color="#ff7f0e", linestyle="--", linewidth=1.3,
         marker="x", markersize=5, markevery=15,
-        label="HPA (K8s, 40%)")),
+        label="HPA (K8s, 20%)")),
     ("exp_09_cloud_llm_baseline", dict(
         color="#2ca02c", linestyle="--", linewidth=1.3,
         marker="D", markersize=4, markevery=15,
@@ -1187,7 +1239,7 @@ def fig_paper_resource_usage(summaries: dict) -> None:
     """
     order = [
         ("exp_01_baseline",          "Baseline\n(No Mgmt)"),
-        ("exp_hpa_baseline",          "HPA\n(K8s, 40%)"),
+        ("exp_hpa_baseline",          "HPA\n(K8s, 20%)"),
         ("exp_09_cloud_llm_baseline", "Cloud LLM\n(GPT-4o)"),
         ("exp_08_full_system",        "Full System\n(Qwen 3.5:4b)"),
     ]
@@ -1263,7 +1315,8 @@ def main():
         ("Figure 4  — Inference Latency",                fig_inference_latency),
         ("Figure 5  — Token Usage",                      fig_token_usage),
         ("Figure 7  — EMA Response Time (per scenario)", fig_ema_response_time),
-        ("Figure 9  — EMA Time-in-Band",                 fig_ema_time_in_band),
+        ("Figure 9  — EMA Time-in-Band (headline SLO metric)", fig_ema_time_in_band),
+        ("Figure 14 — MTTR (headline responsiveness metric)",  fig_mttr),
         ("Figure 10 — Pod CPU Over Time (all services)", fig_pod_cpu_over_time),
         ("Figure 11 — Node CPU Over Time",               fig_node_cpu_over_time),
         ("Figure 12 — Node Memory Over Time",            fig_node_memory_over_time),

@@ -58,6 +58,12 @@ class IntentWatchLoop:
         self.wait_after_action = intent_config["wait_after_action"]
         self.startup_grace_period = intent_config.get("startup_grace_period_seconds", 0)
 
+        # Warm-up gate after add_replica (prevents cold-pod cascade — see _warm_new_replica_until_hot)
+        warmup_config = config.get("warmup", {})
+        self._warm_threshold_s = warmup_config.get("warm_threshold_s", 2.0)
+        self._warm_min_requests_factor = warmup_config.get("warm_min_requests_factor", 3)
+        self._warm_max_seconds = warmup_config.get("warm_max_seconds", 120)
+
         # Application endpoint
         self.app_endpoint = config["application"]["entry_point"]
         self.test_image_path = config["application"].get("test_image")
@@ -403,26 +409,23 @@ class IntentWatchLoop:
                 else:
                     logger.warning("ms3 warm-up request failed — SSD model may still be cold")
 
-                # For add_replica: wait for new pod Ready then use shorter graduated cooldown.
-                # This prevents klipper-LB from routing traffic to a cold pod before it
-                # has loaded its model (root cause of exp_03 4% failure rate).
+                # For add_replica: wait for the new pod to be Ready, then warm EVERY replica
+                # (including the new cold one) before resuming. The previous single LB warm-up
+                # usually hit the OLD pod (klipper-LB picks endpoints ~uniformly), leaving the
+                # new pod to take live traffic before its SSD model loaded — the cold-pod cascade.
                 action_name = recommendation.get("action", "")
                 if action_name == "add_replica":
                     target_dep = recommendation.get("parameters", {}).get("deployment_name", "")
                     logger.info(f"Waiting for {target_dep} to reach Ready state after add_replica...")
                     self._wait_for_deployment_ready(target_dep, timeout=90)
-                    if "microservice3" in target_dep:
-                        logger.info("Sending ms3 warm-up for new replica pod...")
-                        wrt = self._measure_response_time()
-                        if wrt is not None:
-                            logger.info(f"New ms3 replica warm (RT={wrt:.3f}s, not counted)")
-                    effective_cooldown = 15  # pod is warm; short cooldown for horizontal scaling
-                    logger.info(f"Using graduated cooldown: {effective_cooldown}s (add_replica — pod warm)")
+                    self._warm_new_replica_until_hot(target_dep)
+                    effective_cooldown = 0  # new pod provably hot; resume monitoring immediately
                 else:
                     effective_cooldown = self.wait_after_action
 
-                logger.info(f"Waiting {effective_cooldown}s for system to stabilize...")
-                self._smart_cooldown(effective_cooldown)
+                if effective_cooldown > 0:
+                    logger.info(f"Waiting {effective_cooldown}s for system to stabilize...")
+                    self._smart_cooldown(effective_cooldown)
             else:
                 logger.error(f"Action failed: {result['message']}")
         else:
@@ -721,6 +724,60 @@ class IntentWatchLoop:
             logger.info(f"Waiting for {deployment_name}: {ready}/{desired} ready...")
             time.sleep(5)
         logger.warning(f"{deployment_name} did not reach ready state within {timeout}s — proceeding")
+
+    def _warm_new_replica_until_hot(self, deployment_name: str) -> None:
+        """
+        After add_replica, warm every replica (incl. the new cold one) before resuming monitoring.
+
+        A freshly added pod is marked Ready 15-30s before its SSD model finishes loading (30-60s).
+        The chain warm-up request is load-balanced across replicas by klipper-LB/kube-proxy with
+        ~uniform endpoint selection, so a single warm-up usually lands on an already-hot pod and
+        leaves the new pod cold — live traffic then hits it before the model loads (the cold-pod
+        cascade). We send several warm-ups and only declare the deployment hot once the most recent
+        responses are fast, which statistically guarantees the new pod served a model-loading
+        request: P(new pod never hit in k tries) = ((R-1)/R)^k (R=2,k=6 -> 1.6%), and the
+        fast-streak gate catches the rare miss (a still-cold pod yields a slow response).
+
+        Reuses _measure_response_time() (full chain -> exercises ms3). Warm-up RTs are NOT counted
+        in metrics. Tunable via config 'warmup:' (warm_threshold_s, warm_min_requests_factor,
+        warm_max_seconds).
+        """
+        if not deployment_name:
+            return
+
+        # Current replica count for this deployment (default 2 if unreadable).
+        replicas_str = self.data_collector.k8s_client._run_kubectl(
+            f'get deployment {deployment_name} -o jsonpath="{{.spec.replicas}}"'
+        ).strip().strip('"') or "2"
+        try:
+            replicas = max(1, int(replicas_str))
+        except (ValueError, TypeError):
+            replicas = 2
+
+        min_requests = max(6, self._warm_min_requests_factor * replicas)
+        deadline = time.time() + self._warm_max_seconds
+        sent = 0
+        fast_streak = 0
+        logger.info(
+            f"Warming {deployment_name} ({replicas} replicas): need >= {min_requests} warm-ups "
+            f"with last 2 < {self._warm_threshold_s}s (cap {self._warm_max_seconds}s)..."
+        )
+        while time.time() < deadline:
+            wrt = self._measure_response_time()
+            sent += 1
+            if wrt is None:
+                fast_streak = 0
+                logger.warning(f"  warm-up #{sent} failed (pod may still be cold) — retrying")
+                continue
+            fast_streak = fast_streak + 1 if wrt < self._warm_threshold_s else 0
+            logger.info(f"  warm-up #{sent}: RT={wrt:.3f}s (fast_streak={fast_streak}, not counted)")
+            if sent >= min_requests and fast_streak >= 2:
+                logger.info(f"{deployment_name} hot after {sent} warm-up requests — resuming.")
+                return
+        logger.warning(
+            f"{deployment_name} warm-up hit {self._warm_max_seconds}s cap after {sent} requests "
+            f"(fast_streak={fast_streak}) — proceeding anyway."
+        )
 
     def _flush_checkpoint(self) -> None:
         """Write current stats + history + EMA timeline to a checkpoint file."""

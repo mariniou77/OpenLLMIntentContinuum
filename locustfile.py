@@ -46,16 +46,17 @@ USE_DIRECT_CURL = os.environ.get("DIRECT_CURL", "0") == "1"
 
 # ── Staged Load Configuration ─────────────────────────────────────────────
 # Each tuple: (duration_seconds, num_users, spawn_rate)
-# Pattern from IntentContinuum paper: [10, 20, 15, 10, 5, 20, 10] users
-# with 120s intervals
+# Hybrid of the IntentContinuum paper pattern [10, 20, 15, 10, 5, 20, 10]: same oscillating
+# shape for comparability, but stages stretched 120s -> 180s and the two peaks raised 20 -> 25
+# users so they sustain pressure long enough to separate the controllers (TiB% / MTTR).
 LOAD_STAGES = [
-    (120, 10, 1),   # 0-120s:   10 users (ramp up)
-    (120, 20, 1),   # 120-240s: 20 users (peak)
-    (120, 15, 1),   # 240-360s: 15 users (decrease)
-    (120, 10, 1),   # 360-480s: 10 users (normal)
-    (120, 5, 1),    # 480-600s: 5 users  (low)
-    (120, 20, 1),   # 600-720s: 20 users (peak again)
-    (120, 10, 1),   # 720-840s: 10 users (settle)
+    (180, 10, 1),   # 0-180s:     10 users (ramp up)
+    (180, 25, 2),   # 180-360s:   25 users (peak)
+    (180, 15, 1),   # 360-540s:   15 users (decrease)
+    (180, 10, 1),   # 540-720s:   10 users (normal)
+    (180, 5, 1),    # 720-900s:   5 users  (low)
+    (180, 25, 2),   # 900-1080s:  25 users (peak again)
+    (180, 10, 1),   # 1080-1260s: 10 users (settle)
 ]
 
 USE_STAGED = os.environ.get("LOCUST_STAGED", "0") == "1"

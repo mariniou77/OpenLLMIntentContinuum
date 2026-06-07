@@ -146,8 +146,11 @@ class ExperimentTelemetry:
             if violations_resolved > 0 and duration_min > 0 else None
         )
 
-        # EMA time-in-band: % of monitoring cycles with SLO-compliant EMA
+        # EMA time-in-band: % of monitoring cycles with SLO-compliant EMA (headline SLO metric)
         ema_time_in_band_pct = self._compute_ema_time_in_band()
+
+        # MTTR: mean seconds to recover from an upper-threshold violation (headline responsiveness metric)
+        mttr = self._compute_mttr()
 
         # Locust P95 response time from stats CSV
         locust_p95_rt_ms = self._read_locust_p95()
@@ -191,6 +194,10 @@ class ExperimentTelemetry:
             "intent_satisfaction_rate": isr,
             "time_normalised_isr": time_normalised_isr,
             "ema_time_in_band_pct": ema_time_in_band_pct,
+            "mttr_mean_s": mttr["mttr_mean_s"],
+            "mttr_p95_s": mttr["mttr_p95_s"],
+            "violation_episodes": mttr["violation_episodes"],
+            "unresolved_episodes": mttr["unresolved_episodes"],
             "locust_p95_rt_ms": locust_p95_rt_ms,
             "action_type_breakdown": action_breakdown,
             "mean_inference_latency_ms": mean_latency,
@@ -273,3 +280,63 @@ class ExperimentTelemetry:
             if isinstance(e, dict) and lo <= e.get("ema", -1) <= hi
         )
         return round(in_band / len(timeline) * 100, 1)
+
+    def _compute_mttr(self) -> dict:
+        """
+        Mean time-to-recovery (MTTR) from upper-threshold violations, derived from the EMA timeline.
+
+        An "episode" begins at the first point where EMA exceeds the upper threshold and ends at the
+        first later point where EMA re-enters the band (EMA <= upper). MTTR is the mean episode
+        duration in seconds. Episodes that never recover before the run ends are counted as
+        unresolved and excluded from the mean. Works retroactively on any run that persisted the
+        EMA timeline.
+
+        Returns: {mttr_mean_s, mttr_p95_s, violation_episodes, unresolved_episodes}.
+        """
+        timeline = self._ema_timeline
+        if not timeline:
+            return {"mttr_mean_s": None, "mttr_p95_s": None,
+                    "violation_episodes": 0, "unresolved_episodes": 0}
+        hi = self._upper_threshold
+
+        recovery_times: list = []
+        episodes = 0
+        in_violation = False
+        start_ts = None
+
+        for e in timeline:
+            if not isinstance(e, dict):
+                continue
+            ema = e.get("ema")
+            ts_raw = e.get("timestamp")
+            if ema is None or not ts_raw:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_raw)
+            except (ValueError, TypeError):
+                continue
+
+            if not in_violation and ema > hi:
+                in_violation = True
+                episodes += 1
+                start_ts = ts
+            elif in_violation and ema <= hi:
+                in_violation = False
+                if start_ts is not None:
+                    recovery_times.append((ts - start_ts).total_seconds())
+                start_ts = None
+
+        unresolved = 1 if in_violation else 0  # started but never recovered before run end
+
+        if not recovery_times:
+            return {"mttr_mean_s": None, "mttr_p95_s": None,
+                    "violation_episodes": episodes, "unresolved_episodes": unresolved}
+
+        ordered = sorted(recovery_times)
+        p95 = ordered[int(len(ordered) * 0.95)] if len(ordered) >= 2 else ordered[0]
+        return {
+            "mttr_mean_s": round(statistics.mean(recovery_times), 1),
+            "mttr_p95_s": round(p95, 1),
+            "violation_episodes": episodes,
+            "unresolved_episodes": unresolved,
+        }

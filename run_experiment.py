@@ -44,10 +44,12 @@ LOCUST_BIN = _find_locust()
 
 
 # ── Default Experiment Configuration ────────────────────────────────────────
-# Load pattern: 20 users at peak saturate ms3 (500m CPU, ~3.7 req/s capacity) and
-# trigger upper-threshold violations; 5 users ease off below lower threshold.
-DEFAULT_LOAD_PATTERN = [10, 20, 15, 10, 5, 20, 10]
-DEFAULT_INTERVAL = 120  # seconds between load changes
+# Load pattern (hybrid of the IntentContinuum [10,20,15,10,5,20,10] shape): peaks raised
+# 20 -> 25 users to saturate ms3 (500m CPU, ~3.7 req/s capacity) harder, and the interval
+# stretched 120 -> 180s so each tier sustains pressure long enough to separate the controllers
+# (TiB% / MTTR). 5 users eases off below the lower threshold. Total schedule = 7 x 180s = 1260s.
+DEFAULT_LOAD_PATTERN = [10, 25, 15, 10, 5, 25, 10]
+DEFAULT_INTERVAL = 180  # seconds between load changes
 DEFAULT_SPAWN_RATE = 1  # users per second
 LOCUST_WEB_PORT = 8089
 
