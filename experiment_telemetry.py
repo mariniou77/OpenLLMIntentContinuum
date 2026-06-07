@@ -67,7 +67,10 @@ class ExperimentTelemetry:
         os.makedirs(self.output_dir, exist_ok=True)
 
         llm_calls = self._decision_maker.get_llm_calls_log() if self._decision_maker else []
-        all_history: list = []
+        all_history = (
+            self._watch_loop.decision_history.get_all_structured_history()
+            if self._watch_loop else []
+        )
         stats = self._watch_loop.stats.copy() if self._watch_loop else {}
 
         self._export_llm_interactions_csv(llm_calls)

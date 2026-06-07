@@ -4,7 +4,7 @@
 intent:
   upper_threshold: 3.0    # seconds - trigger scale UP if response time exceeds this
   lower_threshold: 0.5    # seconds - trigger scale DOWN if response time below this
-  ema_alpha: 0.12         # smoothing factor for Exponential Moving Average
+  ema_alpha: 0.2          # smoothing factor for Exponential Moving Average
   check_interval: 5       # seconds between checks
   wait_after_action: 60   # seconds to wait after taking an action (matches IntentContinuum paper)
   startup_grace_period_seconds: 30  # skip violation handling for first N seconds (avoids cold-start artefact)

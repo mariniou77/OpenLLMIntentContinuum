@@ -521,20 +521,26 @@ JSON:"""
 
     def _query_ollama_8msg(
         self,
+        history_entries: list,
         structured_state: dict,
         candidate_actions: list
     ) -> Optional[str]:
         """
-        Send 6-message conversation to Ollama (stateless snapshot format).
-
+        Send 8-message conversation to Ollama matching the tested format.
+        
         Messages:
-          1. system:    policy prompt
-          2. user:      {"intent": ..., "application": ...}
+          1. system:    12-rule policy prompt
+          2. user:      {"history": [...]}
           3. assistant: "Understood."
-          4. user:      {"services": ..., "nodes": ..., "network": ...}
+          4. user:      {"intent": ..., "application": ...}
           5. assistant: "Understood."
-          6. user:      {"candidate_actions": [...]} + "Select the best action."
+          6. user:      {"services": ..., "nodes": ..., "network": ...}
+          7. assistant: "Understood."
+          8. user:      {"candidate_actions": [...]} + "Select the best action."
         """
+        # Build history JSON
+        history_text = json.dumps({"history": history_entries})
+        
         # Split state into parts
         part1 = json.dumps({
             "intent": structured_state["intent"],
@@ -551,13 +557,15 @@ JSON:"""
         
         messages = [
             {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": history_text},
+            {"role": "assistant", "content": ASSISTANT_BRIDGE},
             {"role": "user", "content": part1},
             {"role": "assistant", "content": ASSISTANT_BRIDGE},
             {"role": "user", "content": part2},
             {"role": "assistant", "content": ASSISTANT_BRIDGE},
             {"role": "user", "content": part3}
         ]
-
+        
         return self._send_chat(messages)
 
     def _send_chat(self, messages: list) -> Optional[str]:
@@ -1281,7 +1289,8 @@ JSON:"""
         ema_rt: float,
         structured_state: Optional[dict] = None,
         candidate_actions: Optional[list] = None,
-        # Legacy parameters (kept for backward compat, unused in 6-msg mode)
+        history_entries: Optional[list] = None,
+        # Legacy parameters (kept for backward compat, unused in 8-msg mode)
         cluster_data: Optional[dict] = None,
         network_data: Optional[dict] = None,
         monitoring_data: Optional[dict] = None,
@@ -1301,6 +1310,8 @@ JSON:"""
             ema_rt: EMA response time in seconds
             structured_state: Structured JSON from DataCollector.build_structured_state()
             candidate_actions: List of candidate actions from CandidateActionGenerator
+            history_entries: List of structured history dicts (rolling window)
+            
         Returns:
             Dictionary with 'action' and 'parameters' keys
         """
@@ -1313,16 +1324,19 @@ JSON:"""
             logger.error("Missing structured_state or candidate_actions for 8-msg mode")
             return self._get_fallback_response("Missing structured data for LLM query")
         
-        logger.info(f"Candidates: {len(candidate_actions)} actions")
+        history_entries = history_entries or []
+        
+        logger.info(f"Candidates: {len(candidate_actions)} actions, History: {len(history_entries)} entries")
         if self.debug_llm:
             for c in candidate_actions:
                 logger.info(f"  [{c['id']}] {c['type']} → {c.get('target', c.get('description', 'n/a'))}")
-
+        
         # === RETRY LOOP ===
         last_response_text = None
         last_error = ""
-
-        # Build base 6-message array (stateless snapshot — no history message)
+        
+        # Build base 8-message array
+        history_text = json.dumps({"history": history_entries})
         part1 = json.dumps({
             "intent": structured_state["intent"],
             "application": structured_state["application"]
@@ -1333,9 +1347,11 @@ JSON:"""
             "network": structured_state["network"]
         })
         part3 = json.dumps({"candidate_actions": candidate_actions}) + "\n\nSelect the best action."
-
+        
         base_messages = [
             {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": history_text},
+            {"role": "assistant", "content": ASSISTANT_BRIDGE},
             {"role": "user", "content": part1},
             {"role": "assistant", "content": ASSISTANT_BRIDGE},
             {"role": "user", "content": part2},
