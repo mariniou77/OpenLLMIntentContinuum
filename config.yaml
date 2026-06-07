@@ -6,7 +6,7 @@ intent:
   lower_threshold: 0.5    # seconds - trigger scale DOWN if response time below this
   ema_alpha: 0.2          # smoothing factor for Exponential Moving Average (ideal-setup: faster detect+recovery)
   check_interval: 5       # seconds between checks
-  wait_after_action: 30   # seconds to wait after taking an action (ideal-setup tuning; smart_cooldown exits early on recovery)
+  wait_after_action: 60   # seconds to wait after taking an action (gives ms3 SSD changes time to stabilize; smart_cooldown still exits early on recovery)
   startup_grace_period_seconds: 30  # skip violation handling for first N seconds (avoids cold-start artefact)
 
 # Warm-up gate after add_replica (prevents the cold-pod cascade — see
