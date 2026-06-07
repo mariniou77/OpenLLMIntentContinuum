@@ -651,7 +651,14 @@ JSON:"""
             "think": False,
             "options": {
                 "temperature": self.temperature,
-                "num_predict": self.max_tokens
+                "num_predict": self.max_tokens,
+                # Halt as soon as the model emits a blank line after the decision JSON. Rule 12
+                # requires "valid JSON only", but ~2/9 calls ran away to the 512-token cap (4-17 s)
+                # by appending extra prose/reasoning. A valid single-line or code-fenced JSON object
+                # contains no blank line, so this never truncates a real answer; it only cuts the
+                # runaway tail that wrecked p95 inference latency. (think:false already verified to
+                # suppress reasoning on Ollama 0.24.0 / qwen3.5:4b.)
+                "stop": ["\n\n"]
             }
         }
         

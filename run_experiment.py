@@ -44,12 +44,13 @@ LOCUST_BIN = _find_locust()
 
 
 # ── Default Experiment Configuration ────────────────────────────────────────
-# Load pattern (hybrid of the IntentContinuum [10,20,15,10,5,20,10] shape): peaks raised
-# 20 -> 25 users to saturate ms3 (500m CPU, ~3.7 req/s capacity) harder, and the interval
-# stretched 120 -> 180s so each tier sustains pressure long enough to separate the controllers
-# (TiB% / MTTR). 5 users eases off below the lower threshold. Total schedule = 7 x 180s = 1260s.
-DEFAULT_LOAD_PATTERN = [10, 25, 15, 10, 5, 25, 10]
-DEFAULT_INTERVAL = 180  # seconds between load changes
+# Step-and-hold load (ideal own setup — NOT IntentContinuum's oscillation): warm baseline ->
+# sustained high plateau (detect -> scale -> recover -> HOLD) -> scale-down -> repeat spike.
+# Expressed as repeated values at a uniform 120s interval so run_load_schedule/total_duration
+# need no change. Peak P=20 is the calibration DEFAULT — adjust after the WS-A peak calibration.
+# Total = 11 x 120s = 1320s (~22 min): 8u warm (4m) -> 20u hold (10m) -> 8u (4m) -> 20u (4m).
+DEFAULT_LOAD_PATTERN = [8, 8, 20, 20, 20, 20, 20, 8, 8, 20, 20]
+DEFAULT_INTERVAL = 120  # seconds between load changes
 DEFAULT_SPAWN_RATE = 1  # users per second
 LOCUST_WEB_PORT = 8089
 

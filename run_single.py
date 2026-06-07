@@ -21,7 +21,7 @@ Scenarios:
     baseline  ->  exp_01_baseline              (monitor-only, no LLM)
     full      ->  exp_08_full_system            (all actions, local Qwen3.5:4b)
     cloud     ->  exp_09_cloud_llm_baseline     (all actions, GPT-4o via OpenAI API)
-    hpa       ->  exp_hpa_baseline              (K8s HPA @ 20% CPU, no intent loop)
+    hpa       ->  exp_hpa_baseline              (K8s HPA @ 50% CPU, no intent loop)
 
 For the 'cloud' scenario, export OPENAI_API_KEY before running:
     export OPENAI_API_KEY=sk-...
@@ -60,24 +60,24 @@ HPA_EXP_DEF = {
     },
 }
 
-DEFAULT_RESULTS_ROOT = "evaluation_results/9th_experiment"
+DEFAULT_RESULTS_ROOT = "evaluation_results/10th_experiment"
 
 
 # ── HPA lifecycle helpers ────────────────────────────────────────────────────
 
 def _create_hpa(user: str, master: str) -> None:
-    """Create HPA objects (20% CPU target) for all 4 deployments on the K8s master."""
+    """Create HPA objects (50% CPU target) for all 4 deployments on the K8s master."""
     hpa_specs = [
         ("microservice1-deployment", 1, 5),
         ("microservice2-deployment", 1, 5),
         ("microservice3-deployment", 1, 5),
         ("microservice4-deployment", 1, 3),
     ]
-    print("  Creating HPA objects (20% CPU target)...")
+    print("  Creating HPA objects (50% CPU target)...")
     for dep, min_rep, max_rep in hpa_specs:
         cmd = (
             f"kubectl autoscale deployment {dep}"
-            f" --cpu-percent=20 --min={min_rep} --max={max_rep}"
+            f" --cpu-percent=50 --min={min_rep} --max={max_rep}"
         )
         result = ssh_cmd(user, master, cmd)
         status = "created" if result.returncode == 0 else f"FAILED: {result.stderr.strip()}"

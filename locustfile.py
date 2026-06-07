@@ -46,17 +46,21 @@ USE_DIRECT_CURL = os.environ.get("DIRECT_CURL", "0") == "1"
 
 # ── Staged Load Configuration ─────────────────────────────────────────────
 # Each tuple: (duration_seconds, num_users, spawn_rate)
-# Hybrid of the IntentContinuum paper pattern [10, 20, 15, 10, 5, 20, 10]: same oscillating
-# shape for comparability, but stages stretched 120s -> 180s and the two peaks raised 20 -> 25
-# users so they sustain pressure long enough to separate the controllers (TiB% / MTTR).
+# Step-and-hold load (ideal own setup — NOT IntentContinuum's oscillation): warm baseline ->
+# sustained high plateau (detect/scale/recover/HOLD) -> scale-down -> repeat spike. Peak P=20
+# is the calibration DEFAULT; adjust after the peak calibration. Repeated values at 120s.
 LOAD_STAGES = [
-    (180, 10, 1),   # 0-180s:     10 users (ramp up)
-    (180, 25, 2),   # 180-360s:   25 users (peak)
-    (180, 15, 1),   # 360-540s:   15 users (decrease)
-    (180, 10, 1),   # 540-720s:   10 users (normal)
-    (180, 5, 1),    # 720-900s:   5 users  (low)
-    (180, 25, 2),   # 900-1080s:  25 users (peak again)
-    (180, 10, 1),   # 1080-1260s: 10 users (settle)
+    (120, 8, 1),    # 0-240s:     8 users  (warm baseline)
+    (120, 8, 1),
+    (120, 20, 2),   # 240-840s:   20 users (sustained peak — detect/scale/recover/HOLD)
+    (120, 20, 2),
+    (120, 20, 2),
+    (120, 20, 2),
+    (120, 20, 2),
+    (120, 8, 1),    # 840-1080s:  8 users  (scale-down)
+    (120, 8, 1),
+    (120, 20, 2),   # 1080-1320s: 20 users (repeat spike)
+    (120, 20, 2),
 ]
 
 USE_STAGED = os.environ.get("LOCUST_STAGED", "0") == "1"

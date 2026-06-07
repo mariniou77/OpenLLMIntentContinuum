@@ -152,6 +152,10 @@ class ExperimentTelemetry:
         # MTTR: mean seconds to recover from an upper-threshold violation (headline responsiveness metric)
         mttr = self._compute_mttr()
 
+        # Holding quality (steady-state TiB + time-to-first-recovery) and provisioning footprint
+        steady = self._compute_steady_state_metrics()
+        footprint = self._compute_resource_footprint()
+
         # Locust P95 response time from stats CSV
         locust_p95_rt_ms = self._read_locust_p95()
 
@@ -198,6 +202,10 @@ class ExperimentTelemetry:
             "mttr_p95_s": mttr["mttr_p95_s"],
             "violation_episodes": mttr["violation_episodes"],
             "unresolved_episodes": mttr["unresolved_episodes"],
+            "steady_state_tib_pct": steady["steady_state_tib_pct"],
+            "time_to_first_recovery_s": steady["time_to_first_recovery_s"],
+            "mean_total_replicas": footprint["mean_total_replicas"],
+            "mean_total_cpu_m": footprint["mean_total_cpu_m"],
             "locust_p95_rt_ms": locust_p95_rt_ms,
             "action_type_breakdown": action_breakdown,
             "mean_inference_latency_ms": mean_latency,
@@ -340,3 +348,98 @@ class ExperimentTelemetry:
             "violation_episodes": episodes,
             "unresolved_episodes": unresolved,
         }
+
+    def _compute_steady_state_metrics(self) -> dict:
+        """
+        Holding-quality metrics that exclude the cold-start ramp (derived from the EMA timeline).
+
+        - time_to_first_recovery_s: seconds from the first upper-threshold violation to the first
+          moment EMA re-enters the band (how fast the controller first gets the system in-band).
+        - steady_state_tib_pct: EMA time-in-band measured only AFTER that first recovery — i.e. how
+          well the controller HOLDS the SLO once it has converged (cold-start ramp excluded).
+
+        If EMA never violates, steady-state TiB == full-run TiB and TTR is 0. Works retroactively.
+        """
+        timeline = [e for e in self._ema_timeline
+                    if isinstance(e, dict) and e.get("ema") is not None and e.get("timestamp")]
+        if not timeline:
+            return {"steady_state_tib_pct": None, "time_to_first_recovery_s": None}
+        lo, hi = self._lower_threshold, self._upper_threshold
+
+        first_violation_ts = None
+        first_recovery_ts = None
+        in_violation = False
+        for e in timeline:
+            try:
+                ts = datetime.fromisoformat(e["timestamp"])
+            except (ValueError, TypeError):
+                continue
+            if not in_violation and e["ema"] > hi:
+                in_violation = True
+                if first_violation_ts is None:
+                    first_violation_ts = ts
+            elif in_violation and e["ema"] <= hi:
+                first_recovery_ts = ts
+                break
+
+        if first_violation_ts is None:
+            return {"steady_state_tib_pct": self._compute_ema_time_in_band(),
+                    "time_to_first_recovery_s": 0.0}
+        if first_recovery_ts is None:
+            return {"steady_state_tib_pct": 0.0, "time_to_first_recovery_s": None}
+
+        ttr = round((first_recovery_ts - first_violation_ts).total_seconds(), 1)
+        post = []
+        for e in timeline:
+            try:
+                ts = datetime.fromisoformat(e["timestamp"])
+            except (ValueError, TypeError):
+                continue
+            if ts >= first_recovery_ts:
+                post.append(e["ema"])
+        if not post:
+            return {"steady_state_tib_pct": None, "time_to_first_recovery_s": ttr}
+        in_band = sum(1 for v in post if lo <= v <= hi)
+        return {"steady_state_tib_pct": round(in_band / len(post) * 100, 1),
+                "time_to_first_recovery_s": ttr}
+
+    def _compute_resource_footprint(self) -> dict:
+        """
+        Mean provisioning footprint over the run, from k8s_pod_resources.csv
+        (columns: timestamp,namespace,pod_name,cpu_m,memory_mi).
+
+        - mean_total_replicas: mean count of app pods alive per sample.
+        - mean_total_cpu_m: mean summed CPU usage (millicores) across app pods per sample.
+
+        Shows the LLM controller holds the SLO without brute-forcing replicas the way HPA@50% does.
+        Returns Nones if the CSV is missing/unparseable.
+        """
+        empty = {"mean_total_replicas": None, "mean_total_cpu_m": None}
+        path = os.path.join(self.output_dir, "k8s_pod_resources.csv")
+        if not os.path.exists(path):
+            return empty
+        try:
+            per_ts_count: dict = {}
+            per_ts_cpu: dict = {}
+            with open(path) as f:
+                for row in csv.DictReader(f):
+                    pod = row.get("pod_name", "")
+                    if "microservice" not in pod and "db" not in pod:
+                        continue
+                    ts = row.get("timestamp", "")
+                    if not ts:
+                        continue
+                    per_ts_count[ts] = per_ts_count.get(ts, 0) + 1
+                    try:
+                        cpu = float(str(row.get("cpu_m", "0")).replace("m", "") or 0)
+                    except ValueError:
+                        cpu = 0.0
+                    per_ts_cpu[ts] = per_ts_cpu.get(ts, 0.0) + cpu
+            if not per_ts_count:
+                return empty
+            return {
+                "mean_total_replicas": round(sum(per_ts_count.values()) / len(per_ts_count), 2),
+                "mean_total_cpu_m": round(sum(per_ts_cpu.values()) / len(per_ts_cpu), 1),
+            }
+        except Exception:
+            return empty

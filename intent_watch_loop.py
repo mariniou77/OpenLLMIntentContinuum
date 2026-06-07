@@ -409,14 +409,27 @@ class IntentWatchLoop:
                 else:
                     logger.warning("ms3 warm-up request failed — SSD model may still be cold")
 
-                # For add_replica: wait for the new pod to be Ready, then warm EVERY replica
-                # (including the new cold one) before resuming. The previous single LB warm-up
-                # usually hit the OLD pod (klipper-LB picks endpoints ~uniformly), leaving the
-                # new pod to take live traffic before its SSD model loaded — the cold-pod cascade.
+                # Detect a horizontal scale-UP (a new, possibly cold replica was added). The
+                # executor verb is "horizontal_scaling" (NOT the candidate type "add_replica" —
+                # see decision_maker._candidate_to_executor_action), and on success it returns
+                # "Scaled 'X' from N to M replicas". Warm only when M > N; a scale-down or an
+                # "already has N replicas" no-op leaves no cold pod to warm.
                 action_name = recommendation.get("action", "")
-                if action_name == "add_replica":
-                    target_dep = recommendation.get("parameters", {}).get("deployment_name", "")
-                    logger.info(f"Waiting for {target_dep} to reach Ready state after add_replica...")
+                target_dep = recommendation.get("parameters", {}).get("deployment_name", "")
+                is_scale_up = False
+                if action_name == "horizontal_scaling":
+                    msg = result.get("message", "")
+                    if " from " in msg and " to " in msg and "replicas" in msg:
+                        try:
+                            n_str, m_str = (
+                                msg.split(" from ", 1)[1].split(" replicas", 1)[0].split(" to ")
+                            )
+                            is_scale_up = int(m_str) > int(n_str)
+                        except (ValueError, IndexError):
+                            is_scale_up = False
+
+                if is_scale_up:
+                    logger.info(f"Scale-up on {target_dep} — warming the new replica before resuming...")
                     self._wait_for_deployment_ready(target_dep, timeout=90)
                     self._warm_new_replica_until_hot(target_dep)
                     effective_cooldown = 0  # new pod provably hot; resume monitoring immediately

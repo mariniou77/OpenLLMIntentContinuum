@@ -637,6 +637,46 @@ def fig_mttr(summaries: dict) -> None:
     _save(fig, "fig_14_mttr")
 
 
+# ── Figure 15 — Steady-State Time-in-Band (holding quality) ──────────────────
+
+def fig_steady_state_tib(summaries: dict) -> None:
+    """TiB measured only AFTER first recovery — holding quality with the cold-start ramp excluded."""
+    names  = [n for n in EXPERIMENT_ORDER if n in summaries]
+    labels = [SHORT_LABELS[n] for n in names]
+    values = [_val(summaries[n], "steady_state_tib_pct") or 0 for n in names]
+    errs   = [_std(summaries[n], "steady_state_tib_pct") or 0 for n in names]
+    colors = ["#c0c0c0" if n == "exp_01_baseline"
+              else "#E377C2" if n == "exp_09_cloud_llm_baseline"
+              else "#E88C1F" if n == "exp_hpa_baseline"
+              else "#8C8C8C" if n in STRESS_SET
+              else "#4C72B0"
+              for n in names]
+
+    x = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(x, values, color=colors, edgecolor="white", width=0.6,
+           hatch=[_stress_hatch(n) for n in names])
+    if any(e > 0 for e in errs):
+        ax.errorbar(x, values, yerr=errs, fmt="none", color="black",
+                    capsize=4, linewidth=1.2)
+    for i, (val, err) in enumerate(zip(values, errs)):
+        if val > 0:
+            label = f"{val:.0f}%" if err == 0 else f"{val:.0f}%\n±{err:.0f}%"
+            ax.text(x[i], val + 1.5, label, ha="center", va="bottom", fontsize=8)
+    if any(n in STRESS_SET for n in names):
+        sep_idx = next(i for i, n in enumerate(names) if n in STRESS_SET)
+        ax.axvline(sep_idx - 0.5, color="gray", linestyle=":", linewidth=1)
+
+    ax.set_ylim(0, 115)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.set_ylabel("Steady-State Time-in-Band (%)")
+    ax.set_title("Steady-State EMA Time-in-Band (holding quality)\n"
+                 "(% in band measured AFTER first recovery — cold-start ramp excluded)")
+    _bar_style(ax)
+    _save(fig, "fig_15_steady_state_tib")
+
+
 # ── K8s Resource CSV helpers ─────────────────────────────────────────────────
 
 def _run_dirs(exp_name: str) -> list:
@@ -1078,10 +1118,10 @@ def fig_pod_memory_over_time(summaries: dict) -> None:
 
 # ── Paper-Style Figures (IntentContinuum paper replication) ──────────────────
 
-LOAD_STAGES_SEQ = [10, 25, 15, 10, 5, 25, 10]
-_STAGE_DUR_S = 180
+LOAD_STAGES_SEQ = [8, 8, 20, 20, 20, 20, 20, 8, 8, 20, 20]
+_STAGE_DUR_S = 120
 _STAGE_BOUNDS_S = [i * _STAGE_DUR_S for i in range(len(LOAD_STAGES_SEQ))]
-_EXP_TOTAL_S = 1260
+_EXP_TOTAL_S = 1320
 _STAGE_CENTERS_S = [
     (_STAGE_BOUNDS_S[i] + (_STAGE_BOUNDS_S[i + 1] if i + 1 < len(_STAGE_BOUNDS_S) else _EXP_TOTAL_S)) / 2
     for i in range(len(LOAD_STAGES_SEQ))
@@ -1095,7 +1135,7 @@ _FIG7_SCENARIO_STYLES = [
     ("exp_hpa_baseline", dict(
         color="#ff7f0e", linestyle="--", linewidth=1.3,
         marker="x", markersize=5, markevery=15,
-        label="HPA (K8s, 20%)")),
+        label="HPA (K8s, 50%)")),
     ("exp_09_cloud_llm_baseline", dict(
         color="#2ca02c", linestyle="--", linewidth=1.3,
         marker="D", markersize=4, markevery=15,
@@ -1239,7 +1279,7 @@ def fig_paper_resource_usage(summaries: dict) -> None:
     """
     order = [
         ("exp_01_baseline",          "Baseline\n(No Mgmt)"),
-        ("exp_hpa_baseline",          "HPA\n(K8s, 20%)"),
+        ("exp_hpa_baseline",          "HPA\n(K8s, 50%)"),
         ("exp_09_cloud_llm_baseline", "Cloud LLM\n(GPT-4o)"),
         ("exp_08_full_system",        "Full System\n(Qwen 3.5:4b)"),
     ]
@@ -1317,6 +1357,7 @@ def main():
         ("Figure 7  — EMA Response Time (per scenario)", fig_ema_response_time),
         ("Figure 9  — EMA Time-in-Band (headline SLO metric)", fig_ema_time_in_band),
         ("Figure 14 — MTTR (headline responsiveness metric)",  fig_mttr),
+        ("Figure 15 — Steady-State Time-in-Band (holding quality)", fig_steady_state_tib),
         ("Figure 10 — Pod CPU Over Time (all services)", fig_pod_cpu_over_time),
         ("Figure 11 — Node CPU Over Time",               fig_node_cpu_over_time),
         ("Figure 12 — Node Memory Over Time",            fig_node_memory_over_time),

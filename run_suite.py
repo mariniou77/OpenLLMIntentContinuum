@@ -31,7 +31,7 @@ from cluster_reset_verify import verify_cluster
 from run_experiment import get_master_info, reset_cluster, ssh_cmd
 from run_single import SCENARIOS, HPA_EXP_DEF, _create_hpa, _delete_hpa
 
-DEFAULT_RESULTS_ROOT = "evaluation_results/9th_experiment"
+DEFAULT_RESULTS_ROOT = "evaluation_results/10th_experiment"
 TOTAL_RUNS = 3
 MAX_VERIFY_RETRIES = 3
 VERIFY_RETRY_SLEEP_S = 120

@@ -601,6 +601,8 @@ def aggregate_runs(run_dirs: list, agg_dir: str, name: str, label: str) -> None:
         "intent_satisfaction_rate", "time_normalised_isr",
         "ema_time_in_band_pct",
         "mttr_mean_s", "mttr_p95_s", "violation_episodes", "unresolved_episodes",
+        "steady_state_tib_pct", "time_to_first_recovery_s",
+        "mean_total_replicas", "mean_total_cpu_m",
         "locust_p95_rt_ms",
         "mean_inference_latency_ms", "p95_inference_latency_ms",
         "mean_prompt_tokens", "mean_completion_tokens",
