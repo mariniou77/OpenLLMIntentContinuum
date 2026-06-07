@@ -162,6 +162,18 @@ def reset_cluster(config_path: str):
         else:
             print(f"  ⚠️  {name}: could not determine container name, skipping resource reset")
 
+        # Restore the deployment's home node — undoes any service_placement nodeSelector
+        # migration from a prior run (e.g. GPT-4o moving ms2 worker1→worker2). Idempotent:
+        # if the nodeSelector already matches, kubectl applies no change and no rollout fires.
+        # The "Wait for all rollouts to complete" step below covers the reschedule.
+        node = dep.get("node")
+        if node:
+            node_patch = ('{"spec":{"template":{"spec":{"nodeSelector":'
+                          '{"kubernetes.io/hostname":"%s"}}}}}' % node)
+            ssh_cmd(user, master,
+                    f"kubectl patch deployment {name} --type=strategic -p '{node_patch}'")
+            print(f"  ✅ {name}: nodeSelector → {node}")
+
     # Ensure ms3 fwatchdog allows enough time for SSD model cold-start.
     # Only set if not already correct — avoids triggering an unnecessary rollout.
     result = ssh_cmd(user, master,

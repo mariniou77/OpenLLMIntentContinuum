@@ -60,7 +60,7 @@ HPA_EXP_DEF = {
     },
 }
 
-DEFAULT_RESULTS_ROOT = "evaluation_results/10th_experiment"
+DEFAULT_RESULTS_ROOT = "evaluation_results/11th_experiment"
 
 
 # ── HPA lifecycle helpers ────────────────────────────────────────────────────

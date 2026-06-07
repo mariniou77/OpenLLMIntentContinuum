@@ -137,6 +137,29 @@ def verify_cluster(config_path: str = "config.yaml") -> bool:
                 ):
                     pod_nodes[dep_name] = node_name
 
+    # Auto-remediate placement drift BEFORE judging (belt-and-suspenders vs reset_cluster's restore):
+    # a service_placement migration that slipped through gets re-pinned + rolled, then re-read.
+    drifted = [d for d, n in EXPECTED_POD_PLACEMENT.items()
+               if pod_nodes.get(d) is not None and pod_nodes.get(d) != n]
+    if drifted:
+        for dep_name in drifted:
+            expected_node = EXPECTED_POD_PLACEMENT[dep_name]
+            print(f"  ⟳ {dep_name} on {pod_nodes.get(dep_name)} (exp {expected_node}) — re-pinning nodeSelector...")
+            node_patch = ('{"spec":{"template":{"spec":{"nodeSelector":'
+                          '{"kubernetes.io/hostname":"%s"}}}}}' % expected_node)
+            ssh_cmd(user, master, f"kubectl patch deployment {dep_name} --type=strategic -p '{node_patch}'")
+            ssh_cmd(user, master, f"kubectl rollout status deployment/{dep_name} --timeout=120s", timeout=130)
+        # Re-read placement after remediation
+        r = ssh_cmd(user, master, "kubectl get pods -o wide --no-headers 2>/dev/null")
+        pod_nodes = {}
+        for line in r.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 7:
+                pod_name, node_name = parts[0], parts[6]
+                for dep_name in EXPECTED_POD_PLACEMENT:
+                    if pod_name.startswith(dep_name.replace("-deployment", "") + "-"):
+                        pod_nodes[dep_name] = node_name
+
     for dep_name, expected_node in EXPECTED_POD_PLACEMENT.items():
         actual_node = pod_nodes.get(dep_name, "?")
         ok = actual_node == expected_node

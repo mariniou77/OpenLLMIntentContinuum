@@ -6,7 +6,7 @@ intent:
   lower_threshold: 0.5    # seconds - trigger scale DOWN if response time below this
   ema_alpha: 0.2          # smoothing factor for Exponential Moving Average (ideal-setup: faster detect+recovery)
   check_interval: 5       # seconds between checks
-  wait_after_action: 60   # seconds to wait after taking an action (gives ms3 SSD changes time to stabilize; smart_cooldown still exits early on recovery)
+  wait_after_action: 90   # seconds to wait after taking an action (matches ~90s pod-startup/settling; smart_cooldown still exits early on recovery; add_replica handled by warm-gate)
   startup_grace_period_seconds: 30  # skip violation handling for first N seconds (avoids cold-start artefact)
 
 # Warm-up gate after add_replica (prevents the cold-pod cascade — see
@@ -67,21 +67,25 @@ kubernetes:
   ssh_user: "cc"
   deployments:
     - name: "microservice1-deployment"
+      node: "worker2"   # home node — reset_cluster restores this nodeSelector each run (undoes a service_placement migration)
       min_replicas: 1
       max_replicas: 5
       default_cpu: "300m"
       default_memory: "312Mi"
     - name: "microservice2-deployment"
+      node: "worker1"   # home node — reset_cluster restores this nodeSelector each run (undoes a service_placement migration)
       min_replicas: 1
       max_replicas: 5
       default_cpu: "300m"
       default_memory: "312Mi"
     - name: "microservice3-deployment"
+      node: "worker1"   # home node — reset_cluster restores this nodeSelector each run (undoes a service_placement migration)
       min_replicas: 2   # warm standby: never drop ms3 below 1 serving pod during a rollout/scale (SSD cold-start safety)
       max_replicas: 5
       default_cpu: "500m"
       default_memory: "1024Mi"
     - name: "microservice4-deployment"
+      node: "worker2"   # home node — reset_cluster restores this nodeSelector each run (undoes a service_placement migration)
       min_replicas: 1
       max_replicas: 3
       default_cpu: "300m"

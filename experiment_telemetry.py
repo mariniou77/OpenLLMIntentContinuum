@@ -424,7 +424,10 @@ class ExperimentTelemetry:
             with open(path) as f:
                 for row in csv.DictReader(f):
                     pod = row.get("pod_name", "")
-                    if "microservice" not in pod and "db" not in pod:
+                    # Count only app Deployment pods (microserviceN-deployment-*, db-deployment-*).
+                    # Exclude klipper-LB (svclb-microservice*) and host-sflow DaemonSet pods, which
+                    # were inflating mean_total_replicas (svclb-* contains "microservice").
+                    if "-deployment-" not in pod or pod.startswith("svclb"):
                         continue
                     ts = row.get("timestamp", "")
                     if not ts:
