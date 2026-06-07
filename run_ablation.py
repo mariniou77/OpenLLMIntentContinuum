@@ -474,12 +474,24 @@ def run_experiment(
     except subprocess.TimeoutExpired:
         stop_locust_locally(locust_proc)
 
+    # The loop checks its deadline only at the top of each cycle, so a violation firing near the
+    # window end runs a full action cycle (wait-ready + warm-until-hot + up-to-90s cooldown) PAST
+    # the deadline. Give it a generous grace to self-terminate cleanly, then a guarded
+    # terminate→kill ladder that NEVER raises (so the suite can't crash on a slow-exiting loop).
     try:
-        intent_proc.wait(timeout=120)
+        intent_proc.wait(timeout=300)
     except subprocess.TimeoutExpired:
-        print("  ⚠️  Intent loop still running — terminating")
+        print("  ⚠️  Intent loop still running past window — terminating")
         intent_proc.terminate()
-        intent_proc.wait(timeout=15)
+        try:
+            intent_proc.wait(timeout=120)   # SIGTERM is honored once the in-flight curl/kubectl (≤90s) returns
+        except subprocess.TimeoutExpired:
+            print("  ⚠️  Terminate slow — killing")
+            intent_proc.kill()
+            try:
+                intent_proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                print("  ⚠️  Intent loop unresponsive to kill — continuing")
 
     for lf in [intent_log, locust_log]:
         try:

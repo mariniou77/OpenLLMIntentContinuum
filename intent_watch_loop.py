@@ -686,6 +686,8 @@ class IntentWatchLoop:
         check_interval = 10  # seconds between passive measurements
 
         while True:
+            if not self.running:   # honor SIGTERM/stop() promptly instead of finishing the full cooldown
+                break
             elapsed = time.time() - cooldown_start
             if elapsed >= max_seconds:
                 break
@@ -719,6 +721,8 @@ class IntentWatchLoop:
             return
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if not self.running:   # bail out of the readiness wait on SIGTERM/stop()
+                return
             ready_str = self.data_collector.k8s_client._run_kubectl(
                 f'get deployment {deployment_name} -o jsonpath="{{.status.readyReplicas}}"'
             ).strip().strip('"') or "0"
@@ -776,6 +780,8 @@ class IntentWatchLoop:
             f"with last 2 < {self._warm_threshold_s}s (cap {self._warm_max_seconds}s)..."
         )
         while time.time() < deadline:
+            if not self.running:   # bail out of the warm-up loop on SIGTERM/stop()
+                break
             wrt = self._measure_response_time()
             sent += 1
             if wrt is None:
