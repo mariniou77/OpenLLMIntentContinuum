@@ -278,6 +278,18 @@ def main() -> None:
         else:
             print("  No leftover HPA objects (clean)")
 
+        # Likewise purge any leftover VPA objects. A VPA left from a previous run
+        # would keep mutating pod resource requests via eviction and leak that into
+        # the next scenario's reset/verify. `2>/dev/null` swallows the error if the
+        # VPA CRD is not installed (clusters without the VPA admission controller).
+        result = ssh_cmd(user, master,
+                         "kubectl delete vpa --all -n default 2>/dev/null || true")
+        leftover = result.stdout.strip()
+        if leftover:
+            print(f"  VPA purged: {leftover}")
+        else:
+            print("  No leftover VPA objects (clean)")
+
         with open(args.config) as f:
             cfg = yaml.safe_load(f)
         wait_for_cluster_stable(
