@@ -29,7 +29,10 @@ import run_ablation
 from run_ablation import EXPERIMENT_MATRIX, aggregate_runs, wait_for_cluster_stable
 from cluster_reset_verify import verify_cluster
 from run_experiment import get_master_info, reset_cluster, ssh_cmd
-from run_single import SCENARIOS, HPA_EXP_DEF, _create_hpa, _delete_hpa
+from run_single import (
+    SCENARIOS, HPA_EXP_DEF, VPA_EXP_DEF, HPA_VPA_EXP_DEF,
+    _create_hpa, _delete_hpa, _create_vpa, _delete_vpa,
+)
 
 DEFAULT_RESULTS_ROOT = "evaluation_results/11th_experiment"
 TOTAL_RUNS = 3
@@ -37,7 +40,15 @@ MAX_VERIFY_RETRIES = 3
 VERIFY_RETRY_SLEEP_S = 120
 CONFIG_PATH = "config.yaml"
 
-SUITE_ORDER = ["full", "cloud", "hpa", "baseline"]
+SUITE_ORDER = ["full", "cloud", "hpa", "vpa", "hpa_vpa", "baseline"]
+
+# Scenarios that use an inline exp_def + a native-autoscaler create/delete lifecycle
+# (not in EXPERIMENT_MATRIX).
+INLINE_DEFS = {
+    "hpa":     HPA_EXP_DEF,
+    "vpa":     VPA_EXP_DEF,
+    "hpa_vpa": HPA_VPA_EXP_DEF,
+}
 
 
 def _reset_and_verify(config_path: str, max_retries: int, retry_sleep_s: int) -> bool:
@@ -61,6 +72,16 @@ def _reset_and_verify(config_path: str, max_retries: int, retry_sleep_s: int) ->
         else:
             print("  No leftover HPA objects")
 
+        # Likewise purge any leftover VPA objects so a previous run's eviction-driven
+        # request mutations cannot leak into this run. `2>/dev/null` is a no-op when the
+        # VPA CRD is not installed.
+        result = ssh_cmd(user, master, "kubectl delete vpa --all -n default 2>/dev/null || true")
+        leftover = result.stdout.strip()
+        if leftover:
+            print(f"  VPA purged: {leftover}")
+        else:
+            print("  No leftover VPA objects")
+
         wait_for_cluster_stable(master_ip=master_ip, ssh_user=ssh_user)
 
         if verify_cluster(config_path):
@@ -74,11 +95,13 @@ def _reset_and_verify(config_path: str, max_retries: int, retry_sleep_s: int) ->
 
 
 def run_suite(results_root: str, total_runs: int, dry_run: bool,
-              debug_llm: bool, skip_cloud: bool) -> None:
+              debug_llm: bool, skip_cloud: bool, scenarios: list = None) -> None:
     os.makedirs(results_root, exist_ok=True)
     run_ablation.RESULTS_ROOT = results_root
 
-    if not skip_cloud and not os.environ.get("OPENAI_API_KEY"):
+    order = scenarios or SUITE_ORDER
+
+    if not skip_cloud and "cloud" in order and not os.environ.get("OPENAI_API_KEY"):
         print("WARNING: OPENAI_API_KEY not set. Cloud scenario will be skipped.")
         print("  Set it with: export OPENAI_API_KEY=sk-...")
         skip_cloud = True
@@ -88,7 +111,7 @@ def run_suite(results_root: str, total_runs: int, dry_run: bool,
     completed: list = []
     skipped: list = []
 
-    for scenario_name in SUITE_ORDER:
+    for scenario_name in order:
         if scenario_name == "cloud" and skip_cloud:
             print(f"\n{'=' * 70}")
             print(f"  SKIPPING: cloud (no OPENAI_API_KEY)")
@@ -97,8 +120,9 @@ def run_suite(results_root: str, total_runs: int, dry_run: bool,
             continue
 
         exp_key = SCENARIOS[scenario_name]
-        is_hpa = (scenario_name == "hpa")
-        exp_def = HPA_EXP_DEF if is_hpa else EXPERIMENT_MATRIX.get(exp_key)
+        is_hpa = scenario_name in ("hpa", "hpa_vpa")  # needs HPA objects
+        is_vpa = scenario_name in ("vpa", "hpa_vpa")  # needs VPA objects
+        exp_def = INLINE_DEFS.get(scenario_name) or EXPERIMENT_MATRIX.get(exp_key)
 
         if exp_def is None:
             print(f"ERROR: '{exp_key}' not found in EXPERIMENT_MATRIX — skipping scenario")
@@ -136,6 +160,9 @@ def run_suite(results_root: str, total_runs: int, dry_run: bool,
 
             if is_hpa:
                 _create_hpa(user, master)
+            if is_vpa:
+                controlled = ["memory"] if scenario_name == "hpa_vpa" else None
+                _create_vpa(user, master, controlled_resources=controlled)
 
             run_ablation.run_experiment(
                 name=run_name,
@@ -146,9 +173,12 @@ def run_suite(results_root: str, total_runs: int, dry_run: bool,
             )
             completed.append(run_name)
 
-            if is_hpa:
-                print("\n  Removing HPA objects after run...")
-                _delete_hpa(user, master)
+            if is_hpa or is_vpa:
+                print("\n  Removing autoscaler objects after run...")
+                if is_hpa:
+                    _delete_hpa(user, master)
+                if is_vpa:
+                    _delete_vpa(user, master)
 
         # Aggregate once all runs for this scenario are done
         run_dirs = [
@@ -196,7 +226,24 @@ def main() -> None:
                         help="Enable LLM debug logging in the intent loop.")
     parser.add_argument("--skip-cloud", action="store_true",
                         help="Skip the cloud LLM scenario entirely.")
+    parser.add_argument(
+        "--scenarios", default=None,
+        help=(
+            "Comma-separated subset of scenarios to run, in order "
+            f"(choices: {', '.join(SUITE_ORDER)}). "
+            "Default: all. Example: --scenarios vpa,hpa_vpa runs only the two new "
+            "K8s-native baselines, leaving existing runs untouched."
+        ),
+    )
     args = parser.parse_args()
+
+    scenarios = None
+    if args.scenarios:
+        scenarios = [s.strip() for s in args.scenarios.split(",") if s.strip()]
+        unknown = [s for s in scenarios if s not in SCENARIOS]
+        if unknown:
+            print(f"ERROR: unknown scenario(s): {unknown}. Valid: {list(SCENARIOS)}")
+            sys.exit(1)
 
     run_suite(
         results_root=args.results_root,
@@ -204,6 +251,7 @@ def main() -> None:
         dry_run=args.dry_run,
         debug_llm=args.debug_llm,
         skip_cloud=args.skip_cloud,
+        scenarios=scenarios,
     )
 
 
