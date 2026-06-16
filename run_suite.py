@@ -82,6 +82,16 @@ def _reset_and_verify(config_path: str, max_retries: int, retry_sleep_s: int) ->
         else:
             print("  No leftover VPA objects")
 
+        # Also purge VPA checkpoints (recommender histogram, a separate CRD that survives
+        # `delete vpa --all`). Leaving them makes sequential VPA runs non-independent —
+        # the root cause of the run-over-run degradation in the first vpa/hpa_vpa pass.
+        result = ssh_cmd(user, master, "kubectl delete vpacheckpoint --all -n default 2>/dev/null || true")
+        leftover = result.stdout.strip()
+        if leftover:
+            print(f"  VPA checkpoints purged: {leftover}")
+        else:
+            print("  No leftover VPA checkpoints")
+
         wait_for_cluster_stable(master_ip=master_ip, ssh_user=ssh_user)
 
         if verify_cluster(config_path):

@@ -290,6 +290,18 @@ def main() -> None:
         else:
             print("  No leftover VPA objects (clean)")
 
+        # Also purge VPA *checkpoints* (the recommender's usage histogram). These are a
+        # separate CRD that survives `delete vpa --all`; if left behind, the next run's
+        # identically-named VPA reloads the stale histogram → runs are not independent
+        # (root cause of the run-over-run degradation seen in the first vpa/hpa_vpa pass).
+        result = ssh_cmd(user, master,
+                         "kubectl delete vpacheckpoint --all -n default 2>/dev/null || true")
+        leftover = result.stdout.strip()
+        if leftover:
+            print(f"  VPA checkpoints purged: {leftover}")
+        else:
+            print("  No leftover VPA checkpoints (clean)")
+
         with open(args.config) as f:
             cfg = yaml.safe_load(f)
         wait_for_cluster_stable(
