@@ -48,10 +48,11 @@ LOCUST_BIN = _find_locust()
 # sustained high plateau (detect -> scale -> recover -> HOLD) -> scale-down -> repeat spike.
 # Expressed as repeated values at a uniform 120s interval so run_load_schedule/total_duration
 # need no change. Peak P=20 is the calibration DEFAULT — adjust after the WS-A peak calibration.
-# Total = 11 x 120s = 1320s (~22 min): 8u warm (4m) -> 20u hold (10m) -> 8u (4m) -> 20u (4m).
-DEFAULT_LOAD_PATTERN = [8, 8, 20, 20, 20, 20, 20, 8, 8, 20, 20]
+# Total = 11 x 120s = 1320s (~22 min): 16u warm (4m) -> 40u hold (10m) -> 16u (4m) -> 40u (4m).
+# Exp13: peak raised 20 -> 40 to keep ms3 the bottleneck at the elevated 800m/1200m-ceiling regime.
+DEFAULT_LOAD_PATTERN = [16, 16, 40, 40, 40, 40, 40, 16, 16, 40, 40]
 DEFAULT_INTERVAL = 120  # seconds between load changes
-DEFAULT_SPAWN_RATE = 1  # users per second
+DEFAULT_SPAWN_RATE = 2  # users per second (Exp13: was 1; faster ramp for the larger steps)
 LOCUST_WEB_PORT = 8089
 
 

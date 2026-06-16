@@ -21,11 +21,11 @@ logger = logging.getLogger(__name__)
 # Action ID labels
 ACTION_IDS = ["A", "B", "C", "D"]
 
-# CPU step sizes (millicores)
-CPU_INCREASE_STEP = 500
+# CPU step sizes (millicores) — Exp13 elevated regime
+CPU_INCREASE_STEP = 200   # finer steps within the narrow 800→1200 band (was 500)
 CPU_DECREASE_STEP = 100
-CPU_MIN = 100
-CPU_MAX = 3500
+CPU_MIN = 200             # Exp13 floor, matches VPA minAllowed (was 100)
+CPU_MAX = 1200            # Exp13 vertical ceiling, matches the clamp + VPA maxAllowed (was dead 3500)
 
 
 class CandidateActionGenerator:

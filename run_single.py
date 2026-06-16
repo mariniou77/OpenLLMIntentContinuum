@@ -91,22 +91,63 @@ DEFAULT_RESULTS_ROOT = "evaluation_results/11th_experiment"
 # ── HPA lifecycle helpers ────────────────────────────────────────────────────
 
 def _create_hpa(user: str, master: str) -> None:
-    """Create HPA objects (50% CPU target) for all 4 deployments on the K8s master."""
+    """Create responsive HPA objects (50% CPU target) for all 4 deployments.
+
+    Exp13: uses autoscaling/v2 with an explicit behavior block — scaleDown
+    stabilizationWindowSeconds=30 (vs the controller-manager default 300s) and a fast
+    scaleUp — so HPA reacts within the 24-min run, symmetric with the responsive VPA
+    recommender. ms3 max is capped at 3 to match config.yaml (worker1 capacity).
+    """
+    # (deployment, min_replicas, max_replicas)
     hpa_specs = [
         ("microservice1-deployment", 1, 5),
         ("microservice2-deployment", 1, 5),
-        ("microservice3-deployment", 1, 5),
+        ("microservice3-deployment", 1, 3),
         ("microservice4-deployment", 1, 3),
     ]
-    print("  Creating HPA objects (50% CPU target)...")
+    print("  Creating responsive HPA objects (50% CPU, scaleDown stabilization 30s)...")
+    docs = []
     for dep, min_rep, max_rep in hpa_specs:
-        cmd = (
-            f"kubectl autoscale deployment {dep}"
-            f" --cpu-percent=50 --min={min_rep} --max={max_rep}"
-        )
-        result = ssh_cmd(user, master, cmd)
-        status = "created" if result.returncode == 0 else f"FAILED: {result.stderr.strip()}"
-        print(f"  HPA {dep}: {status}")
+        docs.append(f"""---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {dep}
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {dep}
+  minReplicas: {min_rep}
+  maxReplicas: {max_rep}
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15""")
+    manifest = "\n".join(docs)
+    cmd = "cat <<'EOF' | kubectl apply -f -\n" + manifest + "\nEOF"
+    result = ssh_cmd(user, master, cmd)
+    if result.returncode == 0:
+        print("  HPA objects: " + (result.stdout.strip() or "created"))
+    else:
+        print(f"  HPA objects: FAILED: {result.stderr.strip()}")
     print("  Waiting 15s for HPA controller to initialise and read first metrics sample...")
     time.sleep(15)
 
@@ -162,11 +203,11 @@ spec:
     containerPolicies:
     - containerName: {_VPA_CONTAINER}
       minAllowed:
-        cpu: 100m
-        memory: 128Mi
+        cpu: 200m
+        memory: 256Mi
       maxAllowed:
-        cpu: 1000m
-        memory: 1536Mi
+        cpu: 1200m
+        memory: 2048Mi
 {controlled_line}"""
         )
     return "\n".join(docs)

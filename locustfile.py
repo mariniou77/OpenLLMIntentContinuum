@@ -49,18 +49,19 @@ USE_DIRECT_CURL = os.environ.get("DIRECT_CURL", "0") == "1"
 # Step-and-hold load (ideal own setup — NOT IntentContinuum's oscillation): warm baseline ->
 # sustained high plateau (detect/scale/recover/HOLD) -> scale-down -> repeat spike. Peak P=20
 # is the calibration DEFAULT; adjust after the peak calibration. Repeated values at 120s.
+# Exp13: peak raised 20 -> 40 to keep ms3 the bottleneck at the elevated resource regime.
 LOAD_STAGES = [
-    (120, 8, 1),    # 0-240s:     8 users  (warm baseline)
-    (120, 8, 1),
-    (120, 20, 2),   # 240-840s:   20 users (sustained peak — detect/scale/recover/HOLD)
-    (120, 20, 2),
-    (120, 20, 2),
-    (120, 20, 2),
-    (120, 20, 2),
-    (120, 8, 1),    # 840-1080s:  8 users  (scale-down)
-    (120, 8, 1),
-    (120, 20, 2),   # 1080-1320s: 20 users (repeat spike)
-    (120, 20, 2),
+    (120, 16, 2),   # 0-240s:     16 users (warm baseline)
+    (120, 16, 2),
+    (120, 40, 2),   # 240-840s:   40 users (sustained peak — detect/scale/recover/HOLD)
+    (120, 40, 2),
+    (120, 40, 2),
+    (120, 40, 2),
+    (120, 40, 2),
+    (120, 16, 2),   # 840-1080s:  16 users (scale-down)
+    (120, 16, 2),
+    (120, 40, 2),   # 1080-1320s: 40 users (repeat spike)
+    (120, 40, 2),
 ]
 
 USE_STAGED = os.environ.get("LOCUST_STAGED", "0") == "1"

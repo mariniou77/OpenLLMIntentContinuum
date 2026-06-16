@@ -650,7 +650,7 @@ class DataCollector:
             # Determine limits from config
             dep_config = self._get_deployment_config(name)
             max_replicas = dep_config.get("max_replicas", 5)
-            cpu_max = cpu_limit_m >= 1000
+            cpu_max = cpu_limit_m >= 1200  # Exp13 vertical ceiling (was 1000)
             replica_max = replicas >= max_replicas
             
             # Primary node (first node where pods are running)

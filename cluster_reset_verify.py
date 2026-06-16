@@ -42,7 +42,7 @@ def _to_millicores(cpu_str: str) -> int:
 # Expected pod-to-node placement (locked via nodeSelector in deployment.yml.j2)
 EXPECTED_POD_PLACEMENT = {
     "microservice1-deployment": "worker2",
-    "microservice2-deployment": "worker1",
+    "microservice2-deployment": "worker2",  # Exp13: moved off worker1 to free it for ms3
     "microservice3-deployment": "worker1",
     "microservice4-deployment": "worker2",
     "db-deployment":            "master",

@@ -215,7 +215,7 @@ JSON:
             warnings = []
             try:
                 cpu_limit_val = int(str(cpu_limit).replace("m", "").strip())
-                if cpu_limit_val >= 1000:
+                if cpu_limit_val >= 1200:  # Exp13 vertical ceiling (was 1000)
                     warnings.append("CPU AT MAX")
             except (ValueError, TypeError):
                 pass
@@ -937,15 +937,15 @@ JSON:"""
             if not cpu:
                 return False, "Missing cpu_limit"
             
-            # Parse and clamp CPU limit (100m - 1000m)
+            # Parse and clamp CPU limit (Exp13 range 200m - 1200m)
             try:
                 cpu_val = int(str(cpu).replace("m", "").strip())
-                if cpu_val < 100:
-                    logger.info(f"Clamping cpu_limit from {cpu_val}m to min=100m")
-                    cpu_val = 100
-                if cpu_val > 1000:
-                    logger.info(f"Clamping cpu_limit from {cpu_val}m to max=1000m")
-                    cpu_val = 1000
+                if cpu_val < 200:
+                    logger.info(f"Clamping cpu_limit from {cpu_val}m to min=200m")
+                    cpu_val = 200
+                if cpu_val > 1200:
+                    logger.info(f"Clamping cpu_limit from {cpu_val}m to max=1200m")
+                    cpu_val = 1200
                 params["cpu_limit"] = f"{cpu_val}m"
             except (ValueError, TypeError):
                 return False, f"Invalid cpu_limit value: {cpu}"
