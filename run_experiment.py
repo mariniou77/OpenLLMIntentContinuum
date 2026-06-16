@@ -201,6 +201,17 @@ def reset_cluster(config_path: str):
     ssh_cmd(user, master, "kubectl rollout status deployment/microservice3-deployment --timeout=120s", timeout=130)
     print("  ✅ ms3 pod restarted")
 
+    # Force-restart db too. db is a long-lived datastore that logs every request + per-request
+    # timing, so its memory grows across runs and OOM-killed at 512Mi mid-campaign (2026-06-16).
+    # We deliberately keep db OUT of config.kubernetes.deployments (that list is the LLM's
+    # scalable-candidate set in candidate_generator.py — db must never be a scaling target),
+    # so we reset it here instead: a fresh pod each run clears accumulated memory. Its 1Gi
+    # limit is declared in deployment.yml.j2.
+    print("  ♻️  Force-restarting db pod (clears accumulated memory; avoids OOM mid-campaign)...")
+    ssh_cmd(user, master, "kubectl delete pod -l app=db --force --grace-period=0")
+    ssh_cmd(user, master, "kubectl rollout status deployment/db-deployment --timeout=120s", timeout=130)
+    print("  ✅ db pod restarted")
+
     # Verify pods are running
     result = ssh_cmd(user, master, "kubectl get pods --no-headers | grep -c Running")
     running = result.stdout.strip()

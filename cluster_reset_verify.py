@@ -122,14 +122,18 @@ def verify_cluster(config_path: str = "config.yaml") -> bool:
     # A mismatch means the nodeSelector was removed or the scheduler placed the pod elsewhere.
     print()
     placement_all_ok = True
-    r = ssh_cmd(user, master, "kubectl get pods -o wide --no-headers 2>/dev/null")
+    # Use custom-columns (NAME, NODE) — NOT `-o wide` parsed by column index. With `-o wide`,
+    # a non-zero RESTARTS cell renders as "N (Xm ago)" (3 whitespace tokens), shifting every
+    # later column right by 2 so parts[6] reads AGE instead of NODE → false placement FAIL.
+    r = ssh_cmd(user, master,
+                "kubectl get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName"
+                " --no-headers 2>/dev/null")
     pod_nodes: dict = {}
     for line in r.stdout.strip().splitlines():
         parts = line.split()
-        # columns: NAME READY STATUS RESTARTS AGE IP NODE ...
-        if len(parts) >= 7:
+        if len(parts) >= 2:
             pod_name = parts[0]
-            node_name = parts[6]
+            node_name = parts[1]
             for dep_name in EXPECTED_POD_PLACEMENT:
                 app = dep_name.replace("-deployment", "")
                 if pod_name.startswith(app + "-") or pod_name.startswith(
@@ -149,13 +153,15 @@ def verify_cluster(config_path: str = "config.yaml") -> bool:
                           '{"kubernetes.io/hostname":"%s"}}}}}' % expected_node)
             ssh_cmd(user, master, f"kubectl patch deployment {dep_name} --type=strategic -p '{node_patch}'")
             ssh_cmd(user, master, f"kubectl rollout status deployment/{dep_name} --timeout=120s", timeout=130)
-        # Re-read placement after remediation
-        r = ssh_cmd(user, master, "kubectl get pods -o wide --no-headers 2>/dev/null")
+        # Re-read placement after remediation (same robust custom-columns query)
+        r = ssh_cmd(user, master,
+                    "kubectl get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName"
+                    " --no-headers 2>/dev/null")
         pod_nodes = {}
         for line in r.stdout.strip().splitlines():
             parts = line.split()
-            if len(parts) >= 7:
-                pod_name, node_name = parts[0], parts[6]
+            if len(parts) >= 2:
+                pod_name, node_name = parts[0], parts[1]
                 for dep_name in EXPECTED_POD_PLACEMENT:
                     if pod_name.startswith(dep_name.replace("-deployment", "") + "-"):
                         pod_nodes[dep_name] = node_name
