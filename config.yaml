@@ -4,7 +4,7 @@
 intent:
   upper_threshold: 3.0    # seconds - trigger scale UP if response time exceeds this
   lower_threshold: 0.5    # seconds - trigger scale DOWN if response time below this
-  ema_alpha: 0.2          # smoothing factor for Exponential Moving Average (ideal-setup: faster detect+recovery)
+  ema_alpha: 0.5          # smoothing factor for Exponential Moving Average (ideal-setup: faster detect+recovery)
   check_interval: 5       # seconds between checks
   wait_after_action: 90   # seconds to wait after taking an action (matches ~90s pod-startup/settling; smart_cooldown still exits early on recovery; add_replica handled by warm-gate)
   startup_grace_period_seconds: 30  # skip violation handling for first N seconds (avoids cold-start artefact)
