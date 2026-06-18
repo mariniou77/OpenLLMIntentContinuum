@@ -96,13 +96,13 @@ def _create_hpa(user: str, master: str) -> None:
     Exp13: uses autoscaling/v2 with an explicit behavior block — scaleDown
     stabilizationWindowSeconds=30 (vs the controller-manager default 300s) and a fast
     scaleUp — so HPA reacts within the 24-min run, symmetric with the responsive VPA
-    recommender. ms3 max is capped at 3 to match config.yaml (worker1 capacity).
+    recommender. Per-service min/max mirror config.yaml (ms3 max 5 at the Exp-11 regime).
     """
     # (deployment, min_replicas, max_replicas)
     hpa_specs = [
         ("microservice1-deployment", 1, 5),
         ("microservice2-deployment", 1, 5),
-        ("microservice3-deployment", 1, 3),
+        ("microservice3-deployment", 1, 5),
         ("microservice4-deployment", 1, 3),
     ]
     print("  Creating responsive HPA objects (50% CPU, scaleDown stabilization 30s)...")
@@ -203,11 +203,11 @@ spec:
     containerPolicies:
     - containerName: {_VPA_CONTAINER}
       minAllowed:
-        cpu: 200m
-        memory: 256Mi
+        cpu: 100m
+        memory: 128Mi
       maxAllowed:
-        cpu: 1200m
-        memory: 2048Mi
+        cpu: 1000m
+        memory: 1536Mi
 {controlled_line}"""
         )
     return "\n".join(docs)

@@ -4,7 +4,7 @@
 intent:
   upper_threshold: 3.0    # seconds - trigger scale UP if response time exceeds this
   lower_threshold: 0.5    # seconds - trigger scale DOWN if response time below this
-  ema_alpha: 0.8          # smoothing factor for Exponential Moving Average (ideal-setup: faster detect+recovery)
+  ema_alpha: 0.2          # smoothing factor for Exponential Moving Average (ideal-setup: faster detect+recovery)
   check_interval: 5       # seconds between checks
   wait_after_action: 90   # seconds to wait after taking an action (matches ~90s pod-startup/settling; smart_cooldown still exits early on recovery; add_replica handled by warm-gate)
   startup_grace_period_seconds: 30  # skip violation handling for first N seconds (avoids cold-start artefact)
@@ -70,26 +70,26 @@ kubernetes:
       node: "worker2"   # home node — reset_cluster restores this nodeSelector each run (undoes a service_placement migration)
       min_replicas: 1
       max_replicas: 5
-      default_cpu: "500m"
-      default_memory: "512Mi"
+      default_cpu: "300m"
+      default_memory: "312Mi"
     - name: "microservice2-deployment"
-      node: "worker2"   # Exp13: moved off worker1 to free that node for ms3's elevated regime (was worker1)
+      node: "worker1"   # home node — reset_cluster restores this nodeSelector each run (undoes a service_placement migration)
       min_replicas: 1
       max_replicas: 5
-      default_cpu: "500m"
-      default_memory: "512Mi"
+      default_cpu: "300m"
+      default_memory: "312Mi"
     - name: "microservice3-deployment"
       node: "worker1"   # home node — reset_cluster restores this nodeSelector each run (undoes a service_placement migration)
       min_replicas: 2   # warm standby: never drop ms3 below 1 serving pod during a rollout/scale (SSD cold-start safety)
-      max_replicas: 3   # Exp13: capped (3×1200m ceiling = 3600m < worker1's 4000m, since ms2 moved to worker2)
-      default_cpu: "800m"     # Exp13 elevated regime (was 500m)
-      default_memory: "1536Mi"  # Exp13 elevated regime (was 1024Mi)
+      max_replicas: 5
+      default_cpu: "500m"
+      default_memory: "1024Mi"
     - name: "microservice4-deployment"
       node: "worker2"   # home node — reset_cluster restores this nodeSelector each run (undoes a service_placement migration)
       min_replicas: 1
       max_replicas: 3
-      default_cpu: "500m"
-      default_memory: "512Mi"
+      default_cpu: "300m"
+      default_memory: "312Mi"
 
 # sFlow-RT monitoring configuration
 sflow:

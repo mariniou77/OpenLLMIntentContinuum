@@ -212,14 +212,23 @@ def _parse_cpu_millicores(value: str) -> int:
 
 
 def _get_cluster_total_cpu_m(master_ip: str, ssh_user: str) -> Optional[int]:
-    """SSH to master, run kubectl top nodes, return total CPU millicores across all nodes."""
+    """SSH to master, run kubectl top nodes, return total CPU millicores across the
+    WORKER nodes only.
+
+    The master is excluded on purpose: it runs the k3s control plane, db, and the VPA
+    components (the 2-min-decay recommender keeps it busier), so its idle floor is
+    several hundred millicores and rises with the elevated regime — which made the
+    all-nodes sum never drop below the stabilisation threshold even though the workload
+    (ms1–ms4, all on workers) was fully idle. The managed application lives entirely on
+    the workers, so worker CPU is the correct "workload settled" signal.
+    """
     result = _ssh(master_ip, ssh_user, "kubectl top nodes --no-headers 2>/dev/null", timeout=15)
     if result.returncode != 0 or not result.stdout.strip():
         return None
     total = 0
     for line in result.stdout.strip().splitlines():
         parts = line.split()
-        if len(parts) >= 2:
+        if len(parts) >= 2 and "master" not in parts[0].lower():
             total += _parse_cpu_millicores(parts[1])
     return total
 
